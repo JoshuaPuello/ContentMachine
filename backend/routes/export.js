@@ -2,10 +2,25 @@ import express from 'express';
 import archiver from 'archiver';
 import https from 'https';
 import http from 'http';
-import { URL } from 'url';
+import { URL, fileURLToPath } from 'url';
 import path from 'path';
 import { Readable } from 'stream';
+import { createReadStream, existsSync } from 'fs';
 const router = express.Router();
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const OUTPUT_ROOT = path.join(__dirname, '..', '..', 'output');
+
+// Session-file URLs ("/api/session/<id>/files/<rel>", relative or absolute)
+// point at files this server already has on disk — read them directly.
+const sessionFilePath = (urlString) => {
+  const match = String(urlString).match(/\/api\/session\/([^/]+)\/files\/(.+)$/);
+  if (!match) return null;
+  const [, sessionId, rel] = match;
+  if (sessionId.includes('..') || rel.includes('..')) return null;
+  const abs = path.join(OUTPUT_ROOT, sessionId, decodeURIComponent(rel));
+  return abs.startsWith(path.join(OUTPUT_ROOT, sessionId)) && existsSync(abs) ? abs : null;
+};
 
 const getExtFromUrl = (urlString, fallback = 'jpg') => {
   try {
@@ -31,7 +46,19 @@ const fetchUrlToStream = (urlString) => {
       reject(new Error('Invalid URL'));
       return;
     }
-    
+
+    // Locally-stored session assets (audio slices, restored images) —
+    // stream straight from disk, no HTTP round trip
+    const localPath = sessionFilePath(urlString);
+    if (localPath) {
+      resolve(createReadStream(localPath));
+      return;
+    }
+    if (urlString.startsWith('/')) {
+      reject(new Error(`Local file not found for ${urlString}`));
+      return;
+    }
+
     const parsedUrl = new URL(urlString);
     const protocol = parsedUrl.protocol === 'https:' ? https : http;
     
@@ -85,59 +112,87 @@ router.post('/zip', async (req, res) => {
     });
     
     const selectedImages = project.selected_images || {};
-    const allImages = project.images || {};       // keyed "sceneNum_promptIndex"
+    const allImages = project.images || {};       // keyed "scene_segment_promptIndex" (legacy: "scene_promptIndex")
     const selectedVideos = project.selected_videos || {};
-    const sceneNumbers = [...new Set([
+
+    // Unit keys are "scene_segment" ("12_0", "12_1"); legacy projects used
+    // plain scene numbers ("12"). Build a stable file label for either.
+    const parseUnitKey = (key) => {
+      const parts = String(key).split('_');
+      const scene = Number(parts[0]);
+      const segment = parts.length > 1 ? Number(parts[1]) || 0 : 0;
+      return { scene, segment };
+    };
+    const unitLabel = (key) => {
+      const { scene, segment } = parseUnitKey(key);
+      const base = `scene_${String(scene).padStart(2, '0')}`;
+      return segment > 0 ? `${base}_shot${segment + 1}` : base;
+    };
+    const unitSort = (a, b) => {
+      const ua = parseUnitKey(a), ub = parseUnitKey(b);
+      return ua.scene - ub.scene || ua.segment - ub.segment;
+    };
+
+    const unitKeys = [...new Set([
       ...Object.keys(selectedImages),
       ...Object.keys(selectedVideos),
-      ...Object.keys(allImages).map(k => k.split('_')[0])
-    ])].sort((a, b) => Number(a) - Number(b));
+    ])].sort(unitSort);
+
+    const stage = (msg) => console.log(`[export:${baseName.slice(0, 24)}] ${msg}`);
+    stage(`start — ${unitKeys.length} shots, ${Object.keys(allImages).length} image variants, audio scenes: ${Object.keys((project.audio || {}).sceneAudio || {}).length}`);
 
     // ============ IMAGES/SELECTED FOLDER ============
-    for (const sceneNum of sceneNumbers) {
-      const image = selectedImages[sceneNum];
+    for (const uk of unitKeys) {
+      const image = selectedImages[uk];
       if (image?.url) {
         try {
           const stream = await fetchUrlToStream(image.url);
           const ext = image.url.startsWith('data:')
             ? (image.url.startsWith('data:image/png') ? 'png' : 'jpg')
             : getExtFromUrl(image.url, 'jpg');
-          archive.append(stream, { name: `images/selected/scene_${String(sceneNum).padStart(2, '0')}.${ext}` });
+          archive.append(stream, { name: `images/selected/${unitLabel(uk)}.${ext}` });
         } catch (e) {
-          console.error(`Failed to fetch selected image ${sceneNum}:`, e.message);
+          console.error(`Failed to fetch selected image ${uk}:`, e.message);
         }
       }
     }
 
+    stage('selected images done');
     // ============ IMAGES/ALL FOLDER (all generated variants) ============
     for (const [key, image] of Object.entries(allImages)) {
       if (!image?.url) continue;
-      // key is "sceneNum_promptIndex" e.g. "3_2"
-      const [sceneNum, promptIndex] = key.split('_');
+      // key is "scene_segment_promptIndex" (e.g. "3_0_2"); legacy "scene_promptIndex"
+      const parts = key.split('_');
+      const [sceneNum, segment, promptIndex] = parts.length >= 3
+        ? [parts[0], Number(parts[1]) || 0, parts[2]]
+        : [parts[0], 0, parts[1]];
       const variantNum = Number(promptIndex) + 1;
+      const shotSuffix = segment > 0 ? `_shot${segment + 1}` : '';
       try {
         const stream = await fetchUrlToStream(image.url);
         const ext = image.url.startsWith('data:')
           ? (image.url.startsWith('data:image/png') ? 'png' : 'jpg')
           : getExtFromUrl(image.url, 'jpg');
         archive.append(stream, {
-          name: `images/all/scene_${String(sceneNum).padStart(2, '0')}_v${variantNum}.${ext}`
+          name: `images/all/scene_${String(sceneNum).padStart(2, '0')}${shotSuffix}_v${variantNum}.${ext}`
         });
       } catch (e) {
         console.error(`Failed to fetch variant image ${key}:`, e.message);
       }
     }
-    
+
+    stage('image variants done');
     // ============ VIDEOS FOLDER ============
-    // Write all versions for each scene: history versions first, then the
+    // Write all versions for each shot: history versions first, then the
     // currently-selected one last (always named _selected so editors can
     // identify the chosen cut immediately).
     //   videos/scene_02_v1.mp4   ← oldest regenerated version
     //   videos/scene_02_v2.mp4   ← next version
     //   videos/scene_02_selected.mp4  ← currently selected (may duplicate a vN file)
     const videoHistory = project.video_history || {};
-    for (const sceneNum of sceneNumbers) {
-      const history = videoHistory[sceneNum] || [];
+    for (const uk of unitKeys) {
+      const history = videoHistory[uk] || [];
+      const label = unitLabel(uk);
       // Write historical versions
       for (let i = 0; i < history.length; i++) {
         const hv = history[i];
@@ -145,14 +200,14 @@ router.post('/zip', async (req, res) => {
         try {
           const stream = await fetchUrlToStream(hv.url);
           archive.append(stream, {
-            name: `videos/scene_${String(sceneNum).padStart(2, '0')}_v${i + 1}.mp4`
+            name: `videos/${label}_v${i + 1}.mp4`
           });
         } catch (e) {
-          console.error(`Failed to fetch video history ${sceneNum} v${i + 1}:`, e.message);
+          console.error(`Failed to fetch video history ${uk} v${i + 1}:`, e.message);
         }
       }
       // Write the currently selected version
-      const video = selectedVideos[sceneNum];
+      const video = selectedVideos[uk];
       if (video?.url) {
         try {
           const stream = await fetchUrlToStream(video.url);
@@ -160,14 +215,15 @@ router.post('/zip', async (req, res) => {
             ? `_v${history.length + 1}_selected`
             : '_selected';
           archive.append(stream, {
-            name: `videos/scene_${String(sceneNum).padStart(2, '0')}${vLabel}.mp4`
+            name: `videos/${label}${vLabel}.mp4`
           });
         } catch (e) {
-          console.error(`Failed to fetch selected video ${sceneNum}:`, e.message);
+          console.error(`Failed to fetch selected video ${uk}:`, e.message);
         }
       }
     }
     
+    stage('videos done');
     // ============ AUDIO FOLDER ============
     const audioData = project.audio || {};
     
@@ -322,6 +378,7 @@ router.post('/zip', async (req, res) => {
         selected_urls: undefined,
       } : null,
     };
+    stage('audio + thumbnails + metadata done — writing project.json/README');
     archive.append(JSON.stringify(projectExport, null, 2), { name: 'project.json' });
     
     // README
@@ -349,20 +406,31 @@ Generated: ${new Date().toISOString()}
 4. Add thumbnail
 5. Upload to YouTube with metadata
 
-## Scene Durations
+## Shot Timings
 
-${sceneNumbers.map(n => {
-  const video = selectedVideos[n];
-  return `- Scene ${n}: ${video?.duration || 'unknown'}s`;
+${unitKeys.map(uk => {
+  const video = selectedVideos[uk];
+  const clip = video?.duration ? `${video.duration}s clip` : 'unknown clip';
+  const target = video?.target_duration ? ` → covers ${video.target_duration}s of audio` : '';
+  const rate = video?.playback_rate && video.playback_rate < 1 ? ` @ ${Math.round(video.playback_rate * 100)}% speed` : '';
+  return `- ${unitLabel(uk)}: ${clip}${rate}${target}`;
 }).join('\n')}
 `;
     archive.append(readme, { name: 'README.md' });
-    
+
+    stage('finalizing zip...');
     await archive.finalize();
-    
+    stage(`done — ${archive.pointer()} bytes`);
+
   } catch (error) {
-    console.error('Export error:', error);
-    res.status(500).json({ error: true, message: error.message, code: 'EXPORT_ERROR' });
+    console.error('Export error:', error.stack || error);
+    // The archive streams directly into the response — once streaming has
+    // begun we can't send a JSON error anymore, only abort the download
+    if (!res.headersSent) {
+      res.status(500).json({ error: true, message: error.message, code: 'EXPORT_ERROR' });
+    } else {
+      res.destroy();
+    }
   }
 });
 

@@ -2,6 +2,7 @@ import { useState } from 'react'
 
 function VideoCard({
   sceneNumber,
+  label,
   videoPrompt,
   job,
   isSelected,
@@ -131,9 +132,14 @@ function VideoCard({
       <div className="p-3 flex flex-col flex-1">
         <div className="flex items-center justify-between mb-2">
           <div className="flex items-center gap-2">
-            <span className="text-xs font-semibold text-text-primary">Scene {sceneNumber}</span>
+            <span className="text-xs font-semibold text-text-primary">{label || `Scene ${sceneNumber}`}</span>
             {videoPrompt?.duration_seconds && (
-              <span className="text-[10px] text-text-disabled">{videoPrompt.duration_seconds}s</span>
+              <span className="text-[10px] text-text-disabled">
+                {videoPrompt.duration_seconds}s
+                {videoPrompt.playback_rate && videoPrompt.playback_rate < 1 && videoPrompt.target_duration
+                  ? ` → ${Math.round(videoPrompt.target_duration)}s @ ${Math.round(videoPrompt.playback_rate * 100)}%`
+                  : ''}
+              </span>
             )}
           </div>
           <StatusPill />
@@ -147,6 +153,7 @@ function VideoCard({
               className="w-full h-24 text-xs font-mono resize-none"
               placeholder="Edit video prompt..."
             />
+            <p className="text-[10px] text-text-disabled">Identity and source-frame locks stay protected.</p>
             <div className="flex gap-2">
               <button onClick={handleRegenerate} disabled={isLoading}
                 className="flex-1 btn-primary py-1.5 text-xs">

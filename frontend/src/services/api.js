@@ -2,8 +2,28 @@ import axios from 'axios'
 
 const api = axios.create({
   baseURL: '/api',
-  timeout: 180000
+  // Generous timeout: local Claude CLI batches can take 5-10+ minutes.
+  // Must exceed the backend's CLI timeout (15 min) so errors surface properly.
+  timeout: 1000000
 })
+
+const sessionCache = new Map()
+
+const fetchSession = (sessionId, { force = false, optional = false } = {}) => {
+  if (force) sessionCache.delete(sessionId)
+  if (sessionCache.has(sessionId)) return sessionCache.get(sessionId)
+  const request = api.get(`/session/${sessionId}`, {
+    timeout: 20000,
+    params: optional ? { optional: '1' } : undefined,
+  })
+    .then(r => r.data)
+    .catch(err => {
+      sessionCache.delete(sessionId)
+      throw err
+    })
+  sessionCache.set(sessionId, request)
+  return request
+}
 
 const exportedApi = {
   getSettings: () => api.get('/settings').then(r => r.data),
@@ -15,17 +35,33 @@ const exportedApi = {
   
   getDefaultPrompts: () => api.get('/claude/default-prompts').then(r => r.data),
 
-  generateStories: (topic, maxMinutes, provider = 'fal', model, systemPrompt) => 
-    api.post('/claude/stories', { topic, maxMinutes, provider, model, systemPrompt: systemPrompt || undefined }).then(r => r.data),
+  generateStories: (topic, maxMinutes, provider = 'fal', model, systemPrompt, intake = {}) =>
+    api.post('/claude/stories', {
+      topic,
+      maxMinutes,
+      provider,
+      model,
+      systemPrompt: systemPrompt || undefined,
+      mode: intake.mode || 'discover',
+      title: intake.title || undefined,
+      context: intake.context || undefined,
+    }).then(r => r.data),
+
+  extractCharacters: (story, scenePlan) =>
+    api.post('/claude/characters/extract', { story, scenePlan }, { timeout: 1000000 }).then(r => r.data),
+
+  linkCharacters: (characters, scenePlan) =>
+    api.post('/claude/characters/link', { characters, scenePlan }, { timeout: 1000000 }).then(r => r.data),
   
   generateScenePlan: (story, maxMinutes, provider = 'fal', model, systemPrompt, videoModel) =>
     api.post('/claude/scene-planning', { story, maxMinutes, provider, model, systemPrompt: systemPrompt || undefined, videoModel }).then(r => r.data),
   
-  generateImagePrompts: (scenePlan, aspectRatio, provider = 'fal', model, systemPrompt, scenesOverride) =>
+  generateImagePrompts: (scenePlan, aspectRatio, provider = 'fal', model, systemPrompt, scenesOverride, variationsPerSegment) =>
     api.post('/claude/image-prompts', {
       scenePlan: scenesOverride ? undefined : scenePlan,
       scenes: scenesOverride || undefined,
-      aspectRatio, provider, model, systemPrompt: systemPrompt || undefined
+      aspectRatio, provider, model, systemPrompt: systemPrompt || undefined,
+      variationsPerSegment: variationsPerSegment || undefined
     }).then(r => r.data),
   
   generateVideoPrompts: (scenePlan, selectedImages, provider = 'fal', model, systemPrompt, scenesOverride) =>
@@ -38,8 +74,25 @@ const exportedApi = {
       systemPrompt: systemPrompt || undefined
     }).then(r => r.data),
   
-  generateTtsScript: (story, scenePlan, provider = 'fal', model, systemPrompt) =>
-    api.post('/claude/tts-script', { story, scenePlan, provider, model, systemPrompt: systemPrompt || undefined }).then(r => r.data),
+  generateTtsScript: (story, scenePlan, provider = 'fal', model, systemPrompt, cinemaOptions) =>
+    api.post('/claude/tts-script', {
+      story, scenePlan, provider, model,
+      systemPrompt: systemPrompt || undefined,
+      cinemaOptions: cinemaOptions || undefined,
+    }).then(r => r.data),
+
+  generateExpressiveScript: (sceneBreakdown, provider = 'fal', model) =>
+    api.post('/claude/expressive-script', { sceneBreakdown, provider, model }).then(r => r.data),
+
+  // Whisper-based full-audio split — can take minutes for long recordings.
+  // Slices are stored server-side; the response carries small URLs only.
+  splitFullAudio: (audio, sceneScripts, sessionId) =>
+    api.post('/audio/split', { audio, scenes: sceneScripts, sessionId }, { timeout: 1800000 }).then(r => r.data),
+
+  // Store one audio blob server-side, get back a small URL. Audio must never
+  // live as base64 in app state — it breaks persistence.
+  storeAudio: (sessionId, sceneId, audio) =>
+    api.post('/audio/store', { sessionId, sceneId, audio }, { timeout: 300000 }).then(r => r.data),
   
   generateMetadata: (story, scenePlan, ttsScript, provider = 'fal', model, systemPrompt) =>
     api.post('/claude/metadata', { story, scenePlan, ttsScript, provider, model, systemPrompt: systemPrompt || undefined }).then(r => r.data),
@@ -79,8 +132,8 @@ const exportedApi = {
     })
   },
   
-  generateVideos: (scenes, provider = 'fal', resolution = '1080p', aspectRatio = '16:9', videoModel) =>
-    api.post('/videos/generate', { scenes, provider, resolution, aspectRatio, videoModel }).then(r => r.data),
+  generateVideos: (scenes, provider = 'fal', resolution = '1080p', aspectRatio = '16:9', videoModel, sessionId) =>
+    api.post('/videos/generate', { scenes, provider, resolution, aspectRatio, videoModel, sessionId }).then(r => r.data),
   
   getVideoStatus: (jobId, provider = 'fal', falEndpoint) => {
     const params = new URLSearchParams({ provider });
@@ -88,16 +141,33 @@ const exportedApi = {
     return api.get(`/videos/status/${jobId}?${params}`).then(r => r.data);
   },
   
-  regenerateVideo: (sceneNumber, videoPrompt, durationSeconds, imageUrl, provider = 'fal', resolution = '1080p', aspectRatio = '16:9', videoModel) =>
+  regenerateVideo: (
+    sceneNumber,
+    videoPrompt,
+    durationSeconds,
+    imageUrl,
+    provider = 'fal',
+    resolution = '1080p',
+    aspectRatio = '16:9',
+    videoModel,
+    negativePrompt,
+    motionPromptVersion,
+    sourceFrameLocked,
+    sessionId
+  ) =>
     api.post('/videos/regenerate', {
       scene_number: sceneNumber,
       video_prompt: videoPrompt,
+      negative_prompt: negativePrompt,
+      motion_prompt_version: motionPromptVersion,
+      source_frame_locked: sourceFrameLocked,
       duration_seconds: durationSeconds,
       image_url: imageUrl,
       provider,
       resolution,
       aspectRatio,
-      videoModel
+      videoModel,
+      sessionId
     }).then(r => r.data),
   
   generateThumbnails: (prompts, provider, aspectRatio) =>
@@ -118,8 +188,10 @@ const exportedApi = {
   generateSfx: (text, durationSeconds) =>
     api.post('/elevenlabs/sfx', { text, durationSeconds }).then(r => r.data),
   
+  // 10-min cap: a big project legitimately takes minutes to zip, but a dead
+  // backend must surface as an error, not a 16-minute spinner
   exportZip: (project) =>
-    api.post('/export/zip', project, { responseType: 'blob' }).then(r => {
+    api.post('/export/zip', project, { responseType: 'blob', timeout: 600000 }).then(r => {
       const url = window.URL.createObjectURL(new Blob([r.data]))
       const link = document.createElement('a')
       link.href = url
@@ -138,15 +210,77 @@ const exportedApi = {
 }
 
 exportedApi.saveSession = (sessionId, project) =>
-  api.post('/session/save', { sessionId, project }, { timeout: 300000 }).then(r => r.data)
+  api.post('/session/save', { sessionId, project }, { timeout: 300000 }).then(r => {
+    sessionCache.delete(sessionId)
+    return r.data
+  })
 
 exportedApi.listSessions = () =>
   api.get('/session/list').then(r => r.data)
 
-exportedApi.loadSession = (sessionId) =>
-  api.get(`/session/${sessionId}`).then(r => r.data)
+// Preview proxies: local short-GOP re-encodes of remote master clips so the
+// editor never streams from provider CDNs during playback.
+exportedApi.startPreviewProxies = (sessionId, items) =>
+  api.post(`/session/${sessionId}/preview-proxies`, { items }, { timeout: 30000 }).then(r => r.data)
+
+exportedApi.getPreviewProxies = (sessionId) =>
+  api.get(`/session/${sessionId}/preview-proxies`).then(r => r.data)
+
+exportedApi.loadSession = (sessionId, options) => fetchSession(sessionId, options)
+
+// Projects are local, so warm their compact JSON snapshots as soon as the
+// Projects view appears. Clicking Open then resolves from memory.
+exportedApi.prefetchSession = (sessionId) => {
+  fetchSession(sessionId).catch(() => {})
+}
 
 exportedApi.deleteSession = (sessionId) =>
-  api.delete(`/session/${sessionId}`).then(r => r.data)
+  api.delete(`/session/${sessionId}`).then(r => {
+    sessionCache.delete(sessionId)
+    return r.data
+  })
+
+exportedApi.renameSession = (sessionId, name) =>
+  api.patch(`/session/${sessionId}/name`, { name }).then(r => {
+    sessionCache.delete(sessionId)
+    return r.data
+  })
+
+// ─── Director (cinema placement plan + map segments) ─────────────────────────
+
+exportedApi.directorPlan = (payload) =>
+  api.post('/director/plan', payload, { timeout: 210000 }).then(r => r.data)
+
+exportedApi.directorSfxMaterialize = (payload) =>
+  api.post('/director/sfx/materialize', payload, { timeout: 900000 }).then(r => r.data)
+
+exportedApi.directorMapStart = (payload) =>
+  api.post('/director/map/start', payload).then(r => r.data)
+
+exportedApi.directorMapStatus = (jobId) =>
+  api.get(`/director/map/status/${jobId}`).then(r => r.data)
+
+exportedApi.directorMapHistory = (sessionId, mapId) =>
+  api.get(`/director/map/history/${encodeURIComponent(sessionId)}/${encodeURIComponent(mapId)}`).then(r => r.data)
+
+// ─── Final film render (Remotion via StoryForge) ─────────────────────────────
+
+exportedApi.renderStart = (payload) =>
+  api.post('/render/start', payload, { timeout: 600000 }).then(r => r.data)
+
+exportedApi.renderStatus = (jobId) =>
+  api.get(`/render/status/${jobId}`).then(r => r.data)
+
+exportedApi.renderCancel = (jobId) =>
+  api.post(`/render/cancel/${jobId}`).then(r => r.data)
+
+exportedApi.renderHistory = (sessionId) =>
+  api.get(`/render/history/${encodeURIComponent(sessionId)}`).then(r => r.data)
+
+exportedApi.deleteRender = (sessionId, fileName) =>
+  api.delete(`/render/history/${encodeURIComponent(sessionId)}/${encodeURIComponent(fileName)}`).then(r => r.data)
+
+exportedApi.deleteAllRenders = (sessionId) =>
+  api.delete(`/render/history/${encodeURIComponent(sessionId)}`).then(r => r.data)
 
 export default exportedApi

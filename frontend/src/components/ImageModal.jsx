@@ -5,7 +5,7 @@ import { motion } from 'framer-motion'
 // image:   current/latest { url, prompt, error, loading }
 // onSelect(url, prompt): called with the viewed version's data
 // onRegenerate(prompt): called with the viewed version's prompt (or edited)
-function ImageModal({ image, history = [], onClose, onRegenerate, onSelect }) {
+function ImageModal({ image, history = [], onClose, onRegenerate, onEditWithAI, onApplyEdit, onSelect }) {
   // Build full version list: history entries + current (latest)
   const allVersions = useMemo(() => {
     const current = image?.url ? [{ url: image.url, prompt: image.prompt }] : []
@@ -15,8 +15,15 @@ function ImageModal({ image, history = [], onClose, onRegenerate, onSelect }) {
   // Start viewing the latest version
   const [viewIndex, setViewIndex] = useState(allVersions.length - 1)
   const [isEditing, setIsEditing] = useState(false)
+  const [optionCount, setOptionCount] = useState(1)
+  const [editMode, setEditMode] = useState('ai')
+  const [generatedOptions, setGeneratedOptions] = useState([])
+  const [generatedIndex, setGeneratedIndex] = useState(0)
+  const [generating, setGenerating] = useState(false)
+  const [generationError, setGenerationError] = useState(null)
 
-  const viewed = allVersions[viewIndex] || { url: image?.url, prompt: image?.prompt }
+  const historicalViewed = allVersions[viewIndex] || { url: image?.url, prompt: image?.prompt }
+  const viewed = generatedOptions[generatedIndex] || historicalViewed
   const [editedPrompt, setEditedPrompt] = useState(viewed?.prompt || '')
 
   // Keep editedPrompt in sync when navigating between versions
@@ -41,11 +48,32 @@ function ImageModal({ image, history = [], onClose, onRegenerate, onSelect }) {
   }, [onClose, allVersions.length])
 
   const handleSelect = () => {
+    if (generatedOptions.length && onApplyEdit) {
+      onApplyEdit(viewed)
+      onClose()
+      return
+    }
     onSelect(viewed?.url, viewed?.prompt)
     onClose()
   }
 
-  const handleRegenerate = () => {
+  const handleRegenerate = async () => {
+    if (isEditing && editMode === 'ai' && onEditWithAI) {
+      setGenerating(true)
+      setGenerationError(null)
+      try {
+        const options = await onEditWithAI(editedPrompt, optionCount)
+        if (!options?.length) throw new Error('No edited image options were returned')
+        setGeneratedOptions(options)
+        setGeneratedIndex(0)
+        setIsEditing(false)
+      } catch (error) {
+        setGenerationError(error.message)
+      } finally {
+        setGenerating(false)
+      }
+      return
+    }
     onRegenerate(isEditing ? editedPrompt : viewed?.prompt || null)
     setIsEditing(false)
     onClose()
@@ -82,7 +110,7 @@ function ImageModal({ image, history = [], onClose, onRegenerate, onSelect }) {
             )}
 
             {/* Left arrow */}
-            {total > 1 && !isOldest && (
+            {!generatedOptions.length && total > 1 && !isOldest && (
               <button
                 onClick={() => setViewIndex(i => i - 1)}
                 className="absolute left-3 top-1/2 -translate-y-1/2 w-9 h-9 bg-black/60 hover:bg-black/80 rounded-full flex items-center justify-center text-white transition-colors"
@@ -94,7 +122,7 @@ function ImageModal({ image, history = [], onClose, onRegenerate, onSelect }) {
             )}
 
             {/* Right arrow */}
-            {total > 1 && !isLatest && (
+            {!generatedOptions.length && total > 1 && !isLatest && (
               <button
                 onClick={() => setViewIndex(i => i + 1)}
                 className="absolute right-12 top-1/2 -translate-y-1/2 w-9 h-9 bg-black/60 hover:bg-black/80 rounded-full flex items-center justify-center text-white transition-colors"
@@ -106,7 +134,7 @@ function ImageModal({ image, history = [], onClose, onRegenerate, onSelect }) {
             )}
 
             {/* Version badge */}
-            {versionLabel && (
+            {!generatedOptions.length && versionLabel && (
               <div className="absolute bottom-3 left-1/2 -translate-x-1/2 bg-black/60 backdrop-blur-sm text-white text-[10px] px-2 py-1 rounded-full">
                 {versionLabel}
               </div>
@@ -124,23 +152,75 @@ function ImageModal({ image, history = [], onClose, onRegenerate, onSelect }) {
 
           {/* Info & actions */}
           <div className="p-4 border-t border-border flex-shrink-0">
-            {isEditing ? (
+            {generatedOptions.length ? (
+              <div>
+                <div className="flex items-center justify-between gap-3 mb-3">
+                  <div>
+                    <p className="text-sm font-semibold text-text-primary">Choose the edit to keep</p>
+                    <p className="text-[10px] text-text-disabled mt-0.5">Nothing changes until you save this selection.</p>
+                  </div>
+                  <span className="text-[10px] text-text-secondary">Option {generatedIndex + 1} of {generatedOptions.length}</span>
+                </div>
+                <div className="flex gap-2 mb-4">
+                  {generatedOptions.map((option, index) => (
+                    <button
+                      key={`${option.url}-${index}`}
+                      type="button"
+                      onClick={() => setGeneratedIndex(index)}
+                      className={`w-20 h-14 rounded-lg overflow-hidden border-2 ${generatedIndex === index ? 'border-accent' : 'border-border'}`}
+                    >
+                      <img src={option.url} alt={`Edited option ${index + 1}`} className="w-full h-full object-cover" />
+                    </button>
+                  ))}
+                </div>
+                <div className="flex gap-2">
+                  <button onClick={handleSelect} className="btn-primary py-2 px-4 text-sm">Save selected edit</button>
+                  <button
+                    onClick={() => {
+                      setGeneratedOptions([])
+                      setIsEditing(true)
+                      setEditMode('ai')
+                    }}
+                    className="btn-secondary py-2 px-4 text-sm"
+                  >
+                    Try another edit
+                  </button>
+                  <button onClick={onClose} className="btn-ghost py-2 px-4 text-sm">Cancel</button>
+                </div>
+              </div>
+            ) : isEditing ? (
               <div className="space-y-3">
                 <textarea
                   value={editedPrompt}
                   onChange={(e) => setEditedPrompt(e.target.value)}
                   className="w-full h-28 text-xs font-mono resize-none"
-                  placeholder="Edit prompt..."
+                  placeholder={editMode === 'ai' ? 'Describe only what should change in this existing image...' : 'Rewrite the complete generation prompt...'}
                   autoFocus
                 />
+                <div className="flex items-center justify-between gap-3">
+                  <div className="flex rounded-lg border border-border overflow-hidden">
+                    <button type="button" onClick={() => setEditMode('ai')} className={`px-3 py-1.5 text-xs ${editMode === 'ai' ? 'bg-accent/15 text-accent' : 'text-text-secondary'}`}>Edit existing</button>
+                    <button type="button" onClick={() => setEditMode('regenerate')} className={`px-3 py-1.5 text-xs ${editMode === 'regenerate' ? 'bg-accent/15 text-accent' : 'text-text-secondary'}`}>Regenerate</button>
+                  </div>
+                  {editMode === 'ai' && (
+                    <label className="text-xs text-text-secondary flex items-center gap-2">
+                      Options
+                      <select value={optionCount} onChange={event => setOptionCount(Number(event.target.value))} className="text-xs py-1">
+                        <option value={1}>1</option>
+                        <option value={2}>2</option>
+                      </select>
+                    </label>
+                  )}
+                </div>
                 <div className="flex gap-2">
-                  <button onClick={handleRegenerate} className="btn-primary py-2 px-4 text-sm">
-                    Regenerate with edit
+                  <button onClick={handleRegenerate} disabled={generating || !editedPrompt.trim()} className="btn-primary py-2 px-4 text-sm disabled:opacity-40">
+                    {generating ? 'Generating options…' : editMode === 'ai' ? 'Generate edit options' : 'Regenerate'}
                   </button>
                   <button onClick={() => setIsEditing(false)} className="btn-ghost py-2 px-4 text-sm">
                     Cancel
                   </button>
                 </div>
+                {generationError && <p className="text-xs text-error">{generationError}</p>}
               </div>
             ) : (
               <>
@@ -153,8 +233,8 @@ function ImageModal({ image, history = [], onClose, onRegenerate, onSelect }) {
                       {isLatest ? 'Select this image' : `Use version ${viewIndex + 1}`}
                     </button>
                   )}
-                  <button onClick={() => setIsEditing(true)} className="btn-secondary py-2 px-4 text-sm">
-                    Edit & Regenerate
+                  <button onClick={() => { setIsEditing(true); setEditMode('ai'); setEditedPrompt('') }} className="btn-secondary py-2 px-4 text-sm">
+                    Edit with AI
                   </button>
                   <button onClick={handleRegenerate} className="btn-ghost py-2 px-4 text-sm">
                     Regenerate

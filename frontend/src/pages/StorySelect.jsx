@@ -82,6 +82,10 @@ function StorySelect() {
   const {
     topic, setTopic,
     maxMinutes, setMaxMinutes,
+    storyInputMode, setStoryInputMode,
+    storyTitle, setStoryTitle,
+    storyContext, setStoryContext,
+    suppliedVoiceover, setSuppliedVoiceover,
     fetchStories,
     stories,
     storiesLoading,
@@ -90,6 +94,8 @@ function StorySelect() {
     clearProject,
     settings,
     setAspectRatio,
+    setChaptersEnabled,
+    setTrailerIntroEnabled,
     customPrompts,
     setCustomPrompt,
     characterImages,
@@ -136,7 +142,9 @@ function StorySelect() {
         setDefaultPrompts(defaults)
         // Pre-fill any stage that hasn't been customised yet
         PROMPT_STAGES.forEach(({ key }) => {
-          if (!customPrompts[key]) setCustomPrompt(key, defaults[key] || '')
+          const legacyUnsafeVideoPrompt = key === 'videoPrompts'
+            && /CAMERA MOVEMENT VOCABULARY|VIDEO STYLE MANDATE|Motion Format:\s*"\[camera motion\]/i.test(customPrompts[key] || '')
+          if (!customPrompts[key] || legacyUnsafeVideoPrompt) setCustomPrompt(key, defaults[key] || '')
         })
       } catch {
         toast.error('Could not load default prompts')
@@ -151,8 +159,16 @@ function StorySelect() {
   }
 
   const handleFindStories = async () => {
-    if (!topic.trim()) {
+    if (storyInputMode === 'discover' && !topic.trim()) {
       toast.error('Enter a story topic first')
+      return
+    }
+    if (storyInputMode === 'guided' && (!storyTitle.trim() || !storyContext.trim())) {
+      toast.error('Enter the exact title and story context')
+      return
+    }
+    if (storyInputMode === 'script' && (!storyTitle.trim() || !suppliedVoiceover.trim())) {
+      toast.error('Enter the title and main voiceover')
       return
     }
     // errors are handled by storiesError state below — no toast needed here
@@ -161,7 +177,9 @@ function StorySelect() {
 
   const handleSelectStory = (story) => {
     selectStory(story)
-    navigate('/images')
+    // Audio comes before images: scene plan + narration script generate first,
+    // then the user records/uploads audio, and images are sized to the audio
+    navigate('/audio')
   }
 
   const handleReset = () => {
@@ -188,7 +206,9 @@ function StorySelect() {
             <div className="w-2 h-2 rounded-full bg-accent animate-pulse" style={{ animationDelay: '200ms' }} />
             <div className="w-2 h-2 rounded-full bg-accent animate-pulse" style={{ animationDelay: '400ms' }} />
           </div>
-          <h2 className="text-xl font-semibold text-text-primary mb-2">Finding your story</h2>
+          <h2 className="text-xl font-semibold text-text-primary mb-2">
+            {storyInputMode === 'script' ? 'Preparing your script' : 'Researching your story'}
+          </h2>
           <div className="text-sm h-5">
             <TypingMessage messages={loadingMessages} />
           </div>
@@ -206,7 +226,7 @@ function StorySelect() {
               <span className="text-xs text-text-disabled font-mono ml-2">pipeline — story-researcher</span>
             </div>
             <div className="bg-[#0d1117] p-4 h-48 font-mono text-xs">
-              <ResearchStream topic={topic} />
+              <ResearchStream topic={storyInputMode === 'discover' ? topic : storyTitle} />
             </div>
           </div>
         </div>
@@ -307,24 +327,74 @@ function StorySelect() {
             What story do you want to tell?
           </h1>
           <p className="text-text-secondary text-base">
-            Enter a topic and we'll find real, documented stories for your documentary
+            Discover a story, research one exact story, or bring a finished main voiceover
           </p>
         </div>
 
-        {/* Main input */}
-        <div className="mb-4">
-          <textarea
-            value={topic}
-            onChange={e => setTopic(e.target.value)}
-            onKeyDown={e => e.key === 'Enter' && !e.shiftKey && (e.preventDefault(), handleFindStories())}
-            placeholder="A heist that went wrong in 1970s New York..."
-            className="w-full h-28 text-base resize-none"
-            autoFocus
-          />
+        <div className="grid grid-cols-3 gap-2 mb-6 p-1 rounded-xl bg-surface-raised border border-border">
+          {[
+            ['discover', 'Discover', 'Find candidates'],
+            ['guided', 'Exact story', 'Research my brief'],
+            ['script', 'My script', 'Preserve voiceover'],
+          ].map(([mode, label, sub]) => (
+            <button
+              key={mode}
+              type="button"
+              onClick={() => setStoryInputMode(mode)}
+              className={`rounded-lg px-3 py-2.5 text-left transition-colors ${
+                storyInputMode === mode ? 'bg-accent/15 border border-accent/35' : 'border border-transparent hover:bg-white/[0.03]'
+              }`}
+            >
+              <span className={`block text-xs font-semibold ${storyInputMode === mode ? 'text-accent' : 'text-text-primary'}`}>{label}</span>
+              <span className="block text-[9px] text-text-disabled mt-0.5">{sub}</span>
+            </button>
+          ))}
         </div>
 
+        {storyInputMode === 'discover' ? (
+          <div className="mb-4">
+            <textarea
+              value={topic}
+              onChange={e => setTopic(e.target.value)}
+              onKeyDown={e => e.key === 'Enter' && !e.shiftKey && (e.preventDefault(), handleFindStories())}
+              placeholder="A heist that went wrong in 1970s New York..."
+              className="w-full h-28 text-base resize-none"
+              autoFocus
+            />
+          </div>
+        ) : (
+          <div className="space-y-3 mb-5">
+            <div>
+              <label className="text-xs font-medium text-text-secondary mb-1.5 block">Documentary title</label>
+              <input value={storyTitle} onChange={event => setStoryTitle(event.target.value)} placeholder="The Factory Under the Floorboards" className="w-full text-sm" autoFocus />
+            </div>
+            {storyInputMode === 'guided' ? (
+              <div>
+                <label className="text-xs font-medium text-text-secondary mb-1.5 block">Exact story brief</label>
+                <textarea value={storyContext} onChange={event => setStoryContext(event.target.value)} placeholder="Describe the people, event, angle, known facts, and the exact story you want researched." className="w-full h-44 text-sm resize-y" />
+                <p className="text-[10px] text-text-disabled mt-1.5">Research verifies and enriches this brief; it does not replace it with adjacent ideas.</p>
+              </div>
+            ) : (
+              <>
+                <div>
+                  <label className="text-xs font-medium text-text-secondary mb-1.5 block">Main voiceover — preserved verbatim</label>
+                  <textarea value={suppliedVoiceover} onChange={event => setSuppliedVoiceover(event.target.value)} placeholder="Paste only the documentary's main spoken narration. Trailer and chapter voiceovers are generated separately when enabled below." className="w-full h-64 text-sm resize-y leading-relaxed" />
+                  <div className="flex justify-between mt-1.5 text-[10px] text-text-disabled">
+                    <span>Scene planning may divide this at natural boundaries; it cannot rewrite it.</span>
+                    <span>{suppliedVoiceover.trim() ? suppliedVoiceover.trim().split(/\s+/).length : 0} words</span>
+                  </div>
+                </div>
+                <div>
+                  <label className="text-xs font-medium text-text-secondary mb-1.5 block">Supporting context <span className="font-normal text-text-disabled">(optional)</span></label>
+                  <textarea value={storyContext} onChange={event => setStoryContext(event.target.value)} placeholder="Dates, spellings, visual direction, or factual notes for scene planning." className="w-full h-24 text-sm resize-y" />
+                </div>
+              </>
+            )}
+          </div>
+        )}
+
         {/* Example topics */}
-        <div className="flex flex-wrap gap-2 mb-6 justify-center">
+        {storyInputMode === 'discover' && <div className="flex flex-wrap gap-2 mb-6 justify-center">
           {exampleTopics.map((t, i) => (
             <button
               key={i}
@@ -336,7 +406,7 @@ function StorySelect() {
               <span className="text-text-disabled text-[9px]">· {t.sub}</span>
             </button>
           ))}
-        </div>
+        </div>}
 
         {/* Settings grid */}
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-6">
@@ -375,6 +445,49 @@ function StorySelect() {
               ))}
             </select>
           </div>
+        </div>
+
+        {/* Cinematic narration must be chosen before the script/audio stage. */}
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-6">
+          <button
+            type="button"
+            onClick={() => setTrailerIntroEnabled(!settings.trailerIntroEnabled)}
+            className={`text-left rounded-xl border p-4 transition-all ${
+              settings.trailerIntroEnabled
+                ? 'border-accent/60 bg-accent/10'
+                : 'border-border bg-surface hover:border-border-hover'
+            }`}
+          >
+            <div className="flex items-center justify-between gap-3 mb-1">
+              <span className="text-sm font-semibold text-text-primary">Trailer cold open</span>
+              <span className={`w-8 h-4 rounded-full p-0.5 transition-colors ${settings.trailerIntroEnabled ? 'bg-accent' : 'bg-surface-raised border border-border'}`}>
+                <span className={`block w-3 h-3 rounded-full bg-white transition-transform ${settings.trailerIntroEnabled ? 'translate-x-4' : ''}`} />
+              </span>
+            </div>
+            <p className="text-[11px] leading-relaxed text-text-secondary">
+              Writes a measured hook voiceover and dynamically selects the strongest opening shots.
+            </p>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => setChaptersEnabled(!settings.chaptersEnabled)}
+            className={`text-left rounded-xl border p-4 transition-all ${
+              settings.chaptersEnabled
+                ? 'border-accent/60 bg-accent/10'
+                : 'border-border bg-surface hover:border-border-hover'
+            }`}
+          >
+            <div className="flex items-center justify-between gap-3 mb-1">
+              <span className="text-sm font-semibold text-text-primary">Narrated chapters</span>
+              <span className={`w-8 h-4 rounded-full p-0.5 transition-colors ${settings.chaptersEnabled ? 'bg-accent' : 'bg-surface-raised border border-border'}`}>
+                <span className={`block w-3 h-3 rounded-full bg-white transition-transform ${settings.chaptersEnabled ? 'translate-x-4' : ''}`} />
+              </span>
+            </div>
+            <p className="text-[11px] leading-relaxed text-text-secondary">
+              Writes synchronized overview beats and natural spoken transitions for every chapter.
+            </p>
+          </button>
         </div>
 
         {/* Character Base Images */}
@@ -586,14 +699,22 @@ function StorySelect() {
         {/* CTA */}
         <button
           onClick={handleFindStories}
-          disabled={!topic.trim()}
+          disabled={
+            storyInputMode === 'discover'
+              ? !topic.trim()
+              : storyInputMode === 'guided'
+                ? !storyTitle.trim() || !storyContext.trim()
+                : !storyTitle.trim() || !suppliedVoiceover.trim()
+          }
           className="w-full btn-primary py-3 text-base font-semibold disabled:opacity-40 disabled:cursor-not-allowed"
         >
-          Find Stories
+          {storyInputMode === 'discover' ? 'Find Stories' : storyInputMode === 'guided' ? 'Research This Story' : 'Use This Voiceover'}
         </button>
 
         <p className="text-center text-[11px] text-text-disabled mt-4">
-          AI will search for real, verified historical narratives matching your topic
+          {storyInputMode === 'script'
+            ? 'Your main narration stays locked; enabled trailer and chapter transitions are appended around it'
+            : 'Research is grounded in real, verifiable documentary sources'}
         </p>
       </div>
     </motion.div>

@@ -1,8 +1,30 @@
 import express from 'express';
-import * as fal from '@fal-ai/client';
+import { fal } from '@fal-ai/client';
 import Replicate from 'replicate';
 import { GoogleGenAI } from '@google/genai';
+import { generateVertexImage } from '../lib/vertex.js';
 const router = express.Router();
+const IMAGE_GENERATION_TIMEOUT_MS = Math.max(
+  30_000,
+  Number(process.env.IMAGE_GENERATION_TIMEOUT_MS) || 120_000
+);
+
+export const withImageGenerationTimeout = async (operation, timeoutMs = IMAGE_GENERATION_TIMEOUT_MS) => {
+  const effectiveTimeoutMs = Math.max(1, Number(timeoutMs) || IMAGE_GENERATION_TIMEOUT_MS);
+  const controller = new AbortController();
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      reject(new Error(`Image generation timed out after ${Math.round(effectiveTimeoutMs / 1000)} seconds`));
+      controller.abort();
+    }, effectiveTimeoutMs);
+  });
+  try {
+    return await Promise.race([operation(controller.signal), timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
+};
 
 // Allowed MIME types for character reference images
 const ALLOWED_IMAGE_MIMES = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif']);
@@ -134,11 +156,43 @@ const generateWithGemini = async (ai, prompt, aspectRatio, model, characterImage
   }
 };
 
+// Generate via Vertex AI (service-account auth, multi-account pool in lib/vertex.js).
+// Same character-reference handling as generateWithGemini, but images are passed
+// as raw base64 parts to the Vertex REST endpoint.
+const generateWithVertex = async (prompt, aspectRatio, model, characterImages = [], characterDescription = '') => {
+  const images = [];
+  let fullPrompt = prompt;
+  if (characterImages.length > 0) {
+    for (const dataUri of characterImages) {
+      const { mimeType, buffer } = parseDataUri(dataUri);
+      images.push({ mimeType, data: buffer.toString('base64') });
+    }
+    const charLabel = characterDescription
+      ? characterDescription.trim()
+      : 'the character shown in the reference image(s)';
+    const characterInstruction =
+      `The above image(s) show reference character(s) (${charLabel}). ` +
+      'Match their exact visual appearance — body proportions, skin/surface tone, hair style, and overall aesthetic — as faithfully as possible. ' +
+      'For this specific scene, apply the period-accurate clothing, accessories, and pose described in the scene prompt below, ' +
+      'overriding any clothing shown in the reference image with the scene\'s required costume. ';
+    fullPrompt = characterInstruction + prompt;
+  }
+
+  const url = await generateVertexImage({
+    model,
+    prompt: fullPrompt,
+    aspectRatio: aspectRatio || '16:9',
+    imageSize: '2K',
+    images,
+  });
+  return { prompt, url, error: null };
+};
+
 // Map aspect ratio strings to fal ImageSize enum values used by flux/qwen/z-image models
 const aspectRatioToImageSize = (aspectRatio) => {
   const map = {
     '16:9': 'landscape_16_9',
-    '9:16': 'portrait_9_16',
+    '9:16': 'portrait_16_9',
     '1:1': 'square',
     '4:5': 'portrait_4_3',
     '4:3': 'landscape_4_3',
@@ -186,11 +240,12 @@ const buildFalInput = (modelId, prompt, aspectRatio, characterImageUrls = []) =>
   };
 };
 
-const generateWithFal = async (falClient, modelId, prompt, aspectRatio, characterImageUrls = []) => {
+const generateWithFal = async (falClient, modelId, prompt, aspectRatio, characterImageUrls = [], abortSignal) => {
   const input = buildFalInput(modelId, prompt, aspectRatio, characterImageUrls);
   const result = await falClient.subscribe(modelId, {
     input,
     pollInterval: 2000,
+    abortSignal,
   });
   const url = result.data?.images?.[0]?.url || result.images?.[0]?.url;
   if (!url) throw new Error('No image URL in fal response');
@@ -262,7 +317,7 @@ router.post('/generate', async (req, res) => {
     }
     
     const results = await Promise.allSettled(
-      prompts.map(async (prompt) => {
+      prompts.map((prompt) => withImageGenerationTimeout(async (abortSignal) => {
         if (provider === 'fal') {
           const falClient = getFalClient(req);
           const selectedModel = model || 'fal-ai/flux-pro';
@@ -271,10 +326,12 @@ router.post('/generate', async (req, res) => {
           const augmentedPrompt = charImgs.length > 0
             ? buildCharacterPromptPrefix(charImgs.length > 0, charDesc) + prompt
             : prompt;
-          return await generateWithFal(falClient, selectedModel, augmentedPrompt, aspectRatio);
+          return await generateWithFal(falClient, selectedModel, augmentedPrompt, aspectRatio, [], abortSignal);
         } else if (provider === 'gemini') {
           const genAI = getGeminiClient(req);
           return await generateWithGemini(genAI, prompt, aspectRatio, model, charImgs, charDesc);
+        } else if (provider === 'vertex') {
+          return await generateWithVertex(prompt, aspectRatio, model, charImgs, charDesc);
         } else if (provider === 'replicate') {
           const replicate = getReplicateClient(req);
           const selectedModel = model || 'black-forest-labs/flux-1.1-pro';
@@ -358,7 +415,7 @@ router.post('/generate', async (req, res) => {
         } else {
           throw new Error(`Unknown provider: ${provider}`);
         }
-      })
+      }))
     );
     
     const response = results.map((result, index) => {
@@ -406,13 +463,19 @@ router.post('/regenerate', async (req, res) => {
       const augmentedPrompt = charImgs.length > 0
         ? buildCharacterPromptPrefix(charImgs.length > 0, charDesc) + prompt
         : prompt;
-      const result = await generateWithFal(falClient, selectedModel, augmentedPrompt, aspectRatio);
+      const result = await withImageGenerationTimeout((abortSignal) =>
+        generateWithFal(falClient, selectedModel, augmentedPrompt, aspectRatio, [], abortSignal)
+      );
       console.log('FAL result URL:', result.url);
       res.json({ url: result.url });
     } else if (provider === 'gemini') {
       const genAI = getGeminiClient(req);
       const result = await generateWithGemini(genAI, prompt, aspectRatio, model, charImgs, charDesc);
       console.log('Gemini result URL:', result.url?.substring(0, 50) + '...');
+      res.json({ url: result.url });
+    } else if (provider === 'vertex') {
+      const result = await generateWithVertex(prompt, aspectRatio, model, charImgs, charDesc);
+      console.log('Vertex result URL:', result.url?.substring(0, 50) + '...');
       res.json({ url: result.url });
     } else if (provider === 'replicate') {
       const replicate = getReplicateClient(req);

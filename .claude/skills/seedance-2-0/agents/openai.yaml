@@ -1,0 +1,4 @@
+interface:
+  display_name: "Seedance 2.0 Motion Director"
+  short_description: "Stable image-to-video motion prompt discipline"
+  default_prompt: "Use $seedance-2-0 to author a stable motion prompt from this selected frame and scene."

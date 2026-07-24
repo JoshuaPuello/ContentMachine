@@ -2,6 +2,10 @@ import { useState, useEffect, useRef, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { motion, AnimatePresence } from 'framer-motion'
 import { usePipelineStore } from '../store/pipelineStore'
+import {
+  MAX_CONCURRENT_VIDEO_REQUESTS,
+  queuedVideoUnitIds,
+} from '../lib/videoConcurrency'
 import VideoCard from '../components/VideoCard'
 import VideoModal from '../components/VideoModal'
 import ExportModal from '../components/ExportModal'
@@ -64,7 +68,7 @@ function VideoPromptTerminal({ videoPrompts, settings = {}, videoBatches = [], o
     ? videoPrompts.slice(0, 4).flatMap(vp => [
         `  scene_${String(vp.scene_number).padStart(2,'0')}: {`,
         `    duration: ${vp.duration_seconds}s,`,
-        `    motion: "${(vp.video_prompt?.camera_motion || '').substring(0, 50)}...",`,
+        `    motion: "${(vp.video_prompt?.primary_camera_move || vp.video_prompt?.camera_motion || '').substring(0, 50)}...",`,
         `  },`,
       ])
     : []
@@ -187,6 +191,7 @@ function VideoGeneration() {
     resetGeneration,
     stopGeneration,
     resumeVideoPolling,
+    resumeVideoGeneration,
     selectVideoVersion,
   } = usePipelineStore()
 
@@ -277,26 +282,46 @@ function VideoGeneration() {
         return
       }
 
-      const pending = Object.entries(videoJobs).filter(
+      let pending = Object.entries(videoJobs).filter(
         ([, j]) => j.status === 'pending' && j.jobId
       )
 
       if (pending.length === 0) {
-        pollingActiveRef.current = false
-        return
+        const state = usePipelineStore.getState()
+        const queued = queuedVideoUnitIds(state.videoProgress, state.videoJobs)
+        if (queued.length > 0) {
+          await state.startVideoGeneration(state.videoPrompts, true)
+          pending = Object.entries(usePipelineStore.getState().videoJobs).filter(
+            ([, j]) => j.status === 'pending' && j.jobId
+          )
+        }
+        if (pending.length === 0) {
+          pollingActiveRef.current = false
+          const latestState = usePipelineStore.getState()
+          const stillQueued = queuedVideoUnitIds(latestState.videoProgress, latestState.videoJobs)
+          stopGeneration()
+          if (stillQueued.length > 0) {
+            toast.error(`${stillQueued.length} videos could not be submitted. Resume to retry.`, {
+              id: 'video-submit-queue',
+              duration: 5000,
+            })
+          }
+          return
+        }
       }
 
-      // Poll in chunks of 20 — enough concurrency for fast throughput without
-      // triggering rate limits at 45+ scenes (status endpoint is lightweight)
-      const POLL_CHUNK_SIZE = 20
+      // Keep status traffic under the same provider-facing concurrency ceiling.
+      const POLL_CHUNK_SIZE = MAX_CONCURRENT_VIDEO_REQUESTS
       for (let ci = 0; ci < pending.length; ci += POLL_CHUNK_SIZE) {
         const chunk = pending.slice(ci, ci + POLL_CHUNK_SIZE)
-        await Promise.all(chunk.map(async ([sceneNum]) => {
-          const result = await usePipelineStore.getState().pollVideoStatus(parseInt(sceneNum))
+        await Promise.all(chunk.map(async ([unitId]) => {
+          const result = await usePipelineStore.getState().pollVideoStatus(unitId)
+          const [sceneNum, segIdx] = String(unitId).split('_')
+          const label = Number(segIdx) > 0 ? `Scene ${sceneNum} (shot ${Number(segIdx) + 1})` : `Scene ${sceneNum}`
           if (result?.status === 'completed') {
-            toast.success(`Scene ${sceneNum} ready`, { id: `scene-${sceneNum}`, duration: 3000 })
+            toast.success(`${label} ready`, { id: `scene-${unitId}`, duration: 3000 })
           } else if (result?.status === 'failed') {
-            toast.error(`Scene ${sceneNum} failed`, { id: `scene-${sceneNum}-err`, duration: 4000 })
+            toast.error(`${label} failed`, { id: `scene-${unitId}-err`, duration: 4000 })
           }
         }))
         // 200ms gap between chunks to spread out API calls
@@ -305,13 +330,32 @@ function VideoGeneration() {
         }
       }
 
-      // Check again after polling — if nothing left, stop
-      const stillPending = Object.values(usePipelineStore.getState().videoJobs)
+      // Fill every slot freed by this polling pass before deciding whether the
+      // generation run is finished.
+      {
+        const state = usePipelineStore.getState()
+        if (state.generationState === 'running'
+            && queuedVideoUnitIds(state.videoProgress, state.videoJobs).length > 0) {
+          await state.startVideoGeneration(state.videoPrompts, true)
+        }
+      }
+
+      // Check again after polling/top-up — if nothing active or queued remains, stop.
+      const latestState = usePipelineStore.getState()
+      const stillPending = Object.values(latestState.videoJobs)
         .filter(j => j.status === 'pending' && j.jobId)
+      const stillQueued = queuedVideoUnitIds(latestState.videoProgress, latestState.videoJobs)
 
       if (stillPending.length === 0) {
         pollingActiveRef.current = false
         stopGeneration()
+        if (stillQueued.length > 0) {
+          toast.error(`${stillQueued.length} videos could not be submitted. Resume to retry.`, {
+            id: 'video-submit-queue',
+            duration: 5000,
+          })
+          return
+        }
         const jobs = Object.values(usePipelineStore.getState().videoJobs)
         const done = jobs.filter(j => j.status === 'completed').length
         const fail = jobs.filter(j => j.status === 'failed').length
@@ -366,13 +410,33 @@ function VideoGeneration() {
   const handleSelectAll = () => {
     if (allSelected) {
       // Deselect all
-      videoPrompts.forEach(vp => deselectVideo(vp.scene_number))
+      videoPrompts.forEach(vp => deselectVideo(`${vp.scene_number}_${vp.segment_index ?? 0}`))
     } else {
       // Select all completed videos
       videoPrompts.forEach(vp => {
-        const job = videoJobs[vp.scene_number]
-        if (job?.url && job?.status === 'completed') selectVideo(vp.scene_number)
+        const uk = `${vp.scene_number}_${vp.segment_index ?? 0}`
+        const job = videoJobs[uk]
+        if (job?.url && job?.status === 'completed') selectVideo(uk)
       })
+    }
+  }
+
+  const handleRetryVideoPrompts = async () => {
+    try {
+      const prompts = await retryVideoPrompts()
+      if (!prompts?.length) {
+        throw new Error('No motion prompts were produced. The detailed batch error is shown above.')
+      }
+      await startVideoGeneration(prompts)
+      if (!usePipelineStore.getState().ttsScript) {
+        fetchTtsScript().catch(() => {})
+      }
+    } catch (error) {
+      // Prompt-writing errors are rendered by the dedicated error state. Only
+      // surface failures that occur after prompts exist (video submission).
+      if (usePipelineStore.getState().videoPrompts.length > 0) {
+        toast.error(`Failed to start video generation: ${error.message}`)
+      }
     }
   }
 
@@ -435,7 +499,7 @@ function VideoGeneration() {
             No video prompts have been generated. If you just loaded a project, go back to Images and proceed from there. Otherwise the AI may have returned an empty response — retrying usually succeeds.
           </p>
           <div className="flex gap-3 justify-center">
-            <button onClick={retryVideoPrompts} className="btn-primary px-6 py-2">Retry</button>
+            <button onClick={handleRetryVideoPrompts} className="btn-primary px-6 py-2">Retry</button>
             <button onClick={() => navigate('/images')} className="btn-ghost px-6 py-2">Back to Images</button>
           </div>
         </div>
@@ -459,7 +523,7 @@ function VideoGeneration() {
           <h2 className="text-lg font-semibold text-text-primary mb-2">Video Prompts Failed</h2>
           <p className="text-sm text-text-secondary mb-6">{videoPromptsError}</p>
           <div className="flex gap-3 justify-center">
-            <button onClick={retryVideoPrompts} className="btn-primary px-6 py-2">Retry</button>
+            <button onClick={handleRetryVideoPrompts} className="btn-primary px-6 py-2">Retry</button>
             <button onClick={() => navigate('/images')} className="btn-ghost px-6 py-2">Back to Images</button>
           </div>
         </div>
@@ -491,6 +555,29 @@ function VideoGeneration() {
                   <span className="text-xs text-error ml-2">· {failedCount} failed</span>
                 )}
               </div>
+
+              {/* Stop mid-run — in-flight jobs keep processing remotely; polling
+                  and further submissions halt. Resume restarts both. */}
+              {generationState === 'running' && generationPhase === 'videos' && (
+                <button
+                  onClick={stopGeneration}
+                  title="Stop video generation (keeps progress, resume anytime)"
+                  className="flex items-center gap-1.5 py-1 px-3 text-xs rounded-lg bg-error/10 text-error border border-error/20 font-medium hover:bg-error/20 transition-colors"
+                >
+                  <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 24 24"><path d="M6 6h12v12H6z"/></svg>
+                  Stop
+                </button>
+              )}
+
+              {(generationState === 'stopped' || generationState === 'paused') && videoProgress.pending.length > 0 && (
+                <button
+                  onClick={resumeVideoGeneration}
+                  className="flex items-center gap-1.5 py-1 px-3 text-xs rounded-lg bg-accent text-white font-medium hover:bg-accent-hover transition-colors"
+                >
+                  <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
+                  Resume ({videoProgress.pending.length} left)
+                </button>
+              )}
 
               {generationState === 'stopped' && (
                 <button onClick={handleStartFresh}
@@ -526,7 +613,7 @@ function VideoGeneration() {
               const endScene   = Math.min((i + 1) * VIDEO_SCENES_PER_PAGE, videoPrompts.length)
               const pageCompleted = videoPrompts
                 .slice(i * VIDEO_SCENES_PER_PAGE, (i + 1) * VIDEO_SCENES_PER_PAGE)
-                .filter(vp => videoJobs[vp.scene_number]?.status === 'completed').length
+                .filter(vp => videoJobs[`${vp.scene_number}_${vp.segment_index ?? 0}`]?.status === 'completed').length
               const pageTotal = endScene - startScene + 1
               return (
                 <button
@@ -550,25 +637,32 @@ function VideoGeneration() {
           </div>
         )}
 
-        {/* Video cards */}
+        {/* Video cards — one per shot (scene + segment) */}
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-          {visiblePrompts.map((vp) => (
-            <VideoCard
-              key={vp.scene_number}
-              sceneNumber={vp.scene_number}
-              videoPrompt={vp}
-              job={videoJobs[vp.scene_number]}
-              isSelected={!!selectedVideos[vp.scene_number]}
-              onSelect={() => selectVideo(vp.scene_number)}
-              onDeselect={() => deselectVideo(vp.scene_number)}
-              onRegenerate={(newPrompt) => {
-                regenerateVideo(vp.scene_number, newPrompt).catch(err =>
-                  toast.error(`Regeneration failed: ${err.message}`)
-                )
-              }}
-              onViewFull={() => setSelectedModal(vp.scene_number)}
-            />
-          ))}
+          {visiblePrompts.map((vp) => {
+            const uk = `${vp.scene_number}_${vp.segment_index ?? 0}`
+            const label = (vp.segment_count ?? 1) > 1
+              ? `Scene ${vp.scene_number} · shot ${(vp.segment_index ?? 0) + 1}/${vp.segment_count}`
+              : `Scene ${vp.scene_number}`
+            return (
+              <VideoCard
+                key={uk}
+                sceneNumber={uk}
+                label={label}
+                videoPrompt={vp}
+                job={videoJobs[uk]}
+                isSelected={!!selectedVideos[uk]}
+                onSelect={() => selectVideo(uk)}
+                onDeselect={() => deselectVideo(uk)}
+                onRegenerate={(newPrompt) => {
+                  regenerateVideo(uk, newPrompt).catch(err =>
+                    toast.error(`Regeneration failed: ${err.message}`)
+                  )
+                }}
+                onViewFull={() => setSelectedModal(uk)}
+              />
+            )
+          })}
         </div>
 
         {/* Pagination prev/next footer */}
@@ -673,9 +767,12 @@ function VideoGeneration() {
           {allSelected ? (
             <div className="flex gap-2">
               <button onClick={() => navigate('/audio')} className="btn-ghost px-4 py-2 text-sm">
-                + Audio
+                ← Audio
               </button>
-              <button onClick={() => navigate('/export')} className="btn-secondary px-4 py-2 text-sm">
+              <button onClick={() => navigate('/editor')} className="btn-secondary px-4 py-2 text-sm">
+                Editor →
+              </button>
+              <button onClick={() => navigate('/metadata')} className="btn-secondary px-4 py-2 text-sm">
                 Thumbnail & Metadata
               </button>
               <button onClick={() => setShowExportModal(true)} className="btn-primary px-5 py-2 text-sm">
@@ -694,7 +791,9 @@ function VideoGeneration() {
           <VideoModal
             job={videoJobs[selectedModal]}
             history={videoHistory[selectedModal] || []}
-            videoPrompt={videoPrompts.find(v => v.scene_number === selectedModal)}
+            videoPrompt={videoPrompts.find(v =>
+              `${v.scene_number}_${v.segment_index ?? 0}` === String(selectedModal)
+            )}
             sceneNumber={selectedModal}
             onClose={() => setSelectedModal(null)}
             onRegenerate={(newPrompt) => {

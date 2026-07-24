@@ -1,10 +1,96 @@
 import express from 'express';
-import * as fal from '@fal-ai/client';
+import { fal } from '@fal-ai/client';
 import Replicate from 'replicate';
+import fs from 'fs/promises';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import { createHash } from 'crypto';
+import { isR2Configured, ensureProjectAssetInR2 } from '../lib/r2.js';
 const router = express.Router();
+const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
+const OUTPUT_ROOT = path.resolve(MODULE_DIR, '..', '..', 'output');
 
 const PRO_DURATIONS         = [6, 8, 10];
 const KLING_TURBO_DURATIONS = [5, 10];
+const GROK_DURATIONS        = [6, 10, 15];
+const MOTION_PROMPT_VERSION = 'seedance-2-0-v1';
+const MOTION_PROMPT_MAX_CHARS = 5000;
+export const MAX_CONCURRENT_VIDEO_REQUESTS = 10;
+const REQUIRED_PROTECTED_SECTIONS = [
+  'SOURCE FRAME LOCK:',
+  'CHARACTER / STYLE LOCK:',
+  'WARDROBE LOCK:',
+  'OBJECT LOCK:',
+  'ENDING STATE:',
+  'STABILITY / NEGATIVE CONSTRAINTS:',
+];
+
+export const validateVideoSubmission = (scene) => {
+  const issues = [];
+  const prompt = typeof scene?.video_prompt === 'string' ? scene.video_prompt.trim() : '';
+  if (scene?.motion_prompt_version !== MOTION_PROMPT_VERSION) {
+    issues.push(`motion_prompt_version must be ${MOTION_PROMPT_VERSION}`);
+  }
+  if (scene?.source_frame_locked !== true) issues.push('source_frame_locked must be true');
+  if (!scene?.image_url || typeof scene.image_url !== 'string') issues.push('selected source image is required');
+  if (!prompt) issues.push('video_prompt is required');
+  if (prompt.length > MOTION_PROMPT_MAX_CHARS) {
+    issues.push(`video_prompt exceeds the ${MOTION_PROMPT_MAX_CHARS}-character provider limit`);
+  }
+  for (const section of REQUIRED_PROTECTED_SECTIONS) {
+    if (!prompt.includes(section)) issues.push(`video_prompt is missing protected section ${section}`);
+  }
+  if (prompt && !/immutable frame zero/i.test(prompt)) {
+    issues.push('video_prompt is missing immutable frame-zero authority');
+  }
+  const storyboard = prompt.match(/STORYBOARD \/ SHOT LIST[^\n]*:\s*\n([\s\S]*?)(?=\nENDING STATE:|$)/i)?.[1] || '';
+  const firstShot = storyboard.match(/SHOT\s+1\s+[—-][^\n]*\n([\s\S]*?)(?=\nSHOT\s+\d+\s+[—-]|$)/i)?.[1]?.trim() || '';
+  if (!firstShot) issues.push('video_prompt must contain a nonempty SHOT 1 storyboard beat');
+  const creativeMotion = prompt.match(/SCENE INTENT:\s*([\s\S]*?)(?=\nSTABILITY \/ NEGATIVE CONSTRAINTS:|$)/i)?.[1] || '';
+  const unsafeCreative = creativeMotion.match(/\b(?:becomes?|turns? into|morphs? into)\s+(?:a\s+)?(?:realistic\s+)?human\b|\beyes?\s+(?:open|blink)|\bblinks?\b|\bsmiles?\b|\blips?\s+(?:move|part)|\b(?:skin|flesh)\s+(?:appears?|forms?)\b|\b(?:second|another|additional|extra)\s+(?:person|figure|character|subject|worker|soldier|vehicle|animal)\b.{0,32}\b(?:enters?|appears?|emerges?|joins?)\b/i);
+  if (unsafeCreative) issues.push(`video_prompt contains unsafe identity/entity drift: ${unsafeCreative[0]}`);
+  return issues;
+};
+
+export const requireHttpsImageUrl = (value, label = 'Selected source image') => {
+  let parsed;
+  try {
+    parsed = new URL(String(value || ''));
+  } catch {
+    throw new Error(`${label} must resolve to an absolute HTTPS URL`);
+  }
+  if (parsed.protocol !== 'https:' || !parsed.hostname) {
+    throw new Error(`${label} must resolve to an absolute HTTPS URL`);
+  }
+  const hostname = parsed.hostname.toLowerCase();
+  const ipv4 = hostname.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/)?.slice(1).map(Number);
+  const privateIpv4 = ipv4 && (
+    ipv4[0] === 10
+    || ipv4[0] === 127
+    || (ipv4[0] === 169 && ipv4[1] === 254)
+    || (ipv4[0] === 172 && ipv4[1] >= 16 && ipv4[1] <= 31)
+    || (ipv4[0] === 192 && ipv4[1] === 168)
+  );
+  if (
+    hostname === 'localhost'
+    || hostname.endsWith('.localhost')
+    || hostname.endsWith('.local')
+    || hostname === '::1'
+    || hostname === '0.0.0.0'
+    || privateIpv4
+  ) {
+    throw new Error(`${label} must be publicly reachable by the video provider`);
+  }
+  return parsed.toString();
+};
+
+const addNegativePrompt = (input, scene) => {
+  const negativePrompt = typeof scene?.negative_prompt === 'string'
+    ? scene.negative_prompt.trim()
+    : '';
+  if (negativePrompt) input.negative_prompt = negativePrompt;
+  return input;
+};
 
 // Kling v3 accepts any integer 3-15
 const clampKling = (d) => Math.min(15, Math.max(3, Math.round(d || 5)));
@@ -21,6 +107,13 @@ const clampDuration = (d, videoModel) => {
   if (videoModel === 'kwaivgi/kling-v3-video')       return clampKling(d);
   if (videoModel === 'kwaivgi/kling-v2.5-turbo-pro') return clampKlingTurbo(d);
   if (videoModel === 'lightricks/ltx-2-fast')        return clampFast(d);
+  if (videoModel === 'veo-3.1-fast')                 return 8; // GeminiGen Veo/Omni is fixed 8s
+  if (videoModel === 'grok-3') {
+    // GeminiGen Grok accepts only 6, 10 or 15 — snap UP to the smallest clip
+    // that covers the requested duration (segments must never come up short)
+    const raw = d || 6;
+    return GROK_DURATIONS.find(dur => dur >= raw) ?? 15;
+  }
   // LTX-2 Pro
   const raw = d || 6;
   if (PRO_DURATIONS.includes(raw)) return raw;
@@ -30,7 +123,7 @@ const clampDuration = (d, videoModel) => {
 };
 
 // Build model-specific fal.ai input
-const buildFalInput = (videoModel, scene, duration, resolution, aspectRatio) => {
+export const buildFalInput = (videoModel, scene, duration, resolution, aspectRatio) => {
   if (videoModel === 'kwaivgi/kling-v3-video') {
     const input = {
       prompt: scene.video_prompt,
@@ -40,7 +133,7 @@ const buildFalInput = (videoModel, scene, duration, resolution, aspectRatio) => 
       generate_audio: true,
     };
     if (scene.image_url) input.start_image = scene.image_url;
-    return input;
+    return addNegativePrompt(input, scene);
   }
   if (videoModel === 'kwaivgi/kling-v2.5-turbo-pro') {
     const input = {
@@ -50,7 +143,7 @@ const buildFalInput = (videoModel, scene, duration, resolution, aspectRatio) => 
       generate_audio: true,
     };
     if (scene.image_url) input.start_image = scene.image_url;
-    return input;
+    return addNegativePrompt(input, scene);
   }
   // LTX-2 Pro / Fast
   const input = {
@@ -61,11 +154,11 @@ const buildFalInput = (videoModel, scene, duration, resolution, aspectRatio) => 
     generate_audio: true,
   };
   if (scene.image_url) input.image_url = scene.image_url;
-  return input;
+  return addNegativePrompt(input, scene);
 };
 
 // Build model-specific Replicate input
-const buildReplicateInput = (videoModel, scene, duration, resolution, aspectRatio) => {
+export const buildReplicateInput = (videoModel, scene, duration, resolution, aspectRatio) => {
   if (videoModel === 'kwaivgi/kling-v3-video') {
     const input = {
       prompt: scene.video_prompt,
@@ -75,7 +168,7 @@ const buildReplicateInput = (videoModel, scene, duration, resolution, aspectRati
       generate_audio: true,
     };
     if (scene.image_url) input.start_image = scene.image_url;
-    return input;
+    return addNegativePrompt(input, scene);
   }
   if (videoModel === 'kwaivgi/kling-v2.5-turbo-pro') {
     const input = {
@@ -85,7 +178,7 @@ const buildReplicateInput = (videoModel, scene, duration, resolution, aspectRati
       generate_audio: true,
     };
     if (scene.image_url) input.start_image = scene.image_url;
-    return input;
+    return addNegativePrompt(input, scene);
   }
   // LTX-2 Pro / Fast
   const input = {
@@ -96,7 +189,7 @@ const buildReplicateInput = (videoModel, scene, duration, resolution, aspectRati
     generate_audio: true,
   };
   if (scene.image_url) input.image = scene.image_url;
-  return input;
+  return addNegativePrompt(input, scene);
 };
 
 const getFalClient = (req) => {
@@ -123,29 +216,214 @@ const parseDataUri = (dataUri) => {
   return { mimeType: match[1], buffer: Buffer.from(match[2], 'base64') };
 };
 
+const mimeForPath = (filePath) => {
+  const ext = path.extname(filePath).toLowerCase();
+  if (ext === '.png') return 'image/png';
+  if (ext === '.webp') return 'image/webp';
+  return 'image/jpeg';
+};
+
+// Project loading resolves durable assets to the backend's own session URL.
+// Remote video providers cannot fetch localhost, so read that file directly
+// and upload it just like a data URI. This also keeps old saved projects on
+// the source-frame-locked path instead of silently degrading to text-to-video.
+const readLocalSessionImage = async (imageUrl) => {
+  const match = String(imageUrl || '').match(/\/api\/session\/([^/]+)\/files\/([^?#]+)/);
+  if (!match) return null;
+  const sessionId = decodeURIComponent(match[1]);
+  const relativePath = decodeURIComponent(match[2]);
+  if (!sessionId || sessionId.includes('..') || /[\\/]/.test(sessionId) || !relativePath || relativePath.includes('..')) {
+    throw new Error('Invalid local session image path');
+  }
+  const sessionRoot = path.join(OUTPUT_ROOT, sessionId);
+  const absolutePath = path.resolve(sessionRoot, relativePath);
+  if (!absolutePath.startsWith(`${sessionRoot}${path.sep}`)) throw new Error('Local session image escaped its project directory');
+  return {
+    buffer: await fs.readFile(absolutePath),
+    mimeType: mimeForPath(absolutePath),
+    sessionId,
+    relativePath,
+  };
+};
+
 // If image_url is a base64 data URI, upload it to the provider's file store
 // and return a stable HTTPS URL the model can actually fetch.
 // Plain HTTPS URLs are returned unchanged.
 const resolveImageUrl = async (imageUrl, provider, client) => {
-  if (!imageUrl || !imageUrl.startsWith('data:')) return imageUrl;
+  if (!imageUrl) {
+    throw new Error('Selected source image is missing; refusing text-only generation because frame identity and mannequin continuity cannot be preserved');
+  }
   try {
-    const { mimeType, buffer } = parseDataUri(imageUrl);
+    const local = await readLocalSessionImage(imageUrl);
+    if (!local && !imageUrl.startsWith('data:')) {
+      return requireHttpsImageUrl(imageUrl);
+    }
+    const { mimeType, buffer } = local || parseDataUri(imageUrl);
     if (provider === 'replicate') {
       // Replicate file store — returns a stable r2 URL
       const blob = new Blob([buffer], { type: mimeType });
       const url = await client.files.create(blob, { filename: 'scene.jpg' });
-      return url.urls?.get || url.url || imageUrl;
+      return requireHttpsImageUrl(url.urls?.get || url.url, 'Uploaded selected source image');
     } else {
       // fal storage upload — returns a CDN URL
       const blob = new Blob([buffer], { type: mimeType });
       const file = new File([blob], 'scene.jpg', { type: mimeType });
       const url = await client.storage.upload(file);
-      return url;
+      return requireHttpsImageUrl(url, 'Uploaded selected source image');
     }
   } catch (err) {
-    console.warn('resolveImageUrl: upload failed, proceeding without image input:', err.message);
-    return null;
+    throw new Error(`Could not prepare the selected source image for ${provider}; video generation was stopped to prevent identity/style drift: ${err.message}`);
   }
+};
+
+// ─── GeminiGen (snapgen.ai) Veo/Omni + Grok provider — ported from Storyforge ─
+const GEMINIGEN_BASE_URL = 'https://api.snapgen.ai/uapi/v1';
+const GEMINIGEN_RESOLUTION = '720p';
+const GEMINIGEN_MODE_IMAGE = 'frame';
+// Models served through the GeminiGen provider and their fixed/allowed durations
+const GEMINIGEN_MODELS = new Set(['veo-3.1-fast', 'grok-3']);
+
+// Grok uses named aspect ratios instead of W:H strings
+const grokAspectRatio = (aspectRatio) => {
+  if (aspectRatio === '9:16') return 'portrait';
+  if (aspectRatio === '1:1')  return 'square';
+  return 'landscape'; // 16:9 default
+};
+
+const getGeminigenKey = (req) => {
+  const keys = req.app.get('apiKeys');
+  if (!keys.geminigen) {
+    throw new Error('GeminiGen API key not configured');
+  }
+  return keys.geminigen;
+};
+
+// GeminiGen requires a PUBLIC reference image URL — it cannot accept base64.
+// Base64 images are uploaded to Cloudflare R2 (same mechanism Storyforge uses),
+// falling back to fal storage or Replicate's file store if R2 isn't configured.
+const resolvePublicImageUrl = async (req, imageUrl, requestedSessionId) => {
+  if (!imageUrl) throw new Error('GeminiGen requires a reference image for every scene');
+  const local = await readLocalSessionImage(imageUrl);
+  if (!local && imageUrl.startsWith('https://')) return requireHttpsImageUrl(imageUrl);
+  if (!local && !imageUrl.startsWith('data:')) throw new Error('Unsupported image URL format for GeminiGen');
+
+  const { mimeType, buffer } = local || parseDataUri(imageUrl);
+  const sessionId = local?.sessionId || String(requestedSessionId || '').trim();
+  if (local?.sessionId && requestedSessionId && local.sessionId !== requestedSessionId) {
+    throw new Error('Selected source image belongs to a different project session');
+  }
+  if (!isR2Configured()) {
+    throw new Error('GeminiGen needs project-scoped R2 storage for local source images. Configure R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET_NAME, and R2_PUBLIC_URL in backend/.env.');
+  }
+
+  const ext = mimeType.includes('png') ? 'png' : mimeType.includes('webp') ? 'webp' : 'jpg';
+  const digest = createHash('sha256').update(buffer).digest('hex').slice(0, 24);
+  const relativePath = local?.relativePath || `images/submissions/${digest}.${ext}`;
+  try {
+    const publicUrl = await ensureProjectAssetInR2(buffer, mimeType, { sessionId, relativePath });
+    return requireHttpsImageUrl(publicUrl, 'R2 selected source image');
+  } catch (error) {
+    throw new Error(`Could not publish the selected source image to project-scoped R2 storage: ${error.message}`);
+  }
+};
+
+const createGeminigenJob = async (apiKey, prompt, imageUrl, aspectRatio, videoModel = 'veo-3.1-fast', duration = 8) => {
+  const isGrok = videoModel === 'grok-3';
+  const formData = new FormData();
+  formData.append('prompt', prompt);
+  formData.append('model', videoModel);
+  formData.append('resolution', GEMINIGEN_RESOLUTION);
+  formData.append('duration', String(duration));
+  if (isGrok) {
+    // Grok endpoint: named aspect ratios, mode=custom, public URLs via file_urls
+    formData.append('aspect_ratio', grokAspectRatio(aspectRatio));
+    formData.append('mode', 'custom');
+    formData.append('file_urls', imageUrl);
+  } else {
+    formData.append('aspect_ratio', aspectRatio === '9:16' ? '9:16' : '16:9');
+    formData.append('mode_image', GEMINIGEN_MODE_IMAGE);
+    formData.append('ref_images', imageUrl);
+  }
+
+  const endpoint = isGrok ? 'video-gen/grok' : 'video-gen/veo';
+  const response = await fetch(`${GEMINIGEN_BASE_URL}/${endpoint}`, {
+    method: 'POST',
+    headers: { 'x-api-key': apiKey },
+    body: formData,
+    signal: AbortSignal.timeout(120_000),
+  });
+
+  const text = await response.text();
+  let payload;
+  try { payload = JSON.parse(text); } catch { payload = { error_message: text || `HTTP ${response.status}` }; }
+
+  if (!response.ok) {
+    throw new Error(`GeminiGen create failed (${response.status}): ${payload.error_message || payload.status_desc || 'Unknown error'}`);
+  }
+  if (payload.status === 3) {
+    throw new Error(payload.error_message || payload.status_desc || 'GeminiGen generation failed at submit');
+  }
+  if (!payload.uuid) {
+    throw new Error('GeminiGen did not return a generation uuid');
+  }
+  return payload.uuid;
+};
+
+const looksLikeVideoUrl = (value) => {
+  if (!/^https?:\/\//i.test(value)) return false;
+  return /\.(mp4|mov|webm)(?:[?#].*)?$/i.test(value) || /video/i.test(value);
+};
+
+// GeminiGen's history payload nests the output URL inconsistently — search it.
+const findVideoUrl = (value) => {
+  if (typeof value === 'string') return looksLikeVideoUrl(value) ? value : undefined;
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const found = findVideoUrl(item);
+      if (found) return found;
+    }
+    return undefined;
+  }
+  if (!value || typeof value !== 'object') return undefined;
+  for (const key of ['video_url', 'videoUrl', 'file_url', 'fileUrl', 'output_url', 'outputUrl', 'url']) {
+    const field = value[key];
+    if (typeof field === 'string' && looksLikeVideoUrl(field)) return field;
+  }
+  for (const child of Object.values(value)) {
+    const found = findVideoUrl(child);
+    if (found) return found;
+  }
+  return undefined;
+};
+
+const getGeminigenStatus = async (apiKey, uuid) => {
+  const response = await fetch(`${GEMINIGEN_BASE_URL}/history/${encodeURIComponent(uuid)}`, {
+    method: 'GET',
+    headers: { 'x-api-key': apiKey },
+    signal: AbortSignal.timeout(30_000),
+  });
+  const text = await response.text();
+  if (!response.ok) {
+    throw new Error(`GeminiGen history check failed (${response.status}): ${text.slice(0, 200)}`);
+  }
+  let history;
+  try { history = JSON.parse(text); } catch {
+    throw new Error(`GeminiGen history returned invalid JSON: ${text.slice(0, 200)}`);
+  }
+
+  const status = String(history.status ?? '');
+  const statusText = String(history.status_desc || '').toLowerCase();
+  const videoUrl = findVideoUrl(history);
+
+  if (status === '2' || statusText.includes('complete') || statusText.includes('success')) {
+    return videoUrl
+      ? { status: 'completed', url: videoUrl }
+      : { status: 'pending' }; // completed but URL not surfaced yet — retry next poll
+  }
+  if (status === '3' || statusText.includes('fail') || statusText.includes('error')) {
+    return { status: 'failed', error: history.error_message || history.status_desc || 'GeminiGen generation failed' };
+  }
+  return { status: 'pending' };
 };
 
 // Helper to process in batches of N, with per-item error isolation.
@@ -182,15 +460,52 @@ const getFalEndpoint = (videoModel) =>
 
 router.post('/generate', async (req, res) => {
   try {
-    const { scenes, provider = 'fal', resolution = '1080p', aspectRatio = '16:9', videoModel = 'lightricks/ltx-2-pro' } = req.body;
+    const { scenes, sessionId, provider = 'fal', resolution = '1080p', aspectRatio = '16:9', videoModel = 'lightricks/ltx-2-pro' } = req.body;
 
     if (!Array.isArray(scenes) || scenes.length === 0) {
       return res.status(400).json({ error: true, message: 'scenes array is required and must be non-empty', code: 'MISSING_SCENES' });
     }
+    if (scenes.length > MAX_CONCURRENT_VIDEO_REQUESTS) {
+      return res.status(400).json({
+        error: true,
+        message: `Submit no more than ${MAX_CONCURRENT_VIDEO_REQUESTS} video requests at once.`,
+        code: 'VIDEO_CONCURRENCY_LIMIT',
+      });
+    }
+    const invalidScenes = scenes
+      .map(scene => ({ scene_number: scene?.scene_number, issues: validateVideoSubmission(scene) }))
+      .filter(result => result.issues.length > 0);
+    if (invalidScenes.length > 0) {
+      return res.status(400).json({
+        error: true,
+        message: 'Video submission failed the protected Seedance contract.',
+        code: 'UNSAFE_VIDEO_SUBMISSION',
+        scenes: invalidScenes,
+      });
+    }
+
+    if (provider === 'geminigen') {
+      const apiKey = getGeminigenKey(req);
+
+      const geminigenModel = GEMINIGEN_MODELS.has(videoModel) ? videoModel : 'veo-3.1-fast';
+      const processScene = async (scene) => {
+        const duration = clampDuration(scene.duration_seconds, geminigenModel);
+        const publicUrl = await resolvePublicImageUrl(req, scene.image_url, sessionId);
+        const uuid = await createGeminigenJob(apiKey, scene.video_prompt, publicUrl, aspectRatio, geminigenModel, duration);
+        return {
+          scene_number: scene.scene_number,
+          job_id: uuid,
+          status: 'pending'
+        };
+      };
+
+      const jobs = await processInBatches(scenes, MAX_CONCURRENT_VIDEO_REQUESTS, processScene);
+      return res.json(jobs);
+    }
 
     if (provider === 'replicate') {
       const replicate = getReplicateClient(req);
-      
+
       const processScene = async (scene) => {
         const duration = clampDuration(scene.duration_seconds, videoModel);
         // Upload base64 image to Replicate file store so the model gets an HTTPS URL
@@ -210,8 +525,7 @@ router.post('/generate', async (req, res) => {
         };
       };
       
-      // Process 2 videos at a time
-      const jobs = await processInBatches(scenes, 2, processScene);
+      const jobs = await processInBatches(scenes, MAX_CONCURRENT_VIDEO_REQUESTS, processScene);
       res.json(jobs);
       
     } else {
@@ -234,8 +548,7 @@ router.post('/generate', async (req, res) => {
         };
       };
       
-      // Process 2 videos at a time
-      const jobs = await processInBatches(scenes, 2, processScene);
+      const jobs = await processInBatches(scenes, MAX_CONCURRENT_VIDEO_REQUESTS, processScene);
       res.json(jobs);
     }
   } catch (error) {
@@ -248,7 +561,13 @@ router.get('/status/:jobId', async (req, res) => {
   try {
     const { jobId } = req.params;
     const { provider = 'fal', falEndpoint } = req.query;
-    
+
+    if (provider === 'geminigen') {
+      const apiKey = getGeminigenKey(req);
+      const result = await getGeminigenStatus(apiKey, jobId);
+      return res.json(result);
+    }
+
     if (provider === 'replicate') {
       const replicate = getReplicateClient(req);
       const prediction = await replicate.predictions.get(jobId);
@@ -303,15 +622,57 @@ router.get('/status/:jobId', async (req, res) => {
 
 router.post('/regenerate', async (req, res) => {
   try {
-    const { scene_number, video_prompt, duration_seconds, image_url, provider = 'fal', resolution = '1080p', aspectRatio = '16:9', videoModel = 'lightricks/ltx-2-pro' } = req.body;
+    const {
+      scene_number,
+      video_prompt,
+      duration_seconds,
+      image_url,
+      negative_prompt,
+      motion_prompt_version,
+      source_frame_locked,
+      provider = 'fal',
+      resolution = '1080p',
+      aspectRatio = '16:9',
+      videoModel = 'lightricks/ltx-2-pro',
+      sessionId,
+    } = req.body;
+    const submittedScene = {
+      scene_number,
+      video_prompt,
+      image_url,
+      negative_prompt,
+      motion_prompt_version,
+      source_frame_locked,
+    };
+    const validationIssues = validateVideoSubmission(submittedScene);
+    if (validationIssues.length > 0) {
+      return res.status(400).json({
+        error: true,
+        message: 'Video regeneration failed the protected Seedance contract.',
+        code: 'UNSAFE_VIDEO_SUBMISSION',
+        issues: validationIssues,
+      });
+    }
     
     const duration = clampDuration(duration_seconds, videoModel);
-    
+
+    if (provider === 'geminigen') {
+      const apiKey = getGeminigenKey(req);
+      const geminigenModel = GEMINIGEN_MODELS.has(videoModel) ? videoModel : 'veo-3.1-fast';
+      const publicUrl = await resolvePublicImageUrl(req, image_url, sessionId);
+      const uuid = await createGeminigenJob(apiKey, video_prompt, publicUrl, aspectRatio, geminigenModel, clampDuration(duration_seconds, geminigenModel));
+      return res.json({
+        scene_number,
+        job_id: uuid,
+        status: 'pending'
+      });
+    }
+
     if (provider === 'replicate') {
       const replicate = getReplicateClient(req);
       // Upload base64 image to Replicate file store so the model gets an HTTPS URL
       const resolvedImageUrl = await resolveImageUrl(image_url, 'replicate', replicate);
-      const sceneForBuilder = { video_prompt, image_url: resolvedImageUrl };
+      const sceneForBuilder = { ...submittedScene, image_url: resolvedImageUrl };
       const input = buildReplicateInput(videoModel, sceneForBuilder, duration, resolution, aspectRatio);
       
       const prediction = await replicate.predictions.create({
@@ -329,7 +690,7 @@ router.post('/regenerate', async (req, res) => {
       const falEndpoint = getFalEndpoint(videoModel);
       // Upload base64 image to fal storage so the model gets an HTTPS URL
       const resolvedImageUrl = await resolveImageUrl(image_url, 'fal', fal);
-      const sceneForBuilder = { video_prompt, image_url: resolvedImageUrl };
+      const sceneForBuilder = { ...submittedScene, image_url: resolvedImageUrl };
       const falInput = buildFalInput(videoModel, sceneForBuilder, duration, resolution, aspectRatio);
       const { request_id } = await fal.queue.submit(falEndpoint, { input: falInput });
       

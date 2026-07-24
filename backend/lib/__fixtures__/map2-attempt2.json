@@ -1,0 +1,65 @@
+{
+  "bakes": [
+    { "name": "reich-1944", "ids": ["276", "616", "203"], "color": "red" }
+  ],
+  "focus": [
+    { "frame": 90, "subject": "Sagan / Stalag Luft III", "kind": "detail", "bounds": [12.3, 49.4, 18.3, 53.8] },
+    { "frame": 265, "subject": "Dispersal across occupied Europe", "kind": "establishing", "bounds": [8.0, 48.0, 20.0, 57.0] },
+    { "frame": 450, "subject": "Southwest line to Gibraltar", "kind": "detail", "bounds": [-6.0, 35.5, 5.0, 45.5] }
+  ],
+  "props": {
+    "variant": "archival",
+    "durationInFrames": 480,
+    "camera": [
+      { "frame": 0, "lon": 15.9, "lat": 52.6, "zoom": 2.30 },
+      { "frame": 90, "lon": 15.4, "lat": 53.0, "zoom": 2.27 },
+      { "frame": 145, "lon": 15.1, "lat": 53.2, "zoom": 2.25 },
+      { "frame": 265, "lon": 14.2, "lat": 53.2, "zoom": 1.06, "ease": "inOut" },
+      { "frame": 325, "lon": 13.6, "lat": 53.0, "zoom": 1.05 },
+      { "frame": 445, "lon": 0.0, "lat": 39.5, "zoom": 1.95, "ease": "inOut" },
+      { "frame": 479, "lon": -0.3, "lat": 39.2, "zoom": 1.96 }
+    ],
+    "fills": [
+      { "highlight": "reich-1944", "fadeIn": [20, 75], "fadeOut": [330, 390] },
+      { "highlight": "sweden-neutral", "fadeIn": [250, 300], "fadeOut": [380, 430] }
+    ],
+    "labels": [
+      { "lines": ["Sagan"], "lon": 15.4, "lat": 51.4, "size": 20, "tracking": 0.5, "heroFrame": 90, "appear": [15, 45], "fade": [300, 340] },
+      { "lines": ["Germany"], "lon": 8.5, "lat": 49.2, "size": 38, "tracking": 0.7, "heroFrame": 250, "appear": [150, 190], "fade": [300, 340] },
+      { "lines": ["Poland"], "lon": 19.5, "lat": 52.8, "size": 30, "tracking": 0.6, "heroFrame": 250, "appear": [150, 190], "fade": [300, 340] },
+      { "lines": ["Baltic Sea"], "lon": 19.5, "lat": 55.8, "size": 34, "tracking": 0.7, "heroFrame": 250, "appear": [180, 220], "fade": [320, 360] },
+      { "lines": ["Sweden"], "lon": 14.5, "lat": 59.5, "size": 34, "tracking": 0.7, "heroFrame": 280, "appear": [200, 240], "fade": [340, 380] },
+      { "lines": ["North Sea"], "lon": 4.0, "lat": 56.5, "size": 34, "tracking": 0.7, "heroFrame": 250, "appear": [180, 220], "fade": [300, 340] },
+      { "lines": ["France"], "lon": 1.5, "lat": 43.8, "size": 30, "tracking": 0.6, "heroFrame": 450, "appear": [350, 390] },
+      { "lines": ["Spain"], "lon": -4.0, "lat": 39.5, "size": 30, "tracking": 0.6, "heroFrame": 465, "appear": [360, 400] }
+    ],
+    "arrows": [
+      { "points": [[15.3, 51.6], [13.5, 50.2], [12.0, 49.3]], "grow": [165, 220], "color": "neutral", "width": 7, "fade": [305, 345] },
+      { "points": [[15.3, 51.6], [16.8, 49.9], [17.4, 48.6]], "grow": [173, 228], "color": "neutral", "width": 7, "fade": [305, 345] },
+      { "points": [[15.3, 51.6], [18.2, 52.4], [19.5, 52.9]], "grow": [181, 236], "color": "neutral", "width": 7, "fade": [305, 345] },
+      { "points": [[15.3, 51.6], [13.0, 53.2], [11.6, 54.0]], "grow": [189, 244], "color": "neutral", "width": 7, "fade": [305, 345] },
+      { "points": [[15.3, 51.6], [16.2, 53.5], [16.6, 54.4]], "grow": [197, 252], "color": "neutral", "width": 7, "fade": [305, 345] },
+      { "points": [[15.3, 51.6], [11.8, 51.0], [9.6, 51.4]], "grow": [205, 260], "color": "neutral", "width": 7, "fade": [305, 345] },
+      { "points": [[15.3, 51.6], [14.8, 49.2], [14.2, 48.2]], "grow": [213, 268], "color": "neutral", "width": 7, "fade": [305, 345] },
+      { "points": [[15.3, 51.6], [10.5, 53.6], [8.6, 54.2]], "grow": [221, 276], "color": "neutral", "width": 7, "fade": [305, 345] },
+      { "points": [[15.3, 51.6], [14.6, 52.6], [14.55, 53.4]], "grow": [230, 285], "color": "teal", "width": 10, "fade": [340, 380] },
+      { "points": [[14.55, 53.4], [14.2, 54.6], [13.15, 55.4]], "grow": [285, 340], "color": "teal", "width": 10, "fade": [345, 385] },
+      { "points": [[15.3, 51.6], [17.8, 54.2], [15.0, 56.3]], "grow": [240, 300], "color": "teal", "width": 10, "fade": [345, 385] },
+      { "points": [[15.3, 51.6], [10.0, 50.0], [5.0, 48.6]], "grow": [250, 310], "color": "teal", "width": 12 },
+      { "points": [[5.0, 48.6], [1.0, 45.5], [-1.6, 43.3]], "grow": [310, 370], "color": "teal", "width": 12 },
+      { "points": [[-1.6, 43.3], [-4.0, 40.0], [-5.35, 36.2]], "grow": [370, 430], "color": "teal", "width": 12 }
+    ],
+    "markers": [
+      { "lon": 15.3, "lat": 51.6, "appear": [10, 40], "color": "red", "label": "Stalag Luft III", "detail": "76 men out, 24 March 1944", "heroFrame": 90, "fade": [300, 335] },
+      { "lon": 14.55, "lat": 53.4, "appear": [200, 225], "color": "teal", "label": "Stettin", "detail": "north route to the Baltic", "heroFrame": 265, "fade": [330, 360] },
+      { "lon": -5.35, "lat": 36.14, "appear": [380, 405], "color": "teal", "label": "Gibraltar", "detail": "the long way home", "heroFrame": 445 }
+    ],
+    "grade": [
+      { "frame": 280, "brightness": 1, "darkness": 0 },
+      { "frame": 400, "brightness": 0.8, "darkness": 0.26 }
+    ],
+    "pitch": 34,
+    "rotateZ": 0,
+    "perspective": 1650
+  }
+}

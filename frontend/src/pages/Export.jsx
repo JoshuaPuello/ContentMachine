@@ -1,8 +1,274 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
+import { useLocation, useNavigate } from 'react-router-dom'
 import { motion, AnimatePresence } from 'framer-motion'
 import { usePipelineStore } from '../store/pipelineStore'
+import { timelineTotalDuration } from '../lib/timeline'
 import toast from 'react-hot-toast'
 import api from '../services/api'
+
+// ─── Final Film — full cinematic render via the studio timeline ─────────────
+const CINEMA_STYLES = [
+  { value: 'chronicle', label: 'Chronicle' },
+  { value: 'heritage', label: 'Heritage' },
+  { value: 'nocturne', label: 'Nocturne' },
+]
+
+const fmtDuration = (s) => {
+  const m = Math.floor(s / 60)
+  const sec = Math.round(s % 60)
+  return `${m}:${String(sec).padStart(2, '0')}`
+}
+
+function FinalFilmCard() {
+  const navigate = useNavigate()
+  const logRef = useRef(null)
+  const {
+    timeline,
+    renderJob,
+    renderHistory,
+    renderFilm,
+    cancelRender,
+    loadRenderHistory,
+    deleteRenderVersion,
+    deleteAllRenderVersions,
+    settings,
+    setCinemaStyle,
+  } = usePipelineStore()
+
+  const isRendering = renderJob?.status === 'running'
+
+  // Keep the log tail pinned to the bottom
+  useEffect(() => {
+    if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight
+  }, [renderJob?.log?.length])
+
+  useEffect(() => {
+    loadRenderHistory().catch(error => {
+      toast.error(`Could not load render history: ${error.message}`)
+    })
+  }, [loadRenderHistory])
+
+  const handleRender = () => {
+    renderFilm().catch(err => toast.error(`Render failed to start: ${err.message}`))
+  }
+
+  const counts = (() => {
+    const items = timeline?.items || []
+    const of = (pred) => items.filter(pred).length
+    return {
+      clips: of(i => i.kind === 'clip'),
+      narration: of(i => i.kind === 'narration'),
+      cinema: of(i => ['map', 'chapter-reveal', 'chapter-active', 'title'].includes(i.kind)),
+      graphics: of(i => ['lower-third', 'date-chip'].includes(i.kind)),
+      music: of(i => i.kind === 'music'),
+    }
+  })()
+  const totalDuration = timelineTotalDuration(timeline?.items || [])
+
+  return (
+    <section className="bg-surface border border-border rounded-xl p-6">
+      <div className="flex items-center justify-between mb-5">
+        <div>
+          <h2 className="text-base font-semibold text-text-primary">Final Film</h2>
+          <p className="text-xs text-text-secondary mt-0.5">
+            Full cinematic render of the studio timeline (Remotion)
+          </p>
+        </div>
+        {timeline?.built && (
+          <div className="flex items-center gap-2">
+            <select
+              value={settings.cinemaStyle || 'chronicle'}
+              onChange={e => setCinemaStyle(e.target.value)}
+              disabled={isRendering}
+              className="!w-32 text-xs !py-1.5"
+              title="Cinema style variant"
+            >
+              {CINEMA_STYLES.map(s => (
+                <option key={s.value} value={s.value}>{s.label}</option>
+              ))}
+            </select>
+            {isRendering ? (
+              <button
+                onClick={() => cancelRender()}
+                className="px-3 py-1.5 text-xs rounded-lg border border-error/40 text-error hover:bg-error/10 transition-colors"
+              >
+                Cancel
+              </button>
+            ) : (
+              <button onClick={handleRender} className="btn-primary py-1.5 px-4 text-xs font-medium">
+                {renderHistory.length ? 'Render New Version' : 'Render Final Film'}
+              </button>
+            )}
+          </div>
+        )}
+      </div>
+
+      {!timeline?.built ? (
+        <div className="text-center py-8">
+          <p className="text-sm text-text-secondary mb-3">
+            The studio timeline hasn't been built yet — arrange the film in the Editor first.
+          </p>
+          <button onClick={() => navigate('/editor')} className="btn-primary px-5 py-2 text-sm">
+            Open Editor
+          </button>
+        </div>
+      ) : (
+        <div className="space-y-4">
+          {/* Timeline summary */}
+          <div className="flex flex-wrap gap-1.5">
+            <span className="text-[10px] bg-surface-raised border border-border rounded px-2 py-1 text-text-secondary font-mono">
+              {fmtDuration(totalDuration)}
+            </span>
+            <span className="text-[10px] bg-surface-raised border border-border rounded px-2 py-1 text-text-secondary">
+              {counts.clips} clips
+            </span>
+            <span className="text-[10px] bg-surface-raised border border-border rounded px-2 py-1 text-text-secondary">
+              {counts.narration} narration
+            </span>
+            {counts.cinema > 0 && (
+              <span className="text-[10px] bg-surface-raised border border-border rounded px-2 py-1 text-text-secondary">
+                {counts.cinema} cinema
+              </span>
+            )}
+            {counts.graphics > 0 && (
+              <span className="text-[10px] bg-surface-raised border border-border rounded px-2 py-1 text-text-secondary">
+                {counts.graphics} graphics
+              </span>
+            )}
+            {counts.music > 0 && (
+              <span className="text-[10px] bg-surface-raised border border-border rounded px-2 py-1 text-text-secondary">
+                {counts.music} music
+              </span>
+            )}
+          </div>
+
+          {/* Render progress / result */}
+          {renderJob && (
+            <div className="space-y-3">
+              {isRendering && (
+                <>
+                  <div className="flex items-center justify-between text-xs">
+                    <span className="text-text-secondary flex items-center gap-2">
+                      <div className="w-3 h-3 border-2 border-accent border-t-transparent rounded-full animate-spin" />
+                      {renderJob.stage || 'working'}…
+                    </span>
+                    <span className="font-mono text-text-secondary">{renderJob.progress || 0}%</span>
+                  </div>
+                  <div className="h-1.5 bg-surface-raised rounded-full overflow-hidden">
+                    <div
+                      className="h-full bg-accent rounded-full transition-all duration-500"
+                      style={{ width: `${renderJob.progress || 0}%` }}
+                    />
+                  </div>
+                </>
+              )}
+
+              {renderJob.status === 'failed' && (
+                <div className="border border-error/30 bg-error/5 rounded-lg p-3">
+                  <p className="text-xs text-error leading-relaxed mb-2">{renderJob.error || 'Render failed'}</p>
+                  <button onClick={handleRender} className="btn-secondary py-1.5 px-3 text-xs">
+                    Retry render
+                  </button>
+                </div>
+              )}
+
+              {renderJob.status === 'canceled' && (
+                <p className="text-xs text-text-disabled">Render canceled.</p>
+              )}
+
+              {renderJob.status === 'completed' && renderJob.output && (
+                <p className="text-xs text-success">New render completed and added to this project's history.</p>
+              )}
+
+              {/* Live log tail */}
+              {(isRendering || renderJob.status === 'failed') && renderJob.log?.length > 0 && (
+                <pre
+                  ref={logRef}
+                  className="font-mono text-[10px] leading-relaxed text-text-secondary bg-background border border-border rounded-lg p-3 max-h-40 overflow-y-auto whitespace-pre-wrap"
+                >
+                  {renderJob.log.join('\n')}
+                </pre>
+              )}
+            </div>
+          )}
+
+          <div className="border-t border-border pt-4">
+            <div className="flex items-center justify-between mb-3">
+              <div>
+                <h3 className="text-xs font-semibold text-text-primary">Project Render History</h3>
+                <p className="text-[10px] text-text-disabled mt-0.5">
+                  Every final MP4 generated for this project is retained here.
+                </p>
+              </div>
+              {renderHistory.length > 0 && (
+                <button
+                  type="button"
+                  onClick={async () => {
+                    if (!window.confirm(`Delete all ${renderHistory.length} rendered films for this project? This cannot be undone.`)) return
+                    try {
+                      await deleteAllRenderVersions()
+                      toast.success('All project renders deleted')
+                    } catch (error) {
+                      toast.error(`Delete failed: ${error.message}`)
+                    }
+                  }}
+                  className="text-[10px] text-error hover:text-error/80"
+                >
+                  Delete all
+                </button>
+              )}
+            </div>
+            {renderHistory.length === 0 ? (
+              <div className="rounded-lg border border-dashed border-border py-7 text-center text-xs text-text-disabled">
+                No final films have been rendered for this project yet.
+              </div>
+            ) : (
+              <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                {renderHistory.map((render, index) => (
+                  <article key={render.name} className="rounded-lg border border-border bg-background/50 overflow-hidden">
+                    <video controls preload="metadata" src={render.url} className="w-full aspect-video bg-black" />
+                    <div className="p-3">
+                      <div className="flex items-start gap-3">
+                        <div className="min-w-0">
+                          <p className="text-xs font-medium text-text-primary truncate">
+                            {index === 0 ? 'Latest · ' : ''}{render.name}
+                          </p>
+                          <p className="text-[10px] text-text-disabled mt-1">
+                            {new Date(render.createdAt).toLocaleString()} · {(render.size / 1024 / 1024).toFixed(1)} MB
+                          </p>
+                        </div>
+                        <div className="ml-auto flex items-center gap-2 shrink-0">
+                          <a href={render.url} download className="text-[10px] text-accent hover:text-accent-hover">
+                            Download
+                          </a>
+                          <button
+                            type="button"
+                            onClick={async () => {
+                              if (!window.confirm(`Delete ${render.name}? This cannot be undone.`)) return
+                              try {
+                                await deleteRenderVersion(render.name)
+                                toast.success('Render deleted')
+                              } catch (error) {
+                                toast.error(`Delete failed: ${error.message}`)
+                              }
+                            }}
+                            className="text-[10px] text-error hover:text-error/80"
+                          >
+                            Delete
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  </article>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+    </section>
+  )
+}
 
 // Lightbox with history navigation for thumbnails.
 // versions: [{url, prompt}] oldest-first, last entry is latest.
@@ -90,6 +356,9 @@ function ThumbnailLightbox({ versions, slotIndex, selectedThumbnail, onSelect, o
 }
 
 function Export() {
+  const location = useLocation()
+  const navigate = useNavigate()
+  const isMetadataPage = location.pathname === '/metadata'
   const [thumbnailProvider, setThumbnailProvider] = useState('fal')
   const [customTag, setCustomTag] = useState('')
   const [exporting, setExporting] = useState(false)
@@ -125,10 +394,16 @@ function Export() {
   } = usePipelineStore()
 
   useEffect(() => {
-    if (!youtubeMetadata && !metadataLoading) {
+    if (isMetadataPage && !youtubeMetadata && !metadataLoading) {
       initMetadata()
     }
-  }, [])
+  }, [isMetadataPage])
+
+  useEffect(() => {
+    if (location.pathname === '/export') {
+      document.getElementById('final-film-export')?.scrollIntoView({ block: 'start' })
+    }
+  }, [location.pathname])
 
   // Toast on errors
   useEffect(() => {
@@ -212,9 +487,12 @@ function Export() {
       <div className="sticky top-14 bg-background/95 backdrop-blur-sm border-b border-border py-3 px-8 z-10">
         <div className="max-w-6xl mx-auto flex items-center justify-between">
           <div>
-            <h1 className="text-base font-semibold text-text-primary">Export Project</h1>
+            <h1 className="text-base font-semibold text-text-primary">
+              {location.pathname === '/metadata' ? 'Thumbnail & Metadata' : 'Export Project'}
+            </h1>
             <p className="text-xs text-text-secondary">{selectedStory?.title}</p>
           </div>
+          {isMetadataPage ? (
           <div className="flex items-center gap-3 text-xs text-text-disabled">
             <label className="flex items-center gap-2 cursor-pointer">
               <input type="checkbox" checked={includeMetadata} onChange={e => setIncludeMetadata(e.target.checked)}
@@ -227,13 +505,21 @@ function Export() {
               Thumbnail
             </label>
           </div>
+          ) : (
+            <button onClick={() => navigate('/metadata')} className="btn-secondary px-3 py-1.5 text-xs">
+              Edit Thumbnail & Metadata
+            </button>
+          )}
         </div>
       </div>
 
       <div className="max-w-6xl mx-auto p-8 space-y-8">
 
+        {/* ── Final Film (studio timeline render) ── */}
+        {!isMetadataPage && <div id="final-film-export" className="scroll-mt-32"><FinalFilmCard /></div>}
+
         {/* ── YouTube Metadata ── */}
-        {includeMetadata && (
+        {isMetadataPage && includeMetadata && (
           <section className="bg-surface border border-border rounded-xl p-6">
             <div className="flex items-center justify-between mb-5">
               <div>
@@ -422,7 +708,7 @@ function Export() {
         )}
 
         {/* ── Thumbnail ── */}
-        {includeThumbnail && (
+        {isMetadataPage && includeThumbnail && (
           <section className="bg-surface border border-border rounded-xl p-6">
             <div className="flex items-center justify-between mb-5">
               <div>
@@ -432,7 +718,7 @@ function Export() {
               <div className="flex items-center gap-2">
                 {/* Provider selector */}
                 <div className="flex bg-surface-raised border border-border rounded-lg p-0.5 gap-0.5">
-                  {['fal', 'replicate', 'gemini'].map(p => (
+                  {['fal', 'replicate', 'gemini', ...(settings.keysConfigured?.vertex ? ['vertex'] : [])].map(p => (
                     <button key={p}
                       onClick={() => setThumbnailProvider(p)}
                       className={`px-3 py-1.5 rounded-md text-xs font-medium transition-all ${
@@ -441,7 +727,7 @@ function Export() {
                           : 'text-text-secondary hover:text-text-primary'
                       }`}
                     >
-                      {p === 'fal' ? 'fal.ai' : p === 'replicate' ? 'Replicate' : 'Gemini'}
+                      {p === 'fal' ? 'fal.ai' : p === 'replicate' ? 'Replicate' : p === 'gemini' ? 'Gemini' : 'Vertex'}
                     </button>
                   ))}
                 </div>
@@ -543,7 +829,7 @@ function Export() {
         )}
 
         {/* Both skipped */}
-        {!includeMetadata && !includeThumbnail && (
+        {isMetadataPage && !includeMetadata && !includeThumbnail && (
           <div className="bg-surface border border-border rounded-xl p-8 text-center">
             <p className="text-sm text-text-secondary mb-4">
               Both sections are skipped. Only videos and script will be exported.
@@ -562,7 +848,7 @@ function Export() {
 
       {/* Thumbnail lightbox with history navigation */}
       <AnimatePresence>
-        {lightboxIndex !== null && (() => {
+        {isMetadataPage && lightboxIndex !== null && (() => {
           const hist = thumbnailHistory?.[lightboxIndex] || []
           const current = thumbnails[lightboxIndex]
           const allVersions = [...hist, ...(current?.url ? [{ url: current.url, prompt: current.prompt }] : [])]
@@ -592,7 +878,7 @@ function Export() {
             })()}
           </div>
           <button
-            onClick={handleExport}
+            onClick={isMetadataPage ? () => navigate('/export') : handleExport}
             disabled={exporting}
             className="btn-primary px-8 py-2.5 text-sm font-semibold disabled:opacity-50"
           >
@@ -601,7 +887,7 @@ function Export() {
                 <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" />
                 Exporting...
               </span>
-            ) : 'Export Everything'}
+            ) : isMetadataPage ? 'Continue to Export' : 'Export Everything'}
           </button>
         </div>
       </div>

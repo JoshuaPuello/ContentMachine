@@ -1,8 +1,156 @@
 import express from 'express';
-import * as fal from '@fal-ai/client';
+import { fal } from '@fal-ai/client';
 import Replicate from 'replicate';
 import { GoogleGenAI } from '@google/genai';
+import { spawn } from 'child_process';
+import {
+  buildMotionPromptSystem,
+  buildMotionPromptUserContent,
+  coerceVideoPromptArray,
+  composeMotionPromptBatch,
+  createFallbackMotionPromptBatch,
+  validateMotionPromptBatch,
+} from '../lib/motionPrompts.js';
+import {
+  auditNarrationContinuity,
+  buildNarrationSkillPrompt,
+} from '../lib/narrationSkills.js';
 const router = express.Router();
+
+// Local Claude Code CLI (`claude -p`) — runs on the same machine as the backend,
+// uses the user's existing Claude subscription. Model must be a known alias.
+const CLAUDE_CLI_MODELS = new Set(['haiku', 'sonnet', 'opus']);
+export const PROMPT_AUTHOR_PROVIDER = 'claude-cli';
+export const PROMPT_AUTHOR_MODEL = 'sonnet';
+
+const enforceSonnetPromptAuthor = (req) => {
+  req.body.provider = PROMPT_AUTHOR_PROVIDER;
+  req.body.model = PROMPT_AUTHOR_MODEL;
+};
+
+// Claude's stream-json envelope is intentionally normalized here so callers
+// never need to understand CLI transport events. Partial text is emitted once;
+// the final `result` is kept separately to avoid duplicating assistant blocks.
+export const parseClaudeStreamEvent = (event) => {
+  if (!event || typeof event !== 'object') return { delta: '', result: '' };
+  const delta = event.type === 'stream_event'
+    && event.event?.type === 'content_block_delta'
+    && event.event?.delta?.type === 'text_delta'
+    ? String(event.event.delta.text || '')
+    : '';
+  const result = event.type === 'result' && typeof event.result === 'string'
+    ? event.result
+    : '';
+  return { delta, result };
+};
+
+export const callClaudeCli = (model, systemPrompt, userContent, options = {}) => {
+  const selectedModel = CLAUDE_CLI_MODELS.has(model) ? model : 'sonnet';
+  const timeoutMs = Math.max(10_000, Number(options.timeoutMs) || 15 * 60_000);
+  return new Promise((resolve, reject) => {
+    // NOTE: do NOT pass --bare — it skips settings loading, which is where this
+    // profile's CLI auth lives ("Not logged in" otherwise). Instead,
+    // --exclude-dynamic-system-prompt-sections strips CLAUDE.md/env/agent
+    // sections so --system-prompt fully replaces the system prompt and the
+    // model answers as a raw LLM instead of acting agentically.
+    // User content goes via stdin — scene-plan payloads can exceed argv limits.
+    const streaming = options.stream === true;
+    const args = [
+      '-p',
+      '--model', selectedModel,
+      '--system-prompt', systemPrompt,
+      '--exclude-dynamic-system-prompt-sections',
+      '--tools', Array.isArray(options.tools) ? options.tools.join(',') : (options.tools ?? ''),
+      '--output-format', streaming ? 'stream-json' : 'text',
+    ];
+    if (['low', 'medium', 'high'].includes(options.effort)) {
+      args.push('--effort', options.effort);
+    }
+    if (options.safeMode) args.push('--safe-mode');
+    if (options.noSessionPersistence) args.push('--no-session-persistence');
+    if (streaming) args.push('--verbose', '--include-partial-messages');
+    for (const dir of options.addDirs || []) args.push('--add-dir', dir);
+    const child = spawn('claude', args, {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      // Equivalent of the user's `claudejoshua` shell alias
+      // (CLAUDE_CONFIG_DIR=~/.claudejoshua claude): CLAUDE_CONFIG_DIR is set in
+      // backend/.env and inherited here, selecting the logged-in profile.
+      env: process.env,
+    });
+
+    let stdout = '';
+    let stderr = '';
+    let streamBuffer = '';
+    let streamedText = '';
+    let finalResult = '';
+    const consumeStreamLine = (line) => {
+      if (!line.trim()) return;
+      try {
+        const event = JSON.parse(line);
+        options.onEvent?.(event);
+        const parsed = parseClaudeStreamEvent(event);
+        if (parsed.delta) {
+          streamedText += parsed.delta;
+          options.onText?.(parsed.delta, streamedText);
+        }
+        if (parsed.result) finalResult = parsed.result;
+      } catch {
+        // Retain malformed transport output for diagnostics without treating it
+        // as authored map JSON.
+        stdout += `${line}\n`;
+      }
+    };
+    const onAbort = () => {
+      child.kill('SIGKILL');
+      reject(new Error('Claude CLI request was canceled'));
+    };
+    if (options.signal?.aborted) return onAbort();
+    options.signal?.addEventListener('abort', onAbort, { once: true });
+    const cleanup = () => {
+      clearTimeout(timeout);
+      options.signal?.removeEventListener('abort', onAbort);
+    };
+    const timeout = setTimeout(() => {
+      child.kill('SIGKILL');
+      reject(new Error(`Claude CLI timed out after ${Math.round(timeoutMs / 1000)} seconds`));
+    }, timeoutMs);
+
+    child.stdout.on('data', (d) => {
+      const chunk = d.toString();
+      if (!streaming) {
+        stdout += chunk;
+        options.onText?.(chunk, stdout);
+        return;
+      }
+      streamBuffer += chunk;
+      const lines = streamBuffer.split(/\r?\n/);
+      streamBuffer = lines.pop() || '';
+      for (const line of lines) consumeStreamLine(line);
+    });
+    child.stderr.on('data', (d) => { stderr += d; });
+    child.on('error', (err) => {
+      cleanup();
+      reject(err.code === 'ENOENT'
+        ? new Error('Claude CLI not found — install Claude Code or use another provider')
+        : err);
+    });
+    child.on('close', (code) => {
+      cleanup();
+      if (streaming && streamBuffer.trim()) consumeStreamLine(streamBuffer);
+      const responseText = finalResult || streamedText || stdout;
+      if (code !== 0) {
+        reject(new Error(`Claude CLI exited with code ${code}: ${stderr.slice(0, 500) || responseText.slice(0, 500)}`));
+      } else if (!responseText.trim()) {
+        reject(new Error('Claude CLI returned empty output'));
+      } else {
+        resolve(responseText);
+      }
+    });
+
+    child.stdin.write(userContent);
+    child.stdin.end();
+  });
+};
 
 // Recursively replace N/A-like sentinel values with a fallback
 const sanitizeNAValues = (obj) => {
@@ -26,14 +174,47 @@ const sanitizeNAValues = (obj) => {
   return obj;
 };
 
-const safeParseJSON = (text) => {
+// Models sometimes wrap the JSON in prose ("Here is the plan... ```json ... ``` Hope this helps").
+// Pull out the fenced block if present, otherwise the first balanced {...}/[...] span.
+export const extractJsonBlock = (text) => {
+  const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fence) {
+    const inner = fence[1].trim();
+    if (inner.startsWith('{') || inner.startsWith('[')) return inner;
+  }
+  const start = text.search(/[[{]/);
+  if (start === -1) return text;
+  let depth = 0, inStr = false, esc = false;
+  for (let i = start; i < text.length; i++) {
+    const c = text[i];
+    if (esc) { esc = false; continue; }
+    if (c === '\\' && inStr) { esc = true; continue; }
+    if (c === '"') { inStr = !inStr; continue; }
+    if (inStr) continue;
+    if (c === '{' || c === '[') depth++;
+    else if (c === '}' || c === ']') {
+      depth--;
+      if (depth === 0) return text.slice(start, i + 1);
+    }
+  }
+  return text.slice(start); // unbalanced — downstream repair logic will close it
+};
+
+export const safeParseJSON = (text) => {
   const cleaned = text.replace(/^```json\s*/i, '').replace(/```\s*$/, '').trim();
-  
+
   try {
     return sanitizeNAValues(JSON.parse(cleaned));
   } catch (firstErr) {
+    // Second chance: strip surrounding prose, then parse
+    const extracted = extractJsonBlock(cleaned);
+    try {
+      return sanitizeNAValues(JSON.parse(extracted));
+    } catch {
+      // fall through to truncation repair on the extracted block
+    }
     // Attempt to repair truncated JSON by closing open structures
-    let repaired = cleaned;
+    let repaired = extracted;
     
     // Count open braces/brackets to determine what needs closing
     let braceDepth = 0;
@@ -109,7 +290,7 @@ const safeParseJSON = (text) => {
       const result = sanitizeNAValues(JSON.parse(repaired));
       console.warn('safeParseJSON: repaired truncated JSON successfully');
       return result;
-    } catch (secondErr) {
+    } catch {
       console.error('safeParseJSON: repair failed. Original error:', firstErr.message);
       throw firstErr;
     }
@@ -247,14 +428,18 @@ const callGemini = async (keys, model, systemPrompt, userContent) => {
   throw new Error('Gemini: max retries exhausted');
 };
 
-const callClaude = async (req, systemPrompt, userContent) => {
+export const callClaude = async (req, systemPrompt, userContent, options = {}) => {
   const keys = req.app.get('apiKeys');
   const provider = req.body.provider || 'fal';
   const model = req.body.model;
   // Allow frontend to override the system prompt for this call
-  const effectiveSystemPrompt = req.body.systemPrompt?.trim() || systemPrompt;
+  const effectiveSystemPrompt = options.ignoreSystemOverride
+    ? systemPrompt
+    : req.body.systemPrompt?.trim() || systemPrompt;
   
-  if (provider === 'gemini') {
+  if (provider === 'claude-cli') {
+    return await callClaudeCli(model, effectiveSystemPrompt, userContent, options);
+  } else if (provider === 'gemini') {
     if (!keys.gemini) throw new Error('Gemini API key not configured');
     return await callGemini(keys, model, effectiveSystemPrompt, userContent);
   } else if (provider === 'replicate') {
@@ -318,7 +503,65 @@ Return ONLY valid JSON. No markdown. Each story must be a page-turner.`;
 
 router.post('/stories', async (req, res) => {
   try {
-    const { topic, maxMinutes } = req.body;
+    const { topic, maxMinutes, mode = 'discover', title, context } = req.body;
+
+    if (mode === 'guided') {
+      if (!String(title || '').trim() || !String(context || '').trim()) {
+        return res.status(400).json({
+          error: true,
+          message: 'A title and story context are required for guided research.',
+          code: 'GUIDED_STORY_INPUT_REQUIRED',
+        });
+      }
+      const guidedContent = `Research and develop ONE exact documentary story.
+
+User title: ${String(title).trim()}
+User's authoritative story context:
+${String(context).trim()}
+
+The user is not asking for adjacent story ideas. Research only this concrete story. Preserve the supplied premise, people, chronology, and intended focus. Use research to verify facts, resolve dates and locations, add attributable detail, and identify the strongest truthful narrative structure. If a supplied detail conflicts with reliable evidence, flag the conflict in "research_notes" instead of silently replacing it.
+
+Target video length: ${maxMinutes ? `${maxMinutes} minutes` : 'flexible'}
+
+Return ONLY JSON:
+{
+  "stories": [{
+    "id": "guided-story",
+    "input_mode": "guided",
+    "title": "${String(title).trim().replace(/"/g, '\\"')}",
+    "summary": "A precise 3-5 sentence account of this exact story, enriched by research",
+    "why_compelling": "The truthful dramatic and emotional reason this exact story works",
+    "era": "Specific date, year, or range",
+    "location": "Specific location or locations",
+    "estimated_scenes": ${maxMinutes ? Math.round(maxMinutes * 60 / 8) : 45},
+    "narrative_beats": ["hook", "context", "inciting_incident", "rising_action", "climax", "resolution"],
+    "dramatic_highlights": ["specific documented visual moment"],
+    "stakes": "What was at risk",
+    "emotional_core": "The human truth",
+    "surprise_factor": "The strongest documented revelation",
+    "historical_sources": [{"title":"source or archive name","url":"direct source URL","verifies":"specific fact it supports"}],
+    "research_notes": ["verification, uncertainty, or contradiction notes"],
+    "source_context": "The user's original context, preserved verbatim"
+  }]
+}`;
+      const researchModel = CLAUDE_CLI_MODELS.has(req.body.model) ? req.body.model : 'opus';
+      const text = await callClaudeCli(researchModel, STORY_SYSTEM_PROMPT, guidedContent, {
+        tools: ['WebSearch', 'WebFetch'],
+        noSessionPersistence: true,
+        timeoutMs: 15 * 60_000,
+      });
+      const data = safeParseJSON(text);
+      const stories = Array.isArray(data) ? data : data.stories || [];
+      const story = stories[0];
+      if (!story) throw new Error('Guided research returned no story');
+      return res.json([{
+        ...story,
+        id: story.id || `guided-${Date.now().toString(36)}`,
+        input_mode: 'guided',
+        title: String(title).trim(),
+        source_context: String(context).trim(),
+      }]);
+    }
     
     const userContent = `Find exactly 4 REAL, DOCUMENTED historical stories about: "${topic}"
 
@@ -368,12 +611,93 @@ Return JSON:
   }
 });
 
+export const splitVoiceoverAtSentenceBoundaries = (voiceover, count) => {
+  const text = String(voiceover || '').trim();
+  const targetCount = Math.max(1, Number(count) || 1);
+  if (!text) return Array.from({ length: targetCount }, () => '');
+  const sentences = text.match(/[^.!?…]+(?:[.!?…]+["'”’)]*|$)/g)
+    ?.map(sentence => sentence.trim())
+    .filter(Boolean) || [text];
+  const totalWords = sentences.reduce((sum, sentence) => sum + sentence.split(/\s+/).length, 0);
+  const targetWords = Math.max(1, totalWords / targetCount);
+  const chunks = [];
+  let current = [];
+  let currentWords = 0;
+  for (const sentence of sentences) {
+    const words = sentence.split(/\s+/).length;
+    if (
+      current.length
+      && chunks.length < targetCount - 1
+      && currentWords >= targetWords * 0.7
+    ) {
+      chunks.push(current.join(' '));
+      current = [];
+      currentWords = 0;
+    }
+    current.push(sentence);
+    currentWords += words;
+  }
+  if (current.length) chunks.push(current.join(' '));
+
+  // A supplied script can contain a few long sentences while the visual plan
+  // needs more scenes. Split the longest remaining passage at a natural
+  // clause/word boundary instead of manufacturing silent scenes. The words
+  // and their order remain untouched.
+  while (chunks.length < targetCount) {
+    let splitIndex = -1;
+    let splitAt = -1;
+    let largestWords = 1;
+    chunks.forEach((chunk, index) => {
+      const words = chunk.trim().split(/\s+/).filter(Boolean);
+      if (words.length <= largestWords) return;
+      const midpoint = Math.floor(words.length / 2);
+      let boundary = -1;
+      for (let distance = 0; distance < words.length; distance += 1) {
+        for (const candidate of [midpoint + distance, midpoint - distance]) {
+          if (
+            candidate > 0
+            && candidate < words.length
+            && /[,;:—–-]$/.test(words[candidate - 1])
+          ) {
+            boundary = candidate;
+            break;
+          }
+        }
+        if (boundary !== -1) break;
+      }
+      splitIndex = index;
+      splitAt = boundary === -1 ? midpoint : boundary;
+      largestWords = words.length;
+    });
+    if (splitIndex === -1 || splitAt <= 0) break;
+    const words = chunks[splitIndex].trim().split(/\s+/);
+    chunks.splice(
+      splitIndex,
+      1,
+      words.slice(0, splitAt).join(' '),
+      words.slice(splitAt).join(' ')
+    );
+  }
+  while (chunks.length < targetCount) chunks.push('');
+  while (chunks.length > targetCount) {
+    const tail = chunks.pop();
+    chunks[chunks.length - 1] = `${chunks[chunks.length - 1]} ${tail}`.trim();
+  }
+  return chunks;
+};
+
 const buildScenePlanningPrompt = (videoModel) => {
   const isKling      = videoModel === 'kwaivgi/kling-v3-video';
   const isKlingTurbo = videoModel === 'kwaivgi/kling-v2.5-turbo-pro';
   const isFast       = videoModel === 'lightricks/ltx-2-fast';
+  const isVeo        = videoModel === 'veo-3.1-fast';
+  const isGrok       = videoModel === 'grok-3';
 
-  const allowedDurations = isKlingTurbo
+  const allowedDurations = isVeo
+    ? 'exactly 8 (every scene is 8 seconds)'
+    : isGrok
+    ? '6, 10, or 15'
+    : isKlingTurbo
     ? '5 or 10'
     : isKling
       ? 'any integer from 3 to 15'
@@ -381,11 +705,15 @@ const buildScenePlanningPrompt = (videoModel) => {
         ? 'any even number from 6 to 20 (6, 8, 10, 12, 14, 16, 18, 20)'
         : '6, 8, or 10';
 
-  const avgDuration   = isKlingTurbo ? 7 : isKling ? 8 : isFast ? 14 : 8;
-  const climateDur    = isKlingTurbo ? '10s' : isKling ? '12-15s' : isFast ? '18-20s' : '10s';
-  const atmosphereDur = isKlingTurbo ? '10s' : isKling ? '10-12s' : isFast ? '14-16s' : '8s';
+  const avgDuration   = isKlingTurbo ? 7 : isKling ? 8 : isFast ? 14 : isGrok ? 10 : 8;
+  const climateDur    = isKlingTurbo ? '10s' : isKling ? '12-15s' : isFast ? '18-20s' : isVeo ? '8s' : isGrok ? '15s' : '10s';
+  const atmosphereDur = isKlingTurbo ? '10s' : isKling ? '10-12s' : isFast ? '14-16s' : isGrok ? '10s' : '8s';
 
-  const durationGuide = isKlingTurbo ? `
+  const durationGuide = isVeo ? `
+- 8 seconds: EVERY scene is exactly 8 seconds — this model has a fixed duration. Vary pacing through shot type and camera movement, not duration.` : isGrok ? `
+- 6 seconds: Quick cuts, reactions, fast action beats
+- 10 seconds: Standard beats, dialogue, building tension — prefer this as your baseline
+- 15 seconds: Establishing shots, emotional peaks, slow reveals, climax moments` : isKlingTurbo ? `
 - 5 seconds: Quick cuts, reactions, action beats, transitions
 - 10 seconds: Establishing shots, emotional peaks, slow reveals, climax moments` : isKling ? `
 - 3-4 seconds: Very quick cuts, reaction shots
@@ -458,14 +786,32 @@ router.post('/scene-planning', async (req, res) => {
     const isKlingTurbo     = videoModel === 'kwaivgi/kling-v2.5-turbo-pro';
     const isKling          = videoModel === 'kwaivgi/kling-v3-video';
     const isFast           = videoModel === 'lightricks/ltx-2-fast';
-    const allowedDurations = isKlingTurbo ? '5 or 10'
+    const isVeo            = videoModel === 'veo-3.1-fast';
+    const isGrok           = videoModel === 'grok-3';
+    const allowedDurations = isVeo ? 'exactly 8 (every scene is 8 seconds)'
+      : isGrok ? '6, 10, or 15'
+      : isKlingTurbo ? '5 or 10'
       : isKling ? 'any integer from 3 to 15'
       : isFast  ? 'any even number from 6 to 20 (6, 8, 10, 12, 14, 16, 18, 20)'
       : '6, 8, or 10';
-    const avgDuration      = isKlingTurbo ? 7 : isKling ? 8 : isFast ? 14 : 8;
-    const maxSceneDuration = isKlingTurbo ? 10 : isKling ? 15 : isFast ? 20 : 10;
-    const minActionDur     = isFast ? 8 : 6;
-    const standardBeatDur  = isFast ? '12-14s' : isKling ? '6-10s' : '6-8s';
+    const avgDuration      = isKlingTurbo ? 7 : isKling ? 8 : isFast ? 14 : isGrok ? 10 : 8;
+    const maxSceneDuration = isKlingTurbo ? 10 : isKling ? 15 : isFast ? 20 : isVeo ? 8 : isGrok ? 15 : 10;
+    const minActionDur     = isFast ? 8 : isVeo ? 8 : isGrok ? 6 : 6;
+    const standardBeatDur  = isFast ? '12-14s' : isKling ? '6-10s' : isVeo ? '8s' : isGrok ? '10s' : '6-8s';
+
+    const suppliedVoiceover = story.input_mode === 'script'
+      ? String(story.provided_voiceover || '').trim()
+      : '';
+    const sourceScriptDirection = suppliedVoiceover ? `
+SUPPLIED-VOICEOVER CONTRACT:
+- The user supplied the complete main voiceover below. It is authoritative.
+- Plan visuals around that voiceover; do not invent a replacement narration.
+- Do not add, remove, paraphrase, reorder, or polish any of its words.
+- The application will mechanically assign exact sentence-boundary spans to the returned scenes after planning.
+
+AUTHORITATIVE MAIN VOICEOVER:
+${suppliedVoiceover}
+` : '';
 
     const userContent = `Create a SMART scene plan for this documentary story:
 
@@ -475,6 +821,7 @@ Era: ${story.era}
 Location: ${story.location}
 Narrative Beats: ${story.narrative_beats?.join(', ') || 'Not provided'}
 Target Duration: ${maxMinutes ? `${maxMinutes} minutes (${maxMinutes * 60} seconds total)` : 'No duration constraint'}
+${sourceScriptDirection}
 
 CRITICAL RULES:
 - duration_seconds can ONLY be ${allowedDurations}
@@ -499,7 +846,7 @@ Return ONLY this JSON. Every field must have a real, specific value — never "N
         "scene_number": 1,
         "narrative_beat": "hook",
         "importance": "critical",
-        "duration_seconds": ${isFast ? 14 : isKling ? 10 : isKlingTurbo ? 10 : 8},
+        "duration_seconds": ${isFast ? 14 : isKling ? 10 : isKlingTurbo ? 10 : isGrok ? 10 : 8},
         "shot_type": "wide",
         "camera_intent": "Slow push-in reveals scale of the fortress walls",
         "visual_description": "Torchlit stone ramparts at dusk, soldiers in formation on the battlements",
@@ -521,7 +868,17 @@ Return ONLY this JSON. Every field must have a real, specific value — never "N
     
     const text = await callClaude(req, buildScenePlanningPrompt(videoModel), userContent);
     const data = safeParseJSON(text);
-    res.json(data.scene_plan || data);
+    const plan = data.scene_plan || data;
+    if (suppliedVoiceover && Array.isArray(plan.scenes)) {
+      const chunks = splitVoiceoverAtSentenceBoundaries(suppliedVoiceover, plan.scenes.length);
+      plan.scenes = plan.scenes.map((scene, index) => ({
+        ...scene,
+        source_narration: chunks[index] || '',
+        narration_locked: true,
+      }));
+      plan.source_voiceover_locked = true;
+    }
+    res.json(plan);
   } catch (error) {
     console.error('Scene planning error:', error);
     res.status(500).json({ error: true, message: error.message, code: 'SCENE_PLANNING_ERROR' });
@@ -671,9 +1028,44 @@ EXAMPLE OUTPUT (follow this structure and level of detail exactly — note the v
   ]
 }`;
 
+// Addendum applied when scenes are split into sequential segments (the scene's
+// narration audio outlasts a single video clip, so multiple shots are needed).
+const buildSegmentAddendum = (variationsPerSegment) => `
+
+SEQUENTIAL SEGMENTS (CRITICAL — READ CAREFULLY):
+Each scene now contains a "segments" array. Each segment is a SEPARATE SEQUENTIAL SHOT of the same scene — together they play back-to-back to cover the scene's narration audio.
+- Segment 1 establishes the moment described in visual_description.
+- Each following segment must ADVANCE the action — a later beat of the same moment: the action progresses, the camera relocates, the subject moves, tension escalates. It must feel like the story is CONTINUING, never like a re-render of the same instant.
+- Keep hard continuity across segments: same mannequin(s), same clothing (exact outfit), same environment, same weather and time of day, same key props. Only the action, framing, and camera evolve.
+- Think like a film editor cutting within a scene: wide establishing → move closer as the action develops → detail or reaction as it peaks.
+- Generate exactly ${variationsPerSegment} distinct variation(s) per segment (vary lens/lighting/angle across variations of the SAME beat — variations are alternatives for the same shot, segments are different sequential shots).
+
+OUTPUT FORMAT OVERRIDE (MANDATORY WHEN SEGMENTS ARE PRESENT):
+Return ONLY valid JSON in this exact shape:
+{
+  "scenes": [
+    {
+      "scene_id": "s01",
+      "scene_number": 1,
+      "segments": [
+        {
+          "segment_index": 0,
+          "variations": [ { "variation_id": "s01_seg0_v1", "type": "establishing", "prompt": "..." } ]
+        },
+        {
+          "segment_index": 1,
+          "variations": [ { "variation_id": "s01_seg1_v1", "type": "continuation", "prompt": "..." } ]
+        }
+      ],
+      "continuity_checklist": ["..."]
+    }
+  ]
+}`;
+
 router.post('/image-prompts', async (req, res) => {
   try {
-    const { scenePlan, scenes: scenesOverride } = req.body;
+    enforceSonnetPromptAuthor(req);
+    const { scenePlan, scenes: scenesOverride, variationsPerSegment } = req.body;
 
     // Accept either a full scenePlan or a pre-sliced scenes array (for batching)
     const sourceScenes = scenesOverride || scenePlan?.scenes || [];
@@ -686,6 +1078,9 @@ router.post('/image-prompts', async (req, res) => {
       });
     }
 
+    const useSegments = sourceScenes.some(s => Array.isArray(s.segments) && s.segments.length > 0);
+    const variations = Math.min(4, Math.max(1, parseInt(variationsPerSegment) || 4));
+
     const scenesData = sourceScenes.map(scene => ({
       scene_id: scene.scene_id,
       scene_number: scene.scene_number,
@@ -693,14 +1088,32 @@ router.post('/image-prompts', async (req, res) => {
       shot_type: scene.shot_type,
       camera_intent: scene.camera_intent,
       mannequin_details: scene.mannequin_details,
-      environment: scene.environment
+      environment: scene.environment,
+      ...(useSegments ? {
+        segments: (scene.segments?.length ? scene.segments : [{ segment_index: 0 }]).map(seg => ({
+          segment_index: seg.segment_index ?? 0,
+          covers_seconds: seg.target_duration || undefined,
+          narration: seg.narration || undefined,
+        }))
+      } : {})
     }));
+
+    const systemPrompt = useSegments
+      ? IMAGE_PROMPT_SYSTEM + buildSegmentAddendum(variations)
+      : IMAGE_PROMPT_SYSTEM;
+    // A user-supplied custom prompt overrides the default inside callClaude —
+    // make sure the segment contract survives the override too
+    if (useSegments && req.body.systemPrompt?.trim()) {
+      req.body.systemPrompt = req.body.systemPrompt + buildSegmentAddendum(variations);
+    }
 
     const userContent = `Create image prompts for these scenes following all rules and the example format in your instructions:
 
 ${JSON.stringify(scenesData, null, 2)}`;
 
-    const text = await callClaude(req, IMAGE_PROMPT_SYSTEM, userContent);
+    const text = await callClaude(req, systemPrompt, userContent, {
+      noSessionPersistence: true,
+    });
     const parsed = safeParseJSON(text);
 
     // Normalise to array — Claude sometimes returns { scenes: [...] } or a plain object
@@ -732,6 +1145,18 @@ ${JSON.stringify(scenesData, null, 2)}`;
       });
     }
 
+    // When segments were requested, guarantee every scene comes back with a
+    // segments array — wrap legacy flat variations as a single segment 0.
+    if (useSegments) {
+      scenes = scenes.map(scene => {
+        if (Array.isArray(scene.segments) && scene.segments.length > 0) return scene;
+        return {
+          ...scene,
+          segments: [{ segment_index: 0, variations: scene.variations || [] }]
+        };
+      });
+    }
+
     res.json(scenes);
   } catch (error) {
     console.error('Image prompts error:', error);
@@ -739,85 +1164,13 @@ ${JSON.stringify(scenesData, null, 2)}`;
   }
 });
 
-const VIDEO_PROMPT_SYSTEM = `You are a cinematographer directing AI image-to-video generation based on selected still frames.
-INPUT: scene_plan object + selected_image object + previous_scene_video (for continuity).
+const VIDEO_PROMPT_SYSTEM = `Direct restrained, cinematic documentary motion from each selected still frame.
 
-VIDEO STYLE MANDATE:
-- Maintain seamless glossy porcelain mannequin aesthetic: smooth off-white or warm brown porcelain finish, NO cracks, NO texture on mannequin, NO doll joints, NO articulation points, featureless faces, period-appropriate hair, detailed realistic clothing.
-- NO dialogue, text overlays, or UI elements.
-
-CRITICAL: Do NOT include "Unreal Engine 5" or any engine names as text in the video.
-
-VISUAL-NARRATION SYNC:
-The video motion MUST directly illustrate what the narrator says. If narrator says "the door slammed shut", show the door slamming. Match visuals to spoken words.
-
-CAMERA MOVEMENT VOCABULARY TO USE:
-
-Translational moves:
-| Movement | Feel / Use Case |
-|---|---|
-| Slow push in (dolly forward) | Building tension, intimacy, ominous approach |
-| Pull back / reveal (dolly back) | Scale reveal, awe, isolation, dread |
-| Lateral dolly (left or right) | Following action, documentary observation, parallax depth |
-| Diagonal dolly | Dynamic energy, slight unease |
-| Truck left/right (pure lateral) | Subject stays constant size, background slides — surveillance feel |
-
-Rotational / pivot moves:
-| Movement | Feel / Use Case |
-|---|---|
-| Pan left/right | Following movement, surveying environment |
-| Tilt up | Revealing height, grandeur, aspiration |
-| Tilt down | Weight, consequence, looking at ground or fallen subject |
-| Dutch roll (banking tilt into Dutch angle) | Psychological shift, growing dread |
-| Orbit / arc around subject | 3D reveal, subject as centrepiece, god-like perspective |
-
-Vertical moves:
-| Movement | Feel / Use Case |
-|---|---|
-| Crane up (pedestal rise) | Epic establishing, departure, God's-eye reveal |
-| Crane down (pedestal lower) | Descending into scene, intimacy, weight |
-| Boom sweep | Dramatic arc — combines rise with pan |
-
-Combined / compound moves:
-| Movement | Feel / Use Case |
-|---|---|
-| Dolly zoom (Vertigo effect) | Background grows/shrinks while subject stays constant — psychological rupture |
-| Push in + tilt up | Subject looms larger as camera moves closer and looks up — power |
-| Pull back + crane up | Epic scale reveal — subject recedes into vast environment |
-| Orbit + push in | Spiralling approach — obsession, locked focus |
-| Handheld drift | Subtle organic instability — documentary authenticity, unease |
-| Shake / impact hit | Sudden violent camera movement — explosion, impact, shock |
-
-Specialty / lens-driven motion:
-| Movement | Feel / Use Case |
-|---|---|
-| Rack focus (static camera, focus shifts) | Foreground blurs as background sharpens or vice versa — reveal, consequence |
-| Whip pan | Fast blur across frame — time jump, disorientation, action cut |
-| Snap zoom | Fast crash zoom to subject — emphasis, shock, retro drama |
-| Fisheye drift | Wide distorted lens drifts slowly — dreamlike, paranoid, supernatural |
-| Anamorphic sweep | Horizontal lens flare streaks across frame during pan |
-
-LIGHTING EVOLUTION VOCABULARY (for lighting_evolution field):
-- Flicker to steady: Fire/torch settles — calm after chaos
-- Steady to flicker: Wind picks up — growing threat
-- Lightning strike: Instant full-exposure flash at a specific timestamp, then return to dark
-- God ray sweep: Shaft of volumetric light moves across scene as clouds shift
-- Candle blow-out: Scene dims from warm amber to near-black
-- Dawn break: Gradual warm light creeps across scene from one edge
-- Explosion flash: Bright white-orange burst, then rolling smoke dims the light
-- Shadow sweep: A moving shadow slowly crosses the subject — threat approaching
-- Colour temperature shift: Warm to cool (day to night) or cool to warm (fire ignites)
-- Practical flicker (neon/sign): Intermittent coloured light pulses on subject
-
-DURATION CONSTRAINTS (STRICT):
-You must output instructions that exactly match the scene_plan.duration_seconds.
-Motion Format: "[camera motion], while [subject motion], [environment motion]"
-
-OUTPUT FORMAT:
-Return ONLY valid JSON matching this exact schema.`;
+Use the scene narration and visual description to choose the single most important visible action. Prefer a near-locked frame, slow push, gentle pullback, subtle pan, slight tilt, lateral track, small orbit, or rack focus. Environmental motion must be physically motivated and secondary to the story beat. Preserve the project's glossy porcelain mannequin visual language and period detail. End every clip on a composed, stable frame that can cut cleanly to the next shot.`;
 
 router.post('/video-prompts', async (req, res) => {
   try {
+    enforceSonnetPromptAuthor(req);
     const { scenePlan, scenes: scenesOverride, selectedImages } = req.body;
 
     // Accept either a full scenePlan or a pre-sliced scenes array (for batching)
@@ -831,78 +1184,82 @@ router.post('/video-prompts', async (req, res) => {
       });
     }
 
+    // Segment-aware requests send one entry per (scene, segment) with a
+    // segment_index; legacy requests have one entry per scene (no segment_index)
+    const useSegments = sourceScenes.some(s => s.segment_index !== undefined && s.segment_index !== null);
+
     const sceneData = sourceScenes.map(scene => {
-      const selected = (selectedImages || []).find(img => img.scene_number === scene.scene_number);
+      const selected = (selectedImages || []).find(img =>
+        img.scene_number === scene.scene_number &&
+        (!useSegments || (img.segment_index ?? 0) === (scene.segment_index ?? 0))
+      );
       return {
         scene_id: scene.scene_id,
         scene_number: scene.scene_number,
+        segment_index: scene.segment_index ?? 0,
+        segment_count: scene.segment_count || 1,
         duration_seconds: scene.duration_seconds,
+        narration: scene.narration || undefined,
+        full_scene_narration: scene.full_scene_narration || undefined,
         visual_description: scene.visual_description,
         camera_intent: scene.camera_intent,
         mannequin_details: scene.mannequin_details,
         environment: scene.environment,
-        selected_prompt: selected?.prompt || ''
+        selected_prompt: selected?.prompt || scene.selected_prompt || '',
+        continuity_context: scene.continuity_context || undefined,
+        previous_selected_prompt: scene.previous_selected_prompt || undefined,
+        previous_ending_state: scene.previous_ending_state || undefined,
       };
     });
-    
-    const userContent = `Create video prompts for these scenes:
 
-${JSON.stringify(sceneData, null, 2)}
+    const customDirection = req.body.systemPrompt?.trim();
+    const isLegacyUnsafeVideoSystem = customDirection
+      && /CAMERA MOVEMENT VOCABULARY|VIDEO STYLE MANDATE|Motion Format:\s*"\[camera motion\]/i.test(customDirection);
+    const creativeDirection = customDirection
+      && customDirection !== VIDEO_PROMPT_SYSTEM.trim()
+      && !isLegacyUnsafeVideoSystem
+      ? customDirection
+      : VIDEO_PROMPT_SYSTEM;
+    const protectedSystemPrompt = buildMotionPromptSystem(creativeDirection);
 
-Return JSON:
-[
-  {
-    "scene_id": "s01",
-    "scene_number": 1,
-    "duration_seconds": 8,
-    "video_prompt": {
-      "camera_motion": "Slow push in with slight tilt up",
-      "subject_motion": "Mannequin figure slowly slides down door, shoulders dropping in exhaustion",
-      "environment_motion": "Rain intensifies, lantern swings slightly casting moving shadows",
-      "lighting_evolution": "Lightning flash at 3-second mark, returning to lantern glow",
-      "technical_specs": "24fps, motion blur on rain"
-    },
-    "full_prompt_string": "Photorealistic cinematic video, seamless off-white glossy porcelain mannequin figure with no cracks in 1890s oilskin coat sliding down iron door exhausted, slow push in with slight tilt up, heavy storm rain, swinging lantern casting moving shadows, sudden lightning flash illumination, 8K, cinematic",
-    "continuity_notes": {
-      "costume_state": "Oilskin is visibly soaked from previous exterior scenes"
-    },
-    "audio_sync_points": [2.5, 5.0]
-  }
-]`;
-    
-    const text = await callClaude(req, VIDEO_PROMPT_SYSTEM, userContent);
-    const parsed = safeParseJSON(text);
-
-    // Normalise to array — Claude sometimes returns { prompts: [...] } or an object
-    let videoPrompts;
-    if (Array.isArray(parsed)) {
-      videoPrompts = parsed;
-    } else if (parsed && typeof parsed === 'object') {
-      const candidate = parsed.prompts || parsed.video_prompts || parsed.scenes;
-      if (Array.isArray(candidate)) {
-        videoPrompts = candidate;
-      } else {
-        const vals = Object.values(parsed);
-        if (vals.length > 0 && vals.every(v => v && typeof v === 'object')) {
-          videoPrompts = vals;
-        } else {
-          return res.status(500).json({
-            error: true,
-            message: 'LLM returned an object instead of an array for video prompts — could not coerce to array',
-            code: 'VIDEO_PROMPTS_NOT_ARRAY',
-            raw: parsed
-          });
-        }
-      }
-    } else {
-      return res.status(500).json({
-        error: true,
-        message: 'LLM returned unexpected type for video prompts',
-        code: 'VIDEO_PROMPTS_NOT_ARRAY'
+    const authorBatch = async (repairIssues = []) => {
+      const userContent = buildMotionPromptUserContent(sceneData, { useSegments, repairIssues });
+      const text = await callClaude(req, protectedSystemPrompt, userContent, {
+        ignoreSystemOverride: true,
+        noSessionPersistence: true,
       });
+      const parsed = safeParseJSON(text);
+      const prompts = coerceVideoPromptArray(parsed);
+      if (!prompts) throw new Error('LLM returned an invalid motion-prompt collection.');
+      return prompts;
+    };
+
+    let videoPrompts;
+    try {
+      videoPrompts = await authorBatch();
+      let validationIssues = validateMotionPromptBatch(videoPrompts, sceneData);
+      if (validationIssues.length > 0) {
+        console.warn(`[video-prompts] Structured response failed validation; retrying once: ${validationIssues.join(' | ')}`);
+        videoPrompts = await authorBatch(validationIssues);
+        validationIssues = validateMotionPromptBatch(videoPrompts, sceneData);
+      }
+      if (validationIssues.length > 0) {
+        const reason = `AI response remained incomplete after repair: ${validationIssues.join(' ')}`;
+        console.warn(`[video-prompts] ${reason} Using protected local fallback.`);
+        videoPrompts = createFallbackMotionPromptBatch(sceneData, reason);
+      }
+    } catch (authoringError) {
+      const reason = `AI motion authoring failed: ${authoringError.message}`;
+      console.warn(`[video-prompts] ${reason} Using protected local fallback.`);
+      videoPrompts = createFallbackMotionPromptBatch(sceneData, reason);
     }
 
-    res.json(videoPrompts);
+    const fallbackIssues = validateMotionPromptBatch(videoPrompts, sceneData);
+    if (fallbackIssues.length > 0) {
+      throw new Error(`Protected motion prompt fallback failed validation: ${fallbackIssues.join(' ')}`);
+    }
+
+    res.json(composeMotionPromptBatch(videoPrompts, sceneData));
   } catch (error) {
     console.error('Video prompts error:', error);
     res.status(500).json({ error: true, message: error.message, code: 'VIDEO_PROMPTS_ERROR' });
@@ -913,21 +1270,33 @@ const TTS_SCRIPT_SYSTEM = `You are an elite documentary narrator and audio direc
 INPUT: story object + scene_plans array (with exact durations).
 
 VOICE & TONE:
-- Cold open. Start with exact date, place, and a scene already in motion — no preamble, no setup.
-- Short declarative sentences land like punches. Then a longer sentence unspools the context. Then short again.
+- Begin in motion with the story's strongest concrete tension. Use an exact date or place when it helps the listener enter the scene, not as a mandatory template.
 - Present tense throughout — past events narrated as if happening now.
 - Numbers are ALWAYS specific. Never "millions" — always "$400 million". Never "many days" — always "six hours". Exact figures create authority.
-- Repeat key phrases for impact. "The kingpin becomes the snitch. The man who ordered the hits will hunt his own assassins." Parallelism. Inversion. The subject and verb swap to create the gut-punch.
-- End each major section with a cliffhanger question, not a statement. "How does a programmer become a cartel boss? And why does he burn his entire empire to ash?" Then the next section answers it.
-- Occasionally use second person to pull the listener into the room. "You killed for this man. You trusted him."
+- Build emphasis through specific facts, consequences, and sentence rhythm. Do not repeat phrases, force parallelism, or stack fragments merely to sound dramatic.
+- Open curiosity loops only where the story earns them. Vary questions, discoveries, consequences, and time shifts instead of ending every section with the same cliffhanger shape.
+- Use second person sparingly and only when it sounds natural in the established documentary voice.
+- Use contractions and spoken syntax. Do not use em dashes, en dashes, or double-hyphen substitutes in spoken lines.
 - NO visual references ("as we can see here"). Audio must stand alone.
 - Never tabloid. The style is cold, precise, urgent — not sensationalist.
 
+FLOW ACROSS SCENES (the most common failure — read carefully):
+- The scene list is a camera plan, NOT a sentence plan. Write the narration first as ONE continuous piece of prose in your head, then distribute complete sentences across the scenes. A viewer must never be able to hear where one scene ends and the next begins.
+- Each scene's lines CONTINUE the running thought: pick up the previous scene's sentence rhythm, use connective tissue ("But", "By morning", "Three hundred miles away", "What Walsh doesn't know is…").
+- Favor full, flowing sentences with subordinate clauses that carry the story forward. A short fragment ("It simply arrived.") is a spice — at most one per three scenes, and only at a genuine dramatic beat. A run of consecutive short phrases reads as random words and is forbidden.
+- A single scene usually carries one fuller sentence or two connected ones — never a pile of clipped statements.
+- Trailer, overview, transition, and scene units are one playback sequence. Write that sequence as continuous prose first, then partition it at complete-sentence boundaries.
+
+GEOGRAPHY FOR THE MAP (when the story moves through space):
+- When events travel, name the geography concretely: cities, countries, compass directions, distances, borders. "From Sagan they scatter — south toward Czechoslovakia, north to the Baltic ports, three hundred miles to neutral Sweden."
+- Concrete narrated geography is what earns the film its map moments; a map is only ever shown for places and movements the narration actually names.
+- Never force geography into a story that doesn't move. When it exists, be specific enough that a mapmaker could draw exactly what you said.
+
 TIMING GUIDANCE:
-- Average TTS speaking rate is ~2.5 words per second, but DO NOT artificially truncate narration to hit a word count.
+- Target roughly 2.0–2.5 spoken words per planned second across the complete playback sequence, with a hard production ceiling of 2.65. Fluency comes from restructuring fragments, not adding more facts.
 - Use scene duration as a pacing reference only — a 6s scene suggests a short punchy moment; a 10s scene can carry a fuller thought.
-- Write the narration the story demands. A powerful line that runs 5 seconds over a 6s clip is better than a weak line that fits perfectly.
-- The editor will handle sync. Your job is to make every word count, not count every word.
+- A strong line may exceed one unit's estimate because recorded audio controls the final split, but compensate elsewhere so the complete script remains within its production budget.
+- Make every word count. Combine fragments with concise connective tissue; do not solve choppiness by bloating the script.
 - Do not count bracketed audio/SFX cues toward spoken word estimates.
 
 AUDIO DESIGN & PACING CUES (NEW):
@@ -935,34 +1304,212 @@ You must act as the audio mixer and video editor. Include bracketed cues on thei
 - Use [INTENSITY:UP] or [INTENSITY:DOWN] right before a line where the narrator's volume or urgency must shift.
 - Use [SFX:... ] for literal sound effects (e.g., [SFX:LOUD_THUNDER_CRACK], [SFX:HEAVY_RAIN_ON_METAL]).
 - Use [BGM:... ] to dictate background music shifts (e.g., [BGM:TENSION_RISE], [BGM:DRAMATIC_PAUSE]).
-- Use [CUT:HARD] to indicate a jarring, immediate transition to the next visual/audio beat.
+- Use [CUT:HARD] only for a genuinely designed hard cut. Never use it to conceal a broken narration transition.
 
 OUTPUT FORMAT:
 Return ONLY valid JSON matching this exact schema. Bracketed cues must be their own separate string items in the lines array (acting as line breaks).`;
 
+const spokenLines = (unit) => (unit?.lines || []).filter(line => !String(line).startsWith('['));
+const clampNumber = (value, min, max, fallback) => {
+  const number = Number(value);
+  return Math.min(max, Math.max(min, Number.isFinite(number) ? number : fallback));
+};
+
+export const normalizeCinemaNarration = (rawCinema, scenePlan, options) => {
+  const sceneCount = scenePlan.scenes.length;
+  const cinema = { options: { ...options } };
+
+  if (options.trailerEnabled && rawCinema?.trailer) {
+    const targetSeconds = clampNumber(rawCinema.trailer.target_seconds, 8, 14, 10);
+    const candidateScenes = [...new Set(
+      (rawCinema.trailer.candidate_scenes || rawCinema.trailer.shots || [])
+        .map(item => Number(item?.scene_number ?? item))
+        .filter(scene => scene >= 1 && scene <= sceneCount)
+    )];
+    const narration = {
+      unit_id: 'cinema:trailer',
+      scene_id: 'cinema:trailer',
+      cinema_type: 'trailer',
+      duration: targetSeconds,
+      lines: rawCinema.trailer.narration?.lines || rawCinema.trailer.lines || [],
+      timing_notes: rawCinema.trailer.narration?.timing_notes || 'Cold-open voiceover over the peak-shot montage.',
+      delivery_instructions: rawCinema.trailer.narration?.delivery_instructions || 'Controlled urgency; finish on an open loop.',
+    };
+    if (candidateScenes.length >= 3 && spokenLines(narration).length) {
+      cinema.trailer = {
+        title: rawCinema.trailer.title || '',
+        subtitle: rawCinema.trailer.subtitle || '',
+        target_seconds: targetSeconds,
+        candidate_scenes: candidateScenes.slice(0, 8),
+        narration,
+      };
+    }
+  }
+
+  if (options.chaptersEnabled) {
+    const chapters = (rawCinema?.chapters || [])
+      .map((chapter) => ({
+        title: String(chapter.title || '').trim(),
+        start_scene: Number(chapter.start_scene),
+        portrait_prompt: String(chapter.portrait_prompt || '').trim(),
+        overview_narration: {
+          cinema_type: 'chapter-overview',
+          duration: clampNumber(chapter.overview_narration?.duration, 2.5, 6, 3.5),
+          lines: chapter.overview_narration?.lines || [],
+        },
+        transition_narration: {
+          cinema_type: 'chapter-transition',
+          duration: clampNumber(chapter.transition_narration?.duration, 3, 7, 5),
+          lines: chapter.transition_narration?.lines || [],
+        },
+      }))
+      .filter(chapter => (
+        chapter.title
+        && chapter.portrait_prompt
+        && chapter.start_scene >= 1
+        && chapter.start_scene <= sceneCount
+        && spokenLines(chapter.overview_narration).length
+        && spokenLines(chapter.transition_narration).length
+      ))
+      .sort((a, b) => a.start_scene - b.start_scene)
+      .slice(0, 5)
+      .map((chapter, index) => {
+        const chapterNumber = index + 1;
+        return {
+          ...chapter,
+          chapter_number: chapterNumber,
+          overview_narration: {
+            ...chapter.overview_narration,
+            unit_id: `cinema:overview:${chapterNumber}`,
+            scene_id: `cinema:overview:${chapterNumber}`,
+            chapter_number: chapterNumber,
+          },
+          transition_narration: {
+            ...chapter.transition_narration,
+            unit_id: `cinema:transition:${chapterNumber}`,
+            scene_id: `cinema:transition:${chapterNumber}`,
+            chapter_number: chapterNumber,
+          },
+        };
+      });
+    if (chapters.length >= 2 && chapters[0].start_scene === 1) cinema.chapters = chapters;
+  }
+
+  return cinema;
+};
+
+export const buildNarrationSequence = (sceneBreakdown, cinema) => {
+  const sequence = [];
+  if (cinema.trailer?.narration) sequence.push(cinema.trailer.narration);
+  for (const chapter of cinema.chapters || []) sequence.push(chapter.overview_narration);
+  if (cinema.chapters?.[0] && spokenLines(cinema.chapters[0].transition_narration).length) {
+    sequence.push(cinema.chapters[0].transition_narration);
+  }
+
+  const transitionByScene = new Map(
+    (cinema.chapters || [])
+      .filter(chapter => chapter.chapter_number > 1 && spokenLines(chapter.transition_narration).length)
+      .map(chapter => [chapter.start_scene, chapter.transition_narration])
+  );
+  for (const scene of sceneBreakdown || []) {
+    const sceneNumber = Number(String(scene.scene_id || '').match(/\d+/)?.[0]);
+    const transition = transitionByScene.get(sceneNumber);
+    if (transition) sequence.push(transition);
+    sequence.push({ ...scene, unit_id: scene.scene_id, cinema_type: 'scene' });
+  }
+  return sequence;
+};
+
+const materializeNarrationDraft = (data, scenePlan, options) => {
+  const cinema = normalizeCinemaNarration(data.cinema, scenePlan, options);
+  const sceneBreakdown = Array.isArray(data.scene_breakdown) ? data.scene_breakdown : [];
+  const narrationSequence = buildNarrationSequence(sceneBreakdown, cinema);
+  const fullScript = narrationSequence
+    .map(unit => spokenLines(unit).join(' '))
+    .filter(Boolean)
+    .join(' ');
+  const contractIssues = [];
+  if (sceneBreakdown.length !== scenePlan.scenes.length) {
+    contractIssues.push(`Return exactly ${scenePlan.scenes.length} scene_breakdown entries; received ${sceneBreakdown.length}.`);
+  }
+  if (options.trailerEnabled && !cinema.trailer) {
+    contractIssues.push('Return a complete trailer voiceover with at least three valid candidate scenes.');
+  }
+  if (options.chaptersEnabled && !cinema.chapters) {
+    contractIssues.push('Return at least two complete chapters beginning at scene 1, each with overview and transition voiceover.');
+  }
+  const continuityAudit = auditNarrationContinuity(narrationSequence);
+  return {
+    data,
+    cinema,
+    sceneBreakdown,
+    narrationSequence,
+    fullScript,
+    continuityAudit,
+    issues: [...contractIssues, ...continuityAudit.violations],
+  };
+};
+
+const NARRATION_REPAIR_SYSTEM = `You are the final spoken-narration copy chief. Repair the supplied JSON draft without changing facts, scene order, cinema options, or schema. Preserve the hook's jolt, proof, and tension while translating written-cinematic or fragment-heavy language into fluent speech. Rewrite across unit boundaries as one continuous documentary, then repartition only at complete-sentence boundaries. Do not add facts or inflate the script to create flow; use concise connective syntax and remove repetition to meet the production pacing budget. Fix every listed issue. Return only the complete corrected JSON object.`;
+
 router.post('/tts-script', async (req, res) => {
   try {
-    const { story, scenePlan } = req.body;
+    const { story, scenePlan, cinemaOptions = {} } = req.body;
 
     if (!scenePlan?.scenes) {
       return res.status(400).json({ error: true, message: 'scenePlan.scenes is required', code: 'MISSING_SCENE_PLAN' });
     }
     
-    const sceneDurations = scenePlan.scenes.map(s => 
-      `Scene ${s.scene_number} (${s.scene_id}): ${s.duration_seconds}s - ${s.visual_description?.substring(0, 60)}...`
-    ).join('\n');
+    const narrationProfile = buildNarrationSkillPrompt(story, cinemaOptions);
+    const protectedSystemPrompt = `${TTS_SCRIPT_SYSTEM}\n\n${narrationProfile.prompt}`;
+    const customDirection = req.body.systemPrompt?.trim();
+    // Older persisted projects may still carry the former full narration system
+    // prompt. Treat it as application code, not user direction: appending it here
+    // would restore the exact staccato/forced-cliffhanger rules this protected
+    // FacelessOS prompt replaces. Genuine short channel guidance remains supported.
+    const isLegacyNarrationSystem = !!customDirection && (
+      /You are an elite documentary narrator and audio director/i.test(customDirection)
+      || /Repeat key phrases for impact/i.test(customDirection)
+      || /End each major section with a cliffhanger question/i.test(customDirection)
+      || /Five moments\. One impossible decision/i.test(customDirection)
+    );
+    const customDirectionSection = customDirection
+      && !isLegacyNarrationSystem
+      && customDirection !== TTS_SCRIPT_SYSTEM.trim()
+      ? `\nChannel-specific direction (apply only when it does not conflict with the FacelessOS continuity and humanization rules):\n${customDirection}\n`
+      : '';
     
     const userContent = `Write a narration script for this documentary:
 
-Title: ${story.title}
-Summary: ${story.summary}
-Era: ${story.era}
-Location: ${story.location}
+Complete story object:
+${JSON.stringify(story, null, 2)}
 
-Scene Durations:
-${sceneDurations}
+Complete scene plan:
+${JSON.stringify(scenePlan.scenes, null, 2)}
 
 Total Duration: ${scenePlan.total_duration_seconds} seconds
+Detected FacelessOS format: ${narrationProfile.format}
+The scene narration should remain near the existing production budget. Cinema voiceovers add only the concise words their own requested durations can carry.
+${customDirectionSection}
+
+Cinema options:
+- Trailer cold open: ${cinemaOptions.trailerEnabled ? 'ENABLED' : 'DISABLED'}
+- Chapter system: ${cinemaOptions.chaptersEnabled ? 'ENABLED' : 'DISABLED'}
+
+${cinemaOptions.trailerEnabled ? `TRAILER REQUIREMENTS:
+- Write an original 8–14 second spoken hook as one flowing sentence or two naturally connected sentences. It previews the stakes without repeating scene 1 or summarizing the ending.
+- At roughly 2.2 spoken words/second, every sentence must earn its place and end on an open loop.
+- Never use movie-trailer fragment syntax such as "One tunnel. One night. One chance."
+- Select 4–8 distinct candidate scene numbers containing the strongest visual peaks. The editor chooses the exact count after measuring the recorded voiceover.
+- The trailer title/subtitle must be elegant and concise.
+` : ''}
+${cinemaOptions.chaptersEnabled ? `CHAPTER REQUIREMENTS:
+- Create 2–5 story chapters. Chapter 1 starts at scene 1; later chapters start only at genuine narrative turns.
+- For EACH chapter write one 2.5–6 second overview narration beat that integrates the exact chapter title into a grammatical sentence. The overview beats play consecutively and must sound like one coherent preview paragraph.
+- For EACH chapter write a 3–7 second transition narration. Chapter 1 bridges the overview into scene 1; later transitions bridge the preceding scene into the new chapter's first scene. Never announce "Chapter two" mechanically.
+- Do not duplicate scene narration. These are connective lines with cinematic momentum.
+- Portrait prompts describe one museum-grade vertical character/object portrait without text.
+` : ''}
 
 Return JSON:
 {
@@ -975,50 +1522,440 @@ Return JSON:
     {
       "scene_id": "s01",
       "duration": 8,
-      "spoken_word_count": 18,
+      "spoken_word_count": 24,
       "lines": [
         "[BGM:LOW_RUMBLE]",
         "[SFX:HEAVY_STORM_AMBIENCE]",
-        "The storm of 1899 did not warn the lighthouse keepers.",
-        "[INTENSITY:DOWN]"
+        "The storm of 1899 gives the lighthouse keepers no warning, only a horizon turning black before the wind reaches the island."
       ],
       "timing_notes": "First spoken line starts at 2.0s to allow SFX intro",
       "delivery_instructions": "Flat, ominous documentary tone"
     },
     {
-      "scene_id": "s02", 
+      "scene_id": "s02",
       "duration": 10,
-      "spoken_word_count": 17,
+      "spoken_word_count": 26,
       "lines": [
         "[SFX:WAVE_CRASH_LOUD]",
-        "It simply arrived.",
         "[INTENSITY:UP]",
-        "At 4 AM, Keeper Walsh fought to secure the iron door against an 80-knot rage."
+        "By four in the morning it is on top of them, and Keeper Walsh is fighting to hold the iron door against an eighty-knot rage."
       ],
-      "timing_notes": "Narrator pauses for the wave crash, then strikes hard on 'arrived'",
+      "timing_notes": "The sentence continues the thought from s01, so the seam between scenes must be inaudible.",
       "delivery_instructions": "Vocal urgency spikes, pushing through the loud environment"
     }
   ],
+  "cinema": {
+    "trailer": ${cinemaOptions.trailerEnabled ? `{
+      "title": "The Impossible Choice",
+      "subtitle": "TEN DAYS BELOW",
+      "target_seconds": 10,
+      "candidate_scenes": [1, 3, 5, 7, 4],
+      "narration": {
+        "lines": ["[BGM:TENSION_RISE]", "Five moments lead to one impossible decision while the clock is already running out."],
+        "timing_notes": "Build through the montage and leave the final image hanging.",
+        "delivery_instructions": "Low, urgent, restrained."
+      }
+    }` : 'null'},
+    "chapters": ${cinemaOptions.chaptersEnabled ? `[
+      {
+        "title": "Thirty-Three Below",
+        "start_scene": 1,
+        "portrait_prompt": "Museum-grade vertical portrait relevant to this chapter...",
+        "overview_narration": {
+          "duration": 3.5,
+          "lines": ["Thirty-Three Below follows the moment when survival becomes a calculation."]
+        },
+        "transition_narration": {
+          "duration": 5,
+          "lines": ["Before anyone can reach them, the mountain has to reveal where it buried them."]
+        }
+      },
+      {
+        "title": "The Machine From the War",
+        "start_scene": 4,
+        "portrait_prompt": "Museum-grade vertical portrait relevant to the second chapter...",
+        "overview_narration": {
+          "duration": 3.5,
+          "lines": ["The Machine From the War brings in the stranger willing to drive it."]
+        },
+        "transition_narration": {
+          "duration": 5,
+          "lines": ["Now the rescue waits on one machine, and the man flying toward it."]
+        }
+      }
+    ]` : 'null'}
+  },
   "phonetic_guides": {
     "Walsh": "WOLSH"
   }
 }`;
     
-    const text = await callClaude(req, TTS_SCRIPT_SYSTEM, userContent);
-    const data = safeParseJSON(text);
-    
-    const fullScript = data.scene_breakdown?.map(s => (s.lines || []).filter(l => !l.startsWith('[')).join(' ')).join(' ') || '';
+    const options = {
+      chaptersEnabled: !!cinemaOptions.chaptersEnabled,
+      trailerEnabled: !!cinemaOptions.trailerEnabled,
+    };
+    let text = await callClaude(req, protectedSystemPrompt, userContent, { ignoreSystemOverride: true });
+    const suppliedVoiceover = story?.input_mode === 'script'
+      ? String(story.provided_voiceover || '').trim()
+      : '';
+    const applyLockedNarration = (parsed) => {
+      if (!suppliedVoiceover) return parsed;
+      const chunks = splitVoiceoverAtSentenceBoundaries(suppliedVoiceover, scenePlan.scenes.length);
+      const existing = Array.isArray(parsed.scene_breakdown) ? parsed.scene_breakdown : [];
+      parsed.scene_breakdown = scenePlan.scenes.map((scene, index) => {
+        const prior = existing.find(item => item.scene_id === scene.scene_id) || existing[index] || {};
+        const locked = scene.source_narration || chunks[index] || '';
+        return {
+          ...prior,
+          scene_id: scene.scene_id,
+          duration: Number(prior.duration) || Number(scene.duration_seconds) || 8,
+          spoken_word_count: locked.split(/\s+/).filter(Boolean).length,
+          lines: locked ? [locked] : [],
+          narration_locked: true,
+        };
+      });
+      return parsed;
+    };
+    const preserveLockedDraft = (draft) => {
+      if (!suppliedVoiceover) return draft;
+      // User-authored main narration is immutable. The continuity copy chief
+      // may validate generated cinema additions, but it may never "repair"
+      // the supplied words merely because their style differs from FacelessOS.
+      return {
+        ...draft,
+        issues: draft.issues.filter(issue =>
+          /^Return exactly|^Return a complete trailer|^Return at least two complete chapters/.test(issue)
+        ),
+      };
+    };
+    let draft = preserveLockedDraft(
+      materializeNarrationDraft(applyLockedNarration(safeParseJSON(text)), scenePlan, options)
+    );
+
+    for (let attempt = 1; draft.issues.length > 0 && attempt <= 2; attempt++) {
+      console.warn(`[tts-script] FacelessOS audit failed; repair ${attempt}/2: ${draft.issues.join(' | ')}`);
+      const repairContent = `Repair this documentary narration draft.
+
+Detected format: ${narrationProfile.format}
+Cinema options: ${JSON.stringify(options)}
+Required scene count: ${scenePlan.scenes.length}
+
+Audit issues:
+${draft.issues.map((issue, index) => `${index + 1}. ${issue}`).join('\n')}
+
+Complete story:
+${JSON.stringify(story, null, 2)}
+
+Complete scene plan:
+${JSON.stringify(scenePlan.scenes, null, 2)}
+
+Draft JSON:
+${JSON.stringify(draft.data, null, 2)}`;
+      text = await callClaude(
+        req,
+        `${protectedSystemPrompt}\n\n${NARRATION_REPAIR_SYSTEM}`,
+        repairContent,
+        { ignoreSystemOverride: true }
+      );
+      draft = preserveLockedDraft(
+        materializeNarrationDraft(applyLockedNarration(safeParseJSON(text)), scenePlan, options)
+      );
+    }
+
+    if (draft.issues.length > 0) {
+      throw new Error(`Narration failed the FacelessOS continuity audit after repair: ${draft.issues.join(' ')}`);
+    }
     
     res.json({
-      script: fullScript,
-      scene_breakdown: data.scene_breakdown,
-      word_count: data.script_metadata?.total_spoken_word_count || fullScript.split(/\s+/).length,
-      estimated_duration_seconds: data.script_metadata?.estimated_duration_seconds || scenePlan.total_duration_seconds,
-      phonetic_guides: data.phonetic_guides || {}
+      script: draft.fullScript,
+      scene_breakdown: draft.sceneBreakdown,
+      cinema: draft.cinema,
+      narration_sequence: draft.narrationSequence,
+      cinema_options: options,
+      writing_profile: {
+        format: narrationProfile.format,
+        references: narrationProfile.references,
+        continuity_audit: draft.continuityAudit,
+      },
+      word_count: draft.fullScript.split(/\s+/).filter(Boolean).length,
+      estimated_duration_seconds: draft.narrationSequence.reduce((sum, unit) => sum + (Number(unit.duration) || 0), 0),
+      phonetic_guides: draft.data.phonetic_guides || {}
     });
   } catch (error) {
     console.error('TTS script error:', error);
     res.status(500).json({ error: true, message: error.message, code: 'TTS_SCRIPT_ERROR' });
+  }
+});
+
+const CHARACTER_EXTRACTION_SYSTEM = `You are a documentary continuity supervisor. Extract recurring, visually identifiable people or recurring personified subjects from the supplied story and scene plan. Use Claude Sonnet-level precision. Do not create anonymous crowds, generic guards, or one-shot background extras as characters. Return only valid JSON.`;
+
+router.post('/characters/extract', async (req, res) => {
+  try {
+    const { story, scenePlan } = req.body;
+    if (!story || !Array.isArray(scenePlan?.scenes)) {
+      return res.status(400).json({ error: true, message: 'story and scenePlan.scenes are required' });
+    }
+    const text = await callClaudeCli('sonnet', CHARACTER_EXTRACTION_SYSTEM, `Extract the recurring visual cast for this documentary.
+
+STORY:
+${JSON.stringify(story, null, 2)}
+
+SCENES:
+${JSON.stringify(scenePlan.scenes.map(scene => ({
+  scene_id: scene.scene_id,
+  scene_number: scene.scene_number,
+  narration: scene.source_narration,
+  visual_description: scene.visual_description,
+  mannequin_details: scene.mannequin_details,
+})), null, 2)}
+
+Return:
+{
+  "characters": [{
+    "id": "stable-lowercase-id",
+    "name": "display name",
+    "role": "narrative role",
+    "character_type": "person|animal|personified-object",
+    "description": "identity-defining physical traits, approximate age, ethnicity when documented, hair, build, and immutable appearance only",
+    "visual_prompt": "A museum-quality full-body neutral character reference sheet on a simple dark studio background, matching the project's featureless glossy porcelain mannequin style, complete period-accurate neutral outfit, no text, no labels",
+    "scene_numbers": [1, 3],
+    "importance": "primary|supporting"
+  }]
+}`, { noSessionPersistence: true, timeoutMs: 15 * 60_000 });
+    const data = safeParseJSON(text);
+    const characters = (data.characters || []).map((character, index) => ({
+      ...character,
+      id: String(character.id || character.name || `character-${index + 1}`)
+        .toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, ''),
+      approved: false,
+      image: null,
+      image_options: [],
+    }));
+    res.json({ characters, model: 'sonnet' });
+  } catch (error) {
+    console.error('Character extraction error:', error);
+    res.status(500).json({ error: true, message: error.message, code: 'CHARACTER_EXTRACTION_ERROR' });
+  }
+});
+
+router.post('/characters/link', async (req, res) => {
+  try {
+    const { characters, scenePlan } = req.body;
+    if (!Array.isArray(characters) || !Array.isArray(scenePlan?.scenes)) {
+      return res.status(400).json({ error: true, message: 'characters and scenePlan.scenes are required' });
+    }
+    if (characters.length === 0) return res.json({ links: {}, model: 'sonnet' });
+    const text = await callClaudeCli('sonnet',
+      'You are a strict visual continuity editor. Link only characters who must visibly appear in each scene. Narration mentions alone are insufficient when the person is not shown. Return only valid JSON.',
+      `AVAILABLE CHARACTERS:
+${JSON.stringify(characters.map(({ id, name, role, description }) => ({ id, name, role, description })), null, 2)}
+
+SCENES:
+${JSON.stringify(scenePlan.scenes.map(scene => ({
+  scene_id: scene.scene_id,
+  scene_number: scene.scene_number,
+  narration: scene.source_narration,
+  visual_description: scene.visual_description,
+  action: scene.mannequin_details?.action,
+})), null, 2)}
+
+Return:
+{"links":[{"scene_number":1,"character_ids":["exact-character-id"],"reason":"why each linked character is visibly required"}]}`,
+      { noSessionPersistence: true, timeoutMs: 15 * 60_000 }
+    );
+    const data = safeParseJSON(text);
+    const validIds = new Set(characters.map(character => character.id));
+    const links = Object.fromEntries((data.links || []).map(link => [
+      String(link.scene_number),
+      {
+        character_ids: [...new Set((link.character_ids || []).filter(id => validIds.has(id)))],
+        reason: link.reason || '',
+      },
+    ]));
+    res.json({ links, model: 'sonnet' });
+  } catch (error) {
+    console.error('Character linking error:', error);
+    res.status(500).json({ error: true, message: error.message, code: 'CHARACTER_LINKING_ERROR' });
+  }
+});
+
+// ─── Expressive (tagged) narration script — ported from Storyforge ──────────
+// Rewrites the plain narration with inline audio tags (emotion / delivery /
+// pauses / reactions) for expressive TTS engines like ElevenLabs v3.
+
+const EXPRESSIVE_SCENES_PER_CHUNK = 18;
+const EXPRESSIVE_CONTEXT_SENTENCES = 5;
+const EXPRESSIVE_TAG_PATTERN = /\[([^\]]+)\]/g;
+const EXPRESSIVE_SENTENCE_PATTERN = /[^.!?]+(?:[.!?]+["')\]]*|$)/g;
+
+const EXPRESSIVE_ALLOWED_TAGS = new Set([
+  'tense', 'calm', 'excited', 'nervous', 'frustrated', 'sorrowful', 'wistful',
+  'awe', 'matter-of-fact', 'curious', 'angry', 'happy', 'melancholic',
+  'whispers', 'drawn out', 'hesitates', 'rushed', 'stammers',
+  'pause', 'short pause',
+  'sighs', 'laughs', 'gasps', 'exhales', 'clears throat',
+]);
+const EXPRESSIVE_DELIVERY_TAGS = new Set(['whispers', 'drawn out', 'hesitates', 'rushed', 'stammers']);
+const EXPRESSIVE_PAUSE_TAGS = new Set(['pause', 'short pause', 'sighs', 'laughs', 'gasps', 'exhales', 'clears throat']);
+const EXPRESSIVE_EMOTION_TAGS = new Set(
+  [...EXPRESSIVE_ALLOWED_TAGS].filter(t => !EXPRESSIVE_DELIVERY_TAGS.has(t) && !EXPRESSIVE_PAUSE_TAGS.has(t))
+);
+
+const normalizeExpressiveTag = (rawTag) => {
+  const normalized = rawTag.trim().toLowerCase().replace(/\s+/g, ' ');
+  if (normalized === 'long pause' || normalized === 'long-pause') return 'pause';
+  return EXPRESSIVE_ALLOWED_TAGS.has(normalized) ? normalized : null;
+};
+
+const inferDeliveryTag = (sentence, previousTag) => {
+  const text = sentence.toLowerCase();
+  if (/\?/.test(sentence) || /\b(why|what|where|who|wonder|curious|ask|asked)\b/.test(text)) return 'curious';
+  if (/\b(fire|flame|smoke|storm|thunder|lightning|wind|wolves|rifle|danger|terror|panic|heat|burn|burned|ash|ruin|nightmare|roof|dark|gale|cold|scared)\b/.test(text)) return 'tense';
+  if (/\b(cried|cry|tears|grief|dead|death|lonely|alone|loss|lost|sorrow|broke|heartbreaking|not enough|couldn't|can't)\b/.test(text)) return 'sorrowful';
+  if (/\b(beautiful|dawn|sun|gold|green|miracle|understood|impossibly|honor|love|prairie|sky|stars)\b/.test(text)) return 'awe';
+  if (/\b(remembers?|counting|numbers?|list|invoice|rule|because|that was|there was|it was|this is|here is|by the time|instead)\b/.test(text)) return 'matter-of-fact';
+  if (/\b(smiled|laugh|happy|married|wedding|thank you)\b/.test(text)) return 'happy';
+  if (/\b(quiet|soft|still|steady|peaceful|calm|gentle|silence)\b/.test(text)) return 'calm';
+  if (/\b(remembered|porch|old woman|thirty years|used to|watched over|dream)\b/.test(text)) return 'wistful';
+  return EXPRESSIVE_EMOTION_TAGS.has(previousTag) ? previousTag : 'matter-of-fact';
+};
+
+// Guarantees every sentence carries a delivery tag and only allowed tags survive
+const enforceTaggedScriptDensity = (text) => {
+  const sanitized = text.replace(/\[long[- ]pause\]/gi, '[pause]');
+  const parts = sanitized.split(EXPRESSIVE_TAG_PATTERN);
+  const output = [];
+  let pendingTags = [];
+  let previousDeliveryTag = 'matter-of-fact';
+
+  const hasDeliveryTag = (tags) =>
+    tags.some(tag => EXPRESSIVE_EMOTION_TAGS.has(tag) || EXPRESSIVE_DELIVERY_TAGS.has(tag));
+
+  for (let i = 0; i < parts.length; i++) {
+    const part = parts[i];
+    if (!part) continue;
+
+    if (i % 2 === 1) {
+      const normalizedTag = normalizeExpressiveTag(part);
+      if (!normalizedTag) continue;
+      pendingTags.push(normalizedTag);
+      if (EXPRESSIVE_EMOTION_TAGS.has(normalizedTag) || EXPRESSIVE_DELIVERY_TAGS.has(normalizedTag)) {
+        previousDeliveryTag = normalizedTag;
+      }
+      continue;
+    }
+
+    const sentences = (part.match(EXPRESSIVE_SENTENCE_PATTERN) || []).map(s => s.trim()).filter(Boolean);
+    for (const sentence of sentences) {
+      if (!hasDeliveryTag(pendingTags)) {
+        pendingTags.push(inferDeliveryTag(sentence, previousDeliveryTag));
+      }
+      const uniqueTags = [...new Set(pendingTags)];
+      output.push(`${uniqueTags.map(tag => `[${tag}]`).join(' ')} ${sentence}`.trim());
+      const deliveryTag = uniqueTags.find(tag => EXPRESSIVE_EMOTION_TAGS.has(tag) || EXPRESSIVE_DELIVERY_TAGS.has(tag));
+      if (deliveryTag) previousDeliveryTag = deliveryTag;
+      pendingTags = [];
+    }
+  }
+
+  if (pendingTags.length > 0) {
+    output.push([...new Set(pendingTags)].map(tag => `[${tag}]`).join(' '));
+  }
+
+  return output.join('\n\n').replace(/[ \t]+/g, ' ').replace(/\n{3,}/g, '\n\n').trim();
+};
+
+const EXPRESSIVE_SYSTEM_PROMPT = `You are a seasoned audio director preparing a documentary narration script for expressive text-to-speech engines such as ElevenLabs v3, GenAI Pro, and Gemini TTS.
+
+Your job is to deeply analyze the text — its emotional arc, dramatic beats, and the specific delivery each sentence demands — and embed inline expression tags that will make the narration feel genuinely alive.
+
+AVAILABLE TAGS (use ONLY these, never invent new ones):
+  Emotion:  [tense] [calm] [excited] [nervous] [frustrated] [sorrowful] [wistful] [awe] [matter-of-fact] [curious] [angry] [happy] [melancholic]
+  Delivery: [whispers] [drawn out] [hesitates] [rushed] [stammers]
+  Pauses:   [pause] [short pause]
+  Reactions:[sighs] [laughs] [gasps] [exhales] [clears throat]
+
+HOW TO ANALYZE:
+- Read each sentence and ask: "What emotion is the narrator carrying right now? How should this land in the listener's ear?"
+- Tag every sentence where the emotional delivery is clear and specific. Most sentences should have a tag.
+- A sentence that reveals betrayal needs [sorrowful] or [tense]. A sentence that reframes history needs [matter-of-fact] or [curious]. A moment of beauty needs [calm] or [awe]. Tag accordingly.
+- Preserve the authored punctuation and use tags to shape delivery. Do not introduce dashes, fragment the sentences, or rewrite the prose while adding expression.
+- Insert [pause] or [short pause] between sentences when the weight of what was just said needs a moment to land.
+- Reactions like [sighs], [exhales], [gasps] go BETWEEN sentences at emotionally charged turning points.
+
+TRANSITION RULE (critical):
+- Never jump directly between opposing extremes: e.g. [chaotic] → [calm], [angry] → [happy], [excited] → [sorrowful].
+- Use [matter-of-fact] or [pause] as a bridge when the tone needs to shift dramatically. Let the shift feel like a breath, not a cut.
+- Sustain an emotion across consecutive sentences when the content warrants it — don't tag every sentence with a different emotion.
+
+HARD RULES:
+- DO NOT modify, reorder, add, or remove any original words or sentences. The text is sacred.
+- Tags go BEFORE the sentence they affect, or BETWEEN sentences as reactions/pauses.
+- Do NOT place tags mid-sentence (inside a sentence).
+- Never use [long pause] or [long-pause]. Use [pause] instead.
+- Return ONLY the tagged narration text. No commentary, no markdown, no section headers.`;
+
+const lastNSentences = (text, n) => {
+  const sentences = text.match(/[^.!?]+[.!?]+/g) || [];
+  return sentences.slice(-n).join(' ').trim();
+};
+const firstNSentences = (text, n) => {
+  const sentences = text.match(/[^.!?]+[.!?]+/g) || [];
+  return sentences.slice(0, n).join(' ').trim();
+};
+
+router.post('/expressive-script', async (req, res) => {
+  try {
+    const { sceneBreakdown } = req.body;
+    if (!Array.isArray(sceneBreakdown) || sceneBreakdown.length === 0) {
+      return res.status(400).json({ error: true, message: 'sceneBreakdown is required', code: 'MISSING_SCENE_BREAKDOWN' });
+    }
+
+    // Plain spoken text per chunk of scenes (cue lines stripped)
+    const sceneTexts = sceneBreakdown.map(scene => {
+      const text = (scene.lines || []).filter(line => !line.startsWith('[')).join(' ').trim();
+      if (!text) return '';
+      return scene.cinema_type && scene.cinema_type !== 'scene'
+        ? `[pause] ${text} [pause]`
+        : text;
+    }).filter(Boolean);
+
+    const chunks = [];
+    for (let i = 0; i < sceneTexts.length; i += EXPRESSIVE_SCENES_PER_CHUNK) {
+      chunks.push(sceneTexts.slice(i, i + EXPRESSIVE_SCENES_PER_CHUNK).join(' '));
+    }
+
+    // Sequential — chunk order matters for tonal continuity, and the local
+    // Claude CLI handles one request at a time anyway
+    const taggedChunks = [];
+    for (let i = 0; i < chunks.length; i++) {
+      const prevContext = i > 0 ? lastNSentences(chunks[i - 1], EXPRESSIVE_CONTEXT_SENTENCES) : '';
+      const nextContext = i < chunks.length - 1 ? firstNSentences(chunks[i + 1], EXPRESSIVE_CONTEXT_SENTENCES) : '';
+
+      const prevSection = prevContext
+        ? `PRECEDING CONTEXT (DO NOT tag — use only to maintain tonal continuity at the start of your output):\n${prevContext}\n\n`
+        : '';
+      const nextSection = nextContext
+        ? `\n\nUPCOMING CONTEXT (DO NOT tag — ensure your last tag leads smoothly into this):\n${nextContext}`
+        : '';
+
+      const userContent = `${prevSection}SCRIPT TO TAG:\n${chunks[i]}${nextSection}`;
+
+      try {
+        const result = await callClaude(req, EXPRESSIVE_SYSTEM_PROMPT, userContent);
+        taggedChunks.push(enforceTaggedScriptDensity(result.trim()));
+      } catch (err) {
+        console.error(`expressive-script: chunk ${i + 1}/${chunks.length} failed:`, err.message);
+        // Fall back to auto-tagged plain text for this chunk
+        taggedChunks.push(enforceTaggedScriptDensity(chunks[i]));
+      }
+    }
+
+    const script = enforceTaggedScriptDensity(taggedChunks.join(' '));
+    res.json({ script });
+  } catch (error) {
+    console.error('Expressive script error:', error);
+    res.status(500).json({ error: true, message: error.message, code: 'EXPRESSIVE_SCRIPT_ERROR' });
   }
 });
 

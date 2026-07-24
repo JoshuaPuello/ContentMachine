@@ -1,0 +1,4 @@
+interface:
+  display_name: "Faceless Documentary Scripts"
+  short_description: "Write fluent, human documentary narration"
+  default_prompt: "Use $faceless-scripts-os to write or audit a fluent documentary narration script."

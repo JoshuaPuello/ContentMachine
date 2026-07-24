@@ -4,6 +4,7 @@ import { motion, AnimatePresence } from 'framer-motion'
 import { usePipelineStore } from '../store/pipelineStore'
 import api from '../services/api'
 import toast from 'react-hot-toast'
+import ActivityFeed from './ActivityFeed'
 
 // Offload ZIP extraction to a worker so the UI never freezes on large projects
 const importZipViaWorker = (file) => new Promise((resolve, reject) => {
@@ -23,13 +24,33 @@ const importZipViaWorker = (file) => new Promise((resolve, reject) => {
   worker.postMessage(file)
 })
 
+// Audio precedes images/videos: measured narration length per scene decides
+// how many shots (images + clips) each scene needs
 const steps = [
   { id: 'story', label: 'Story', path: '/' },
+  { id: 'audio', label: 'Audio', path: '/audio' },
   { id: 'images', label: 'Images', path: '/images' },
   { id: 'videos', label: 'Videos', path: '/videos' },
-  { id: 'audio', label: 'Audio', path: '/audio' },
+  { id: 'editor', label: 'Editor', path: '/editor' },
+  { id: 'metadata', label: 'Thumbnail / Metadata', path: '/metadata' },
   { id: 'export', label: 'Export', path: '/export' }
 ]
+
+const resumePathForProject = (project) => {
+  if (project?.timeline?.built) {
+    const hasMetadata = !!(
+      project.metadata?.selected_title
+      || project.metadata?.description
+      || project.metadata?.all_titles?.length
+    )
+    return hasMetadata || project.thumbnail?.selected_url ? '/export' : '/metadata'
+  }
+  if (Object.keys(project?.selected_videos || {}).length > 0) return '/editor'
+  if (Object.keys(project?.selected_images || {}).length > 0 || Object.keys(project?.images || {}).length > 0) return '/videos'
+  if (project?.tts_script || Object.keys(project?.audio?.sceneAudio || {}).length > 0) return '/images'
+  if (project?.story) return '/audio'
+  return '/'
+}
 
 const LS_KEYS_KEY = 'cm-api-keys'
 const loadKeysFromStorage = () => {
@@ -48,24 +69,37 @@ function Layout({ children }) {
   const [sessions, setSessions] = useState([])
   const [sessionsLoading, setSessionsLoading] = useState(false)
 
-  // On mount: push any localStorage-cached API keys to the backend
+  // On mount: push any localStorage-cached API keys to the backend, and pull
+  // back the heavy assets (audio, images) that localStorage persistence
+  // strips — until this runs, auto-save is blocked so a fresh reload can
+  // never overwrite a good session with empty state.
   useEffect(() => {
+    usePipelineStore.getState().restoreSessionAssets()
     const stored = loadKeysFromStorage()
     if (Object.values(stored).some(v => v)) {
       api.saveSettings({
         falKey: stored.fal || undefined,
         replicateKey: stored.replicate || undefined,
         geminiKey: stored.gemini || undefined,
-        elevenlabsKey: stored.elevenlabs || undefined
+        elevenlabsKey: stored.elevenlabs || undefined,
+        geminigenKey: stored.geminigen || undefined
       }).catch(() => {})
     }
   }, [])
+
+  // Routes share one document scroller. Never carry a deep scroll position
+  // into the Editor, where its fixed control row must attach to this header.
+  useEffect(() => {
+    window.scrollTo({ top: 0, left: 0, behavior: 'auto' })
+  }, [location.pathname])
 
   const {
     selectedStory,
     selectedImages,
     selectedVideos,
+    timeline,
     selectedThumbnail,
+    youtubeMetadata,
     generationState,
     generationPhase,
     imageProgress,
@@ -125,15 +159,20 @@ function Layout({ children }) {
 
 
   const getStepState = (index) => {
+    // Order: Story → Audio → Images → Videos → Editor → Thumbnail/Metadata → Export
     if (index === 0) return selectedStory ? 'completed' : currentStepIndex === 0 ? 'active' : 'upcoming'
-    if (index === 1) return Object.keys(selectedImages).length > 0 ? 'completed' : currentStepIndex === 1 ? 'active' : 'upcoming'
-    if (index === 2) return Object.keys(selectedVideos).length > 0 ? 'completed' : currentStepIndex === 2 ? 'active' : 'upcoming'
-    if (index >= 3) return currentStepIndex === index ? 'active' : 'upcoming'
+    if (index === 1) return selectedStory ? 'completed' : currentStepIndex === 1 ? 'active' : 'upcoming'
+    if (index === 2) return Object.keys(selectedImages).length > 0 ? 'completed' : currentStepIndex === 2 ? 'active' : 'upcoming'
+    if (index === 3) return Object.keys(selectedVideos).length > 0 ? 'completed' : currentStepIndex === 3 ? 'active' : 'upcoming'
+    if (index === 4) return timeline?.built ? 'completed' : currentStepIndex === 4 ? 'active' : 'upcoming'
+    if (index === 5) return (selectedThumbnail || youtubeMetadata || currentStepIndex > 5) ? 'completed' : currentStepIndex === 5 ? 'active' : 'upcoming'
+    if (index >= 6) return currentStepIndex === index ? 'active' : timeline?.built ? 'available' : 'upcoming'
     return 'upcoming'
   }
 
   const handleStepClick = (index) => {
-    if (getStepState(index) === 'completed') navigate(steps[index].path)
+    const state = getStepState(index)
+    if (state === 'completed' || state === 'available') navigate(steps[index].path)
   }
 
   const handleOpenSessions = async () => {
@@ -156,17 +195,7 @@ function Layout({ children }) {
       const project = await api.loadSession(sessionId)
       loadProject(project)
       toast.success('Session loaded', { id: toastId })
-      const hasImages = Object.keys(project.selected_images || {}).length > 0
-        || Object.keys(project.images || {}).length > 0
-      if (project.tts_script || Object.keys(project.audio?.sceneAudio || {}).length > 0) {
-        navigate('/audio')
-      } else if (project.selected_videos && Object.keys(project.selected_videos).length > 0) {
-        navigate('/videos')
-      } else if (hasImages) {
-        navigate('/images')
-      } else if (project.story) {
-        navigate('/')
-      }
+      navigate(resumePathForProject(project))
     } catch (err) {
       toast.error(`Failed to load session: ${err.message}`, { id: toastId })
     }
@@ -178,8 +207,8 @@ function Layout({ children }) {
       await api.deleteSession(sessionId)
       setSessions(prev => prev.filter(s => s.id !== sessionId))
       toast.success('Session deleted')
-    } catch {
-      toast.error('Failed to delete session')
+    } catch (error) {
+      toast.error(`Failed to delete session: ${error.response?.data?.error || error.message}`)
     }
   }
 
@@ -203,20 +232,7 @@ function Layout({ children }) {
       loadProject(project)
       toast.success('Project loaded', { id: toastId })
 
-      // Navigate to the furthest completed step.
-      // Check images by either selected_images OR images (all variants) having
-      // any entries — user may have generated images without selecting one yet.
-      const hasImages = Object.keys(project.selected_images || {}).length > 0
-        || Object.keys(project.images || {}).length > 0
-      if (project.tts_script || Object.keys(project.audio?.sceneAudio || {}).length > 0) {
-        navigate('/audio')
-      } else if (project.selected_videos && Object.keys(project.selected_videos).length > 0) {
-        navigate('/videos')
-      } else if (hasImages) {
-        navigate('/images')
-      } else if (project.story) {
-        navigate('/')
-      }
+      navigate(resumePathForProject(project))
     } catch (err) {
       console.error('Load project error:', err)
       toast.error(`Failed to load project: ${err.message}`, { id: toastId })
@@ -229,8 +245,21 @@ function Layout({ children }) {
     <div className="min-h-screen bg-background">
       <header className="fixed top-0 left-0 right-0 h-14 bg-surface/95 backdrop-blur-sm border-b border-border z-50 flex items-center px-5">
 
-        {/* Left — generation controls */}
-        <div className="w-44 flex items-center gap-2 shrink-0">
+        {/* Left — projects link + generation controls */}
+        <div className="w-52 flex items-center gap-2 shrink-0">
+          <button
+            onClick={() => navigate('/projects')}
+            title="Projects"
+            className={`w-8 h-8 flex items-center justify-center rounded-lg transition-colors shrink-0 ${
+              location.pathname === '/projects'
+                ? 'bg-accent/10 text-accent'
+                : 'hover:bg-surface-raised text-text-secondary hover:text-text-primary'
+            }`}
+          >
+            <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M3.75 6A2.25 2.25 0 016 3.75h2.25A2.25 2.25 0 0110.5 6v2.25a2.25 2.25 0 01-2.25 2.25H6a2.25 2.25 0 01-2.25-2.25V6zM13.5 6a2.25 2.25 0 012.25-2.25H18A2.25 2.25 0 0120.25 6v2.25A2.25 2.25 0 0118 10.5h-2.25a2.25 2.25 0 01-2.25-2.25V6zM3.75 15.75A2.25 2.25 0 016 13.5h2.25a2.25 2.25 0 012.25 2.25V18a2.25 2.25 0 01-2.25 2.25H6A2.25 2.25 0 013.75 18v-2.25zM13.5 15.75a2.25 2.25 0 012.25-2.25H18a2.25 2.25 0 012.25 2.25V18A2.25 2.25 0 0118 20.25h-2.25A2.25 2.25 0 0113.5 18v-2.25z" />
+            </svg>
+          </button>
       {/* Sessions browser */}
       <AnimatePresence>
         {sessionsOpen && (
@@ -299,9 +328,12 @@ function Layout({ children }) {
             </motion.span>
           )}
 
-          {/* App name when idle */}
+          {/* App name + current project name when idle */}
           {!isActive && (
-            <span className="text-sm font-semibold text-text-primary tracking-tight">ContentMachine</span>
+            <div className="flex flex-col min-w-0 leading-tight">
+              <span className="text-sm font-semibold text-text-primary tracking-tight">ContentMachine</span>
+              <ProjectNameLabel />
+            </div>
           )}
         </div>
 
@@ -315,11 +347,11 @@ function Layout({ children }) {
                 <div key={step.id} className="flex items-center">
                   <button
                     onClick={() => handleStepClick(index)}
-                    disabled={state !== 'completed' && state !== 'active'}
+                    disabled={state !== 'completed' && state !== 'active' && state !== 'available'}
                     className={`flex items-center gap-2 px-3 py-1.5 rounded-lg transition-all text-sm ${
                       state === 'active'
                         ? 'bg-accent/10 text-accent font-medium cursor-default'
-                        : state === 'completed'
+                        : state === 'completed' || state === 'available'
                         ? 'hover:bg-surface-raised text-text-secondary hover:text-text-primary cursor-pointer'
                         : 'opacity-35 cursor-default text-text-secondary'
                     }`}
@@ -329,6 +361,8 @@ function Layout({ children }) {
                         ? 'bg-accent text-white'
                         : state === 'active'
                         ? 'bg-accent text-white'
+                        : state === 'available'
+                        ? 'bg-surface-raised border border-accent/50 text-accent'
                         : 'bg-surface-raised border border-border text-text-disabled'
                     }`}>
                       {state === 'completed' ? (
@@ -355,7 +389,7 @@ function Layout({ children }) {
         </div>
 
         {/* Right — actions */}
-        <div className="w-44 flex items-center justify-end gap-1 shrink-0">
+        <div className="w-52 flex items-center justify-end gap-1 shrink-0">
           <input ref={fileInputRef} type="file" accept=".json,.zip" onChange={handleLoadProject} className="hidden" />
 
 
@@ -425,7 +459,57 @@ function Layout({ children }) {
       <AnimatePresence>
         {settingsOpen && <SettingsDrawer onClose={() => setSettingsOpen(false)} />}
       </AnimatePresence>
+
+      {/* Real-time generation activity feed */}
+      <ActivityFeed />
     </div>
+  )
+}
+
+// ── Current project name — small subtitle under the logo, click-to-rename ──
+function ProjectNameLabel() {
+  const { projectName, renameProject } = usePipelineStore()
+  const [editing, setEditing] = useState(false)
+  const [draft, setDraft] = useState('')
+  const inputRef = useRef(null)
+
+  const fallback = sessionStorage.getItem('pipeline_session_id') || 'Untitled project'
+  const display = projectName || fallback
+
+  useEffect(() => {
+    if (editing) inputRef.current?.select()
+  }, [editing])
+
+  const commit = () => {
+    setEditing(false)
+    const trimmed = draft.trim()
+    if (trimmed && trimmed !== display) renameProject(trimmed)
+  }
+
+  if (editing) {
+    return (
+      <input
+        ref={inputRef}
+        value={draft}
+        onChange={(e) => setDraft(e.target.value)}
+        onBlur={commit}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter') commit()
+          if (e.key === 'Escape') setEditing(false)
+        }}
+        className="!w-36 !py-0 !px-1 !text-[10px] leading-tight"
+      />
+    )
+  }
+
+  return (
+    <button
+      onClick={() => { setDraft(projectName || ''); setEditing(true) }}
+      title="Rename project"
+      className="text-[10px] text-text-disabled hover:text-text-secondary truncate max-w-[9.5rem] text-left transition-colors"
+    >
+      {display}
+    </button>
   )
 }
 
@@ -435,7 +519,8 @@ const PROVIDERS = [
   { id: 'fal', name: 'fal.ai', description: 'AI media generation', link: 'https://fal.ai/dashboard/keys' },
   { id: 'replicate', name: 'Replicate', description: 'AI model hosting', link: 'https://replicate.com/account/api-tokens' },
   { id: 'gemini', name: 'Gemini', description: 'Google AI', link: 'https://aistudio.google.com/api-keys' },
-  { id: 'elevenlabs', name: 'ElevenLabs', description: 'Voice & audio', link: 'https://elevenlabs.io/app/settings/api-keys' }
+  { id: 'elevenlabs', name: 'ElevenLabs', description: 'Voice & audio', link: 'https://elevenlabs.io/app/settings/api-keys' },
+  { id: 'geminigen', name: 'GeminiGen', description: 'Veo/Omni video (snapgen.ai)', link: 'https://geminigen.ai' }
 ]
 
 const FAL_IMAGE_MODELS = [
@@ -462,11 +547,41 @@ const GEMINI_IMAGE_MODELS = [
   { value: 'gemini-3-pro-image-preview', label: 'Gemini 3 Pro Image (2K)' },
 ]
 
+// Vertex AI image models — same set Storyforge exposes. Auth comes from the
+// service-account JSON files configured in backend/.env, not a UI key.
+const VERTEX_IMAGE_MODELS = [
+  { value: 'gemini-2.5-flash-image', label: 'Gemini 2.5 Flash Image (fast, 1024px)' },
+  { value: 'gemini-3.1-flash-lite-image', label: 'Gemini 3.1 Flash Lite Image (fastest)' },
+  { value: 'gemini-3-pro-image-preview', label: 'Gemini 3 Pro Image (up to 4K)' },
+  { value: 'gemini-3.1-flash-image-preview', label: 'Gemini 3.1 Flash Image (4K, best value)' },
+]
+
+const CLAUDE_CLI_MODELS = [
+  { value: 'sonnet', label: 'Claude Sonnet (Recommended)' },
+  { value: 'opus', label: 'Claude Opus (highest quality)' },
+  { value: 'haiku', label: 'Claude Haiku (fastest)' },
+]
+
 const REPLICATE_VIDEO_MODELS = [
   { value: 'lightricks/ltx-2-pro', label: 'LTX-2 Pro (best quality)' },
   { value: 'lightricks/ltx-2-fast', label: 'LTX-2 Fast (cheaper · 6–20s)' },
   { value: 'kwaivgi/kling-v3-video', label: 'Kling v3 (cinematic · up to 15s)' },
   { value: 'kwaivgi/kling-v2.5-turbo-pro', label: 'Kling 2.5 Turbo Pro (5s or 10s)' },
+]
+
+// GeminiGen (snapgen.ai) models
+const GEMINIGEN_VIDEO_MODELS = [
+  { value: 'veo-3.1-fast', label: 'Veo 3.1 Fast (fixed 8s clips)' },
+  { value: 'grok-3', label: 'Grok (6s / 10s / 15s clips)' },
+]
+
+// Minimum playback rate when a clip is stretched over longer audio
+const SPEED_FACTOR_OPTIONS = [
+  { value: 1,    label: 'Off — never slow down' },
+  { value: 0.95, label: 'Up to 95% speed (subtle)' },
+  { value: 0.9,  label: 'Up to 90% speed' },
+  { value: 0.85, label: 'Up to 85% speed' },
+  { value: 0.8,  label: 'Up to 80% speed (recommended)' },
 ]
 
 function SettingsDrawer({ onClose }) {
@@ -475,11 +590,15 @@ function SettingsDrawer({ onClose }) {
     fal: stored.fal || '',
     replicate: stored.replicate || '',
     gemini: stored.gemini || '',
-    elevenlabs: stored.elevenlabs || ''
+    elevenlabs: stored.elevenlabs || '',
+    geminigen: stored.geminigen || ''
   })
   const [validationState, setValidationState] = useState({
-    fal: 'unknown', replicate: 'unknown', gemini: 'unknown', elevenlabs: 'unknown'
+    fal: 'unknown', replicate: 'unknown', gemini: 'unknown', elevenlabs: 'unknown', geminigen: 'unknown'
   })
+  // Backend-environment capabilities (not UI keys): Vertex service accounts and
+  // the local Claude Code CLI.
+  const [envStatus, setEnvStatus] = useState({ vertex: false, claudeCli: false, vertexError: null })
   const [validating, setValidating] = useState({})
   const [saving, setSaving] = useState(false)
 
@@ -488,6 +607,11 @@ function SettingsDrawer({ onClose }) {
     setProvider, setModel,
     setClaudeProvider, setClaudeModel,
     setVideoProvider, setVideoModel,
+    setVideoClipDuration, setVideoSpeedFactor, setImageVariations,
+    setSoundEffectsVolume, setBackgroundMusicEnabled, setBackgroundMusicVolume,
+    setFilmGrainEnabled, setFilmGrainAmount,
+    setAtmosphericGradeEnabled, setAtmosphericGradeAmount,
+    setVignetteEnabled, setVignetteAmount,
     setKeysConfigured
   } = usePipelineStore()
 
@@ -501,7 +625,8 @@ function SettingsDrawer({ onClose }) {
         falKey: stored.fal || undefined,
         replicateKey: stored.replicate || undefined,
         geminiKey: stored.gemini || undefined,
-        elevenlabsKey: stored.elevenlabs || undefined
+        elevenlabsKey: stored.elevenlabs || undefined,
+        geminigenKey: stored.geminigen || undefined
       }).catch(() => {})
     }
     api.getSettings().then(status => {
@@ -509,13 +634,19 @@ function SettingsDrawer({ onClose }) {
         fal: status.fal ? 'valid' : 'unknown',
         replicate: status.replicate ? 'valid' : 'unknown',
         gemini: status.gemini ? 'valid' : 'unknown',
-        elevenlabs: status.elevenlabs ? 'valid' : 'unknown'
+        elevenlabs: status.elevenlabs ? 'valid' : 'unknown',
+        geminigen: status.geminigen ? 'valid' : 'unknown'
       })
+      setEnvStatus({ vertex: !!status.vertex, claudeCli: !!status.claudeCli, vertexError: status.vertexError || null })
       setKeysConfigured({
         fal: !!status.fal,
         replicate: !!status.replicate,
         gemini: !!status.gemini,
-        elevenlabs: !!status.elevenlabs
+        elevenlabs: !!status.elevenlabs,
+        geminigen: !!status.geminigen,
+        vertex: !!status.vertex,
+        claudeCli: !!status.claudeCli,
+        whisper: !!status.whisper
       })
     }).catch(() => {})
   }, [])
@@ -572,7 +703,8 @@ function SettingsDrawer({ onClose }) {
         falKey: keys.fal || undefined,
         replicateKey: keys.replicate || undefined,
         geminiKey: keys.gemini || undefined,
-        elevenlabsKey: keys.elevenlabs || undefined
+        elevenlabsKey: keys.elevenlabs || undefined,
+        geminigenKey: keys.geminigen || undefined
       })
       // Save all non-empty keys to localStorage
       const stored = loadKeysFromStorage()
@@ -581,6 +713,7 @@ function SettingsDrawer({ onClose }) {
       if (keys.replicate) updated.replicate = keys.replicate
       if (keys.gemini) updated.gemini = keys.gemini
       if (keys.elevenlabs) updated.elevenlabs = keys.elevenlabs
+      if (keys.geminigen) updated.geminigen = keys.geminigen
       saveKeysToStorage(updated)
 
       const status = await api.getSettings()
@@ -588,12 +721,14 @@ function SettingsDrawer({ onClose }) {
         fal: status.fal ? 'valid' : 'unknown',
         replicate: status.replicate ? 'valid' : 'unknown',
         gemini: status.gemini ? 'valid' : 'unknown',
-        elevenlabs: status.elevenlabs ? 'valid' : 'unknown'
+        elevenlabs: status.elevenlabs ? 'valid' : 'unknown',
+        geminigen: status.geminigen ? 'valid' : 'unknown'
       })
-      setKeysConfigured({ fal: !!status.fal, replicate: !!status.replicate, gemini: !!status.gemini, elevenlabs: !!status.elevenlabs })
+      setEnvStatus({ vertex: !!status.vertex, claudeCli: !!status.claudeCli, vertexError: status.vertexError || null })
+      setKeysConfigured({ fal: !!status.fal, replicate: !!status.replicate, gemini: !!status.gemini, elevenlabs: !!status.elevenlabs, geminigen: !!status.geminigen, vertex: !!status.vertex, claudeCli: !!status.claudeCli, whisper: !!status.whisper })
       // Refresh displayed keys from storage
       const refreshed = loadKeysFromStorage()
-      setKeys({ fal: refreshed.fal || '', replicate: refreshed.replicate || '', gemini: refreshed.gemini || '', elevenlabs: refreshed.elevenlabs || '' })
+      setKeys({ fal: refreshed.fal || '', replicate: refreshed.replicate || '', gemini: refreshed.gemini || '', elevenlabs: refreshed.elevenlabs || '', geminigen: refreshed.geminigen || '' })
       toast.success('Settings saved')
     } catch {
       toast.error('Failed to save settings')
@@ -618,6 +753,8 @@ function SettingsDrawer({ onClose }) {
     ? FAL_IMAGE_MODELS
     : settings.imageProvider === 'replicate'
     ? REPLICATE_IMAGE_MODELS
+    : settings.imageProvider === 'vertex'
+    ? VERTEX_IMAGE_MODELS
     : GEMINI_IMAGE_MODELS
 
   return (
@@ -714,19 +851,190 @@ function SettingsDrawer({ onClose }) {
             </div>
           </section>
 
+          {/* Documentary underscore — project-level master mix */}
+          <section>
+            <div className="flex items-center justify-between mb-3">
+              <h3 className="text-xs font-semibold text-text-disabled uppercase tracking-wider">
+                Background Score
+              </h3>
+              <span className="text-xs font-mono text-text-secondary tabular-nums">
+                {settings.backgroundMusicEnabled === false
+                  ? 'Off'
+                  : `${Math.round((settings.backgroundMusicVolume ?? 1) * 100)}%`}
+              </span>
+            </div>
+            <div className="bg-surface-raised rounded-lg p-3">
+              <label className="flex items-center justify-between gap-3 text-xs font-medium text-text-primary">
+                <span>Director-selected underscore</span>
+                <input
+                  type="checkbox"
+                  checked={settings.backgroundMusicEnabled !== false}
+                  onChange={event => setBackgroundMusicEnabled(event.target.checked)}
+                  className="accent-accent"
+                />
+              </label>
+              <input
+                type="range"
+                min="0"
+                max="1.5"
+                step="0.05"
+                disabled={settings.backgroundMusicEnabled === false}
+                value={settings.backgroundMusicVolume ?? 1}
+                onChange={event => setBackgroundMusicVolume(Number(event.target.value))}
+                className="mt-4 w-full accent-accent disabled:opacity-40"
+              />
+              <div className="flex justify-between mt-2 text-[10px] text-text-disabled">
+                <span>Muted</span>
+                <span>Authored 100%</span>
+                <span>Boost 150%</span>
+              </div>
+              <p className="text-[10px] text-text-disabled leading-relaxed mt-2">
+                Scales the loudness-normalized score independently from narration and sound effects.
+                Changes are saved with this project and used in Editor playback and final render.
+              </p>
+            </div>
+          </section>
+
+          {/* Final-film optical treatment — persisted per project */}
+          <section>
+            <div className="flex items-center justify-between mb-3">
+              <h3 className="text-xs font-semibold text-text-disabled uppercase tracking-wider">
+                Film Treatment
+              </h3>
+              <span className="text-[10px] text-text-disabled">Editor + final render</span>
+            </div>
+            <div className="bg-surface-raised rounded-lg p-3 space-y-5">
+              <div>
+                <label className="flex items-center justify-between gap-3 text-xs font-medium text-text-primary">
+                  <span>
+                    Film grain
+                    <span className="ml-2 font-mono text-text-secondary">
+                      {Math.round((settings.filmGrainAmount ?? 0.32) * 100)}%
+                    </span>
+                  </span>
+                  <input
+                    type="checkbox"
+                    checked={settings.filmGrainEnabled !== false}
+                    onChange={event => setFilmGrainEnabled(event.target.checked)}
+                    className="accent-accent"
+                  />
+                </label>
+                <input
+                  type="range"
+                  min="0"
+                  max="1"
+                  step="0.01"
+                  disabled={settings.filmGrainEnabled === false}
+                  value={settings.filmGrainAmount ?? 0.32}
+                  onChange={event => setFilmGrainAmount(Number(event.target.value))}
+                  className="mt-2 w-full accent-accent disabled:opacity-40"
+                />
+                <p className="text-[10px] text-text-disabled leading-relaxed mt-1">
+                  Fine, animated analog texture—never scratches or heavy VHS damage.
+                </p>
+              </div>
+
+              <div className="border-t border-border/70 pt-4">
+                <label className="flex items-center justify-between gap-3 text-xs font-medium text-text-primary">
+                  <span>
+                    Cold atmospheric grade
+                    <span className="ml-2 font-mono text-text-secondary">
+                      {Math.round((settings.atmosphericGradeAmount ?? 0.42) * 100)}%
+                    </span>
+                  </span>
+                  <input
+                    type="checkbox"
+                    checked={settings.atmosphericGradeEnabled ?? true}
+                    onChange={event => setAtmosphericGradeEnabled(event.target.checked)}
+                    className="accent-accent"
+                  />
+                </label>
+                <input
+                  type="range"
+                  min="0"
+                  max="1"
+                  step="0.01"
+                  disabled={settings.atmosphericGradeEnabled === false}
+                  value={settings.atmosphericGradeAmount ?? 0.42}
+                  onChange={event => setAtmosphericGradeAmount(Number(event.target.value))}
+                  className="mt-2 w-full accent-accent disabled:opacity-40"
+                />
+                <div className="grid grid-cols-3 gap-1.5 mt-2">
+                  {[
+                    { label: 'Subtle', value: 0.24 },
+                    { label: 'Cinema', value: 0.42 },
+                    { label: 'Deep', value: 0.62 },
+                  ].map(preset => (
+                    <button
+                      key={preset.label}
+                      type="button"
+                      onClick={() => {
+                        setAtmosphericGradeEnabled(true)
+                        setAtmosphericGradeAmount(preset.value)
+                      }}
+                      className={`py-1.5 rounded-md text-[10px] border transition-colors ${
+                        (settings.atmosphericGradeEnabled ?? true)
+                        && Math.abs((settings.atmosphericGradeAmount ?? 0.42) - preset.value) < 0.005
+                          ? 'border-accent/60 bg-accent/10 text-accent'
+                          : 'border-border text-text-secondary hover:text-text-primary'
+                      }`}
+                    >
+                      {preset.label}
+                    </button>
+                  ))}
+                </div>
+                <p className="text-[10px] text-text-disabled leading-relaxed mt-2">
+                  Low-key blue-gray shadows, restrained desaturation and soft optical haze.
+                </p>
+              </div>
+
+              <div className="border-t border-border/70 pt-4">
+                <label className="flex items-center justify-between gap-3 text-xs font-medium text-text-primary">
+                  <span>
+                    Four-corner vignette
+                    <span className="ml-2 font-mono text-text-secondary">
+                      {Math.round((settings.vignetteAmount ?? 0.70) * 100)}%
+                    </span>
+                  </span>
+                  <input
+                    type="checkbox"
+                    checked={settings.vignetteEnabled !== false}
+                    onChange={event => setVignetteEnabled(event.target.checked)}
+                    className="accent-accent"
+                  />
+                </label>
+                <input
+                  type="range"
+                  min="0"
+                  max="1"
+                  step="0.01"
+                  disabled={settings.vignetteEnabled === false}
+                  value={settings.vignetteAmount ?? 0.70}
+                  onChange={event => setVignetteAmount(Number(event.target.value))}
+                  className="mt-2 w-full accent-accent disabled:opacity-40"
+                />
+                <p className="text-[10px] text-text-disabled leading-relaxed mt-1">
+                  Gradually darkens every edge and corner without obscuring the focal subject.
+                </p>
+              </div>
+            </div>
+          </section>
+
           {/* LLM Model */}
           <section>
             <h3 className="text-xs font-semibold text-text-disabled uppercase tracking-wider mb-3">LLM Model</h3>
             <div className="space-y-2">
-              <div className="grid grid-cols-3 gap-1.5 bg-surface-raised rounded-lg p-1">
+              <div className="grid grid-cols-4 gap-1.5 bg-surface-raised rounded-lg p-1">
                 {[
-                  { id: 'fal', label: 'fal.ai' },
-                  { id: 'replicate', label: 'Replicate' },
-                  { id: 'gemini', label: 'Gemini' }
+                  { id: 'fal', label: 'fal.ai', enabled: isValid('fal') },
+                  { id: 'replicate', label: 'Replicate', enabled: isValid('replicate') },
+                  { id: 'gemini', label: 'Gemini', enabled: isValid('gemini') },
+                  { id: 'claude-cli', label: 'Claude (local)', enabled: envStatus.claudeCli }
                 ].map(p => (
                   <button key={p.id}
                     onClick={() => setClaudeProvider(p.id)}
-                    disabled={!isValid(p.id)}
+                    disabled={!p.enabled}
+                    title={p.id === 'claude-cli' && !p.enabled ? 'Claude Code CLI not found on this machine' : undefined}
                     className={`py-1.5 rounded-md text-xs font-medium transition-all disabled:opacity-40 ${
                       settings.claudeProvider === p.id
                         ? 'bg-surface text-text-primary shadow-sm'
@@ -736,6 +1044,18 @@ function SettingsDrawer({ onClose }) {
                 ))}
               </div>
 
+              {settings.claudeProvider === 'claude-cli' && (
+                <>
+                  <select value={settings.claudeModel} onChange={e => setClaudeModel(e.target.value)} className="w-full text-sm">
+                    {CLAUDE_CLI_MODELS.map(m => (
+                      <option key={m.value} value={m.value}>{m.label}</option>
+                    ))}
+                  </select>
+                  <p className="text-[10px] text-text-disabled leading-relaxed">
+                    Runs <span className="font-mono">claude -p</span> on this machine using your Claude subscription — no API key needed.
+                  </p>
+                </>
+              )}
               {settings.claudeProvider === 'gemini' && (
                 <select value={settings.claudeModel} onChange={e => setClaudeModel(e.target.value)} className="w-full text-sm">
                   <option value="gemini-3-flash">Gemini 3 Flash (Recommended)</option>
@@ -765,15 +1085,17 @@ function SettingsDrawer({ onClose }) {
           <section>
             <h3 className="text-xs font-semibold text-text-disabled uppercase tracking-wider mb-3">Image Generation</h3>
             <div className="space-y-2">
-              <div className="grid grid-cols-3 gap-1.5 bg-surface-raised rounded-lg p-1">
+              <div className="grid grid-cols-4 gap-1.5 bg-surface-raised rounded-lg p-1">
                 {[
-                  { id: 'fal', label: 'fal.ai' },
-                  { id: 'replicate', label: 'Replicate' },
-                  { id: 'gemini', label: 'Gemini' }
+                  { id: 'fal', label: 'fal.ai', enabled: isValid('fal') },
+                  { id: 'replicate', label: 'Replicate', enabled: isValid('replicate') },
+                  { id: 'gemini', label: 'Gemini', enabled: isValid('gemini') },
+                  { id: 'vertex', label: 'Vertex', enabled: envStatus.vertex }
                 ].map(p => (
                   <button key={p.id}
                     onClick={() => setProvider(p.id)}
-                    disabled={!isValid(p.id)}
+                    disabled={!p.enabled}
+                    title={p.id === 'vertex' && !p.enabled ? (envStatus.vertexError || 'Vertex AI not configured in backend/.env') : undefined}
                     className={`py-1.5 rounded-md text-xs font-medium transition-all disabled:opacity-40 ${
                       settings.imageProvider === p.id
                         ? 'bg-surface text-text-primary shadow-sm'
@@ -788,20 +1110,27 @@ function SettingsDrawer({ onClose }) {
                   <option key={m.value} value={m.value}>{m.label}</option>
                 ))}
               </select>
+              {settings.imageProvider === 'vertex' && (
+                <p className="text-[10px] text-text-disabled leading-relaxed">
+                  Uses the GCP service accounts configured in backend/.env — billed to GCP credits, rotates accounts on rate limits.
+                </p>
+              )}
             </div>
           </section>
 
           {/* Video Generation */}
           <section>
             <h3 className="text-xs font-semibold text-text-disabled uppercase tracking-wider mb-3">Video Generation</h3>
-            <div className="grid grid-cols-2 gap-1.5 bg-surface-raised rounded-lg p-1 mb-2">
+            <div className="grid grid-cols-3 gap-1.5 bg-surface-raised rounded-lg p-1 mb-2">
               {[
-                { id: 'fal', label: 'fal.ai (LTX-2)' },
-                { id: 'replicate', label: 'Replicate' }
+                { id: 'fal', label: 'fal.ai (LTX-2)', enabled: isValid('fal') },
+                { id: 'replicate', label: 'Replicate', enabled: isValid('replicate') },
+                { id: 'geminigen', label: 'Gemini Omni', enabled: isValid('geminigen') }
               ].map(p => (
                 <button key={p.id}
                   onClick={() => setVideoProvider(p.id)}
-                  disabled={!isValid(p.id)}
+                  disabled={!p.enabled}
+                  title={p.id === 'geminigen' && !p.enabled ? 'Add and test a GeminiGen API key above' : undefined}
                   className={`py-1.5 rounded-md text-xs font-medium transition-all disabled:opacity-40 ${
                     settings.videoProvider === p.id
                       ? 'bg-surface text-text-primary shadow-sm'
@@ -821,6 +1150,120 @@ function SettingsDrawer({ onClose }) {
                 ))}
               </select>
             )}
+            {settings.videoProvider === 'geminigen' && (
+              <div className="space-y-2">
+                <select
+                  value={settings.videoModel || 'veo-3.1-fast'}
+                  onChange={e => {
+                    setVideoModel(e.target.value)
+                    setVideoClipDuration(null)  // reset to the new model's default
+                  }}
+                  className="w-full text-sm"
+                >
+                  {GEMINIGEN_VIDEO_MODELS.map(m => (
+                    <option key={m.value} value={m.value}>{m.label}</option>
+                  ))}
+                </select>
+                {settings.videoModel === 'grok-3' && (
+                  <div>
+                    <label className="text-[10px] text-text-secondary block mb-1">Max clip length</label>
+                    <div className="grid grid-cols-3 gap-1.5 bg-surface-raised rounded-lg p-1">
+                      {[6, 10, 15].map(d => (
+                        <button key={d}
+                          onClick={() => setVideoClipDuration(d)}
+                          className={`py-1.5 rounded-md text-xs font-medium transition-all ${
+                            (settings.videoClipDuration || 15) === d
+                              ? 'bg-surface text-text-primary shadow-sm'
+                              : 'text-text-secondary hover:text-text-primary'
+                          }`}
+                        >{d}s</button>
+                      ))}
+                    </div>
+                  </div>
+                )}
+                <p className="text-[10px] text-text-disabled leading-relaxed">
+                  {settings.videoModel === 'grok-3'
+                    ? 'Grok via GeminiGen (snapgen.ai) — clips of 6/10/15s. Shots are sized to each scene\'s audio.'
+                    : 'Veo 3.1 Fast via GeminiGen (snapgen.ai) — 720p, fixed 8s clips. Scenes with longer audio automatically get multiple sequential shots.'}
+                </p>
+              </div>
+            )}
+          </section>
+
+          {/* Video Timing — how shots are fitted to the narration audio */}
+          <section>
+            <h3 className="text-xs font-semibold text-text-disabled uppercase tracking-wider mb-3">Video Timing</h3>
+            <div className="space-y-3">
+              <div>
+                <label className="text-[10px] text-text-secondary block mb-1">Slow-down allowance</label>
+                <select
+                  value={settings.videoSpeedFactor ?? 0.8}
+                  onChange={e => setVideoSpeedFactor(parseFloat(e.target.value))}
+                  className="w-full text-sm"
+                >
+                  {SPEED_FACTOR_OPTIONS.map(o => (
+                    <option key={o.value} value={o.value}>{o.label}</option>
+                  ))}
+                </select>
+                <p className="text-[10px] text-text-disabled leading-relaxed mt-1">
+                  Lets a clip be played slower to cover more narration — e.g. at 80% an 8s clip covers 10s of audio,
+                  so fewer extra shots are needed. Segments under 5s are never created; the audio is split evenly instead.
+                </p>
+              </div>
+              <div>
+                <label className="text-[10px] text-text-secondary block mb-1">Image variations per shot</label>
+                <div className="grid grid-cols-4 gap-1.5 bg-surface-raised rounded-lg p-1">
+                  {[1, 2, 3, 4].map(n => (
+                    <button key={n}
+                      onClick={() => setImageVariations(n)}
+                      className={`py-1.5 rounded-md text-xs font-medium transition-all ${
+                        (settings.imageVariations ?? 4) === n
+                          ? 'bg-surface text-text-primary shadow-sm'
+                          : 'text-text-secondary hover:text-text-primary'
+                      }`}
+                    >{n}</button>
+                  ))}
+                </div>
+                <p className="text-[10px] text-text-disabled leading-relaxed mt-1">
+                  How many image options are generated for each shot — you still pick exactly one.
+                </p>
+              </div>
+            </div>
+          </section>
+
+          {/* Director sound effects — project-level master mix */}
+          <section>
+            <div className="flex items-center justify-between mb-3">
+              <h3 className="text-xs font-semibold text-text-disabled uppercase tracking-wider">
+                Director Sound
+              </h3>
+              <span className="text-xs font-mono text-text-secondary tabular-nums">
+                {Math.round((settings.soundEffectsVolume ?? 1) * 100)}%
+              </span>
+            </div>
+            <div className="bg-surface-raised rounded-lg p-3">
+              <label className="text-xs font-medium text-text-primary block mb-2">
+                Sound effects level
+              </label>
+              <input
+                type="range"
+                min="0"
+                max="1.5"
+                step="0.05"
+                value={settings.soundEffectsVolume ?? 1}
+                onChange={event => setSoundEffectsVolume(Number(event.target.value))}
+                className="w-full accent-accent"
+              />
+              <div className="flex justify-between mt-2 text-[10px] text-text-disabled">
+                <span>Muted</span>
+                <span>Authored 100%</span>
+                <span>Boost 150%</span>
+              </div>
+              <p className="text-[10px] text-text-disabled leading-relaxed mt-2">
+                Scales waveform-aligned Director effects only. Narration and music are unchanged.
+                The level is saved with this project and used by both Editor playback and final render.
+              </p>
+            </div>
           </section>
         </div>
 

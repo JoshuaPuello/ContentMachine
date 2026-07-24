@@ -52,7 +52,7 @@ function VideoModal({ job, history = [], videoPrompt, sceneNumber, onClose, onRe
     if (!url) return
     const link = document.createElement('a')
     link.href = url
-    link.download = `scene-${String(sceneNumber).padStart(2, '0')}.mp4`
+    link.download = `scene-${String(sceneNumber).replace('_', '-shot')}.mp4`
     document.body.appendChild(link)
     link.click()
     document.body.removeChild(link)
@@ -148,7 +148,7 @@ function VideoModal({ job, history = [], videoPrompt, sceneNumber, onClose, onRe
           {/* Info & actions */}
           <div className="p-4 border-t border-border">
             <div className="flex items-center justify-between mb-2">
-              <span className="text-sm font-semibold text-text-primary">Scene {sceneNumber}</span>
+              <span className="text-sm font-semibold text-text-primary">Scene {String(sceneNumber).replace(/_(\d+)$/, (m, seg) => Number(seg) > 0 ? ` · shot ${Number(seg) + 1}` : '')}</span>
               <span className="text-xs text-text-disabled">{videoPrompt?.duration_seconds}s</span>
             </div>
 
@@ -161,6 +161,7 @@ function VideoModal({ job, history = [], videoPrompt, sceneNumber, onClose, onRe
                   placeholder="Edit prompt..."
                   autoFocus
                 />
+                <p className="text-[10px] text-text-disabled">Source-frame, mannequin, wardrobe, object, continuity, and stability locks stay protected.</p>
                 <div className="flex gap-2">
                   <button onClick={handleRegenerate} className="btn-primary py-2 px-4 text-sm">
                     Regenerate with edit

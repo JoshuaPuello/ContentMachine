@@ -1,13 +1,16 @@
 import express from 'express';
 import { ElevenLabsClient } from '@elevenlabs/elevenlabs-js';
+import { ElevenLabsSfxClient } from '../lib/elevenLabsSfx.js';
 const router = express.Router();
 
-const getClient = (req) => {
+const getApiKey = (req) => {
   const keys = req.app.get('apiKeys');
-  if (!keys.elevenlabs) {
-    throw new Error('ElevenLabs API key not configured');
-  }
-  return new ElevenLabsClient({ apiKey: keys.elevenlabs });
+  if (!keys.elevenlabs) throw new Error('ElevenLabs API key not configured');
+  return keys.elevenlabs;
+};
+
+const getClient = (req) => {
+  return new ElevenLabsClient({ apiKey: getApiKey(req) });
 };
 
 const streamToBase64 = async (audioStream) => {
@@ -109,18 +112,24 @@ router.post('/tts/scene', async (req, res) => {
 router.post('/sfx', async (req, res) => {
   try {
     const { text, durationSeconds } = req.body;
-    const client = getClient(req);
-    
-    const audio = await client.textToSoundEffects.convert({
-      text,
-      durationSeconds: durationSeconds || 5
+    const client = new ElevenLabsSfxClient({
+      apiKey: getApiKey(req),
+      promptInfluence: 0.9,
+    });
+    const result = await client.generateRaw({
+      role: 'texture',
+      provider_prompt: text,
+      description: text,
+    }, {
+      durationSeconds: durationSeconds || 3,
     });
     
-    const base64Audio = await streamToBase64(audio);
-    
     res.json({ 
-      audio: `data:audio/mp3;base64,${base64Audio}`,
-      format: 'mp3'
+      audio: `data:audio/mp3;base64,${result.bytes.toString('base64')}`,
+      format: 'mp3',
+      model: client.model,
+      promptInfluence: client.promptInfluence,
+      prompt: result.prompt,
     });
   } catch (error) {
     console.error('SFX error:', error);

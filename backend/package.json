@@ -5,9 +5,12 @@
   "type": "module",
   "scripts": {
     "dev": "node --watch server.js",
-    "start": "node server.js"
+    "start": "node server.js",
+    "sync:r2": "node tools/sync-session-r2.mjs",
+    "import:vertex": "node tools/import-vertex-config.mjs"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.1090.0",
     "@fal-ai/client": "^1.0.0",
     "@google/genai": "^1.42.0",
     "@google/generative-ai": "^0.21.0",
@@ -15,6 +18,7 @@
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
     "express": "^4.21.0",
+    "google-auth-library": "^10.9.0",
     "replicate": "^1.0.6",
     "uuid": "^10.0.0"
   }

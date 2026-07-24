@@ -180,7 +180,9 @@ function SceneImages() {
   const [regeneratingAll, setRegeneratingAll] = useState(false)
   const [currentPage, setCurrentPage] = useState(0)
   const [showExportModal, setShowExportModal] = useState(false)
+  const [characterEditor, setCharacterEditor] = useState(null)
   const allImagesCompleteToastedRef = useRef(false)
+  const autoStartRef = useRef(false)
 
   const {
     selectedStory,
@@ -188,6 +190,7 @@ function SceneImages() {
     scenePlanLoading,
     scenePlanError,
     scenes,
+    audio,
     images,
     imageHistory,
     selectedImages,
@@ -198,9 +201,21 @@ function SceneImages() {
     imageProgress,
     imageBatches,
     settings,
+    characters,
+    characterSceneLinks,
+    characterStatus,
+    characterError,
+    prepareCharacters,
+    regenerateCharacter,
+    selectCharacterOption,
+    approveCharacters,
+    setSceneCharacters,
     selectImage,
     regenerateImage,
+    editSceneImageWithAi,
+    applySceneImageEdit,
     resumeImageGeneration,
+    stopGeneration,
     retryScenePlan,
     retryImagePrompts,
     retryImageBatch,
@@ -208,9 +223,10 @@ function SceneImages() {
     regenerateAllImages,
   } = usePipelineStore()
 
+  // scenes = one entry per (scene, segment) unit; selection is per unit
   const completedCount = Object.keys(selectedImages).length
-  const totalSceneCount = scenes.length
-  const allSelected = completedCount === totalSceneCount && totalSceneCount > 0
+  const totalUnitCount = scenes.length
+  const allSelected = completedCount === totalUnitCount && totalUnitCount > 0
 
   const imagesCompleteCount = Object.values(images).filter(img => img?.url && !img?.error).length
   const imagesTotalCount = scenes.reduce((sum, s) => sum + (s.prompts?.length ?? 0), 0)
@@ -221,6 +237,24 @@ function SceneImages() {
   useEffect(() => {
     if (!selectedStory) navigate('/')
   }, [selectedStory, navigate])
+
+  // Audio-first flow: arriving here with a scene plan but no image prompts yet
+  // means the audio step just finished — start the image pipeline automatically
+  useEffect(() => {
+    if (autoStartRef.current) return
+    if (selectedStory && scenePlan && scenes.length === 0 && !scenePlanLoading
+        && characterStatus === 'ready'
+        && generationState !== 'running' && !imagesError && !scenePlanError) {
+      autoStartRef.current = true
+      retryImagePrompts()
+    }
+  }, [selectedStory, scenePlan, scenes.length, scenePlanLoading, characterStatus, generationState, imagesError, scenePlanError])
+
+  useEffect(() => {
+    if (selectedStory && scenePlan?.scenes?.length && characterStatus === 'idle') {
+      prepareCharacters().catch(error => toast.error(`Character preparation failed: ${error.message}`))
+    }
+  }, [selectedStory, scenePlan, characterStatus, prepareCharacters])
 
   // Toast on error states
   useEffect(() => {
@@ -254,6 +288,19 @@ function SceneImages() {
     ? scenes.slice(currentPage * SCENES_PER_PAGE, (currentPage + 1) * SCENES_PER_PAGE)
     : scenes
 
+  // Group per-segment units under their parent scene for display
+  const groupedScenes = (() => {
+    const map = new Map()
+    visibleScenes.forEach(unit => {
+      if (!map.has(unit.scene_number)) map.set(unit.scene_number, [])
+      map.get(unit.scene_number).push(unit)
+    })
+    return [...map.entries()].map(([sceneNumber, units]) => ({
+      sceneNumber,
+      units: units.sort((a, b) => (a.segment_index ?? 0) - (b.segment_index ?? 0))
+    }))
+  })()
+
   // Reset to page 0 when a new generation run starts (first scene number changes)
   const firstSceneNumber = scenes[0]?.scene_number ?? 0
   useEffect(() => {
@@ -269,6 +316,117 @@ function SceneImages() {
   // Guard: while selectedStory is null the useEffect above will redirect;
   // render nothing in the meantime to avoid downstream crashes
   if (!selectedStory) return null
+
+  if (characterStatus !== 'ready' && scenes.length === 0) {
+    const busy = ['extracting', 'generating', 'linking'].includes(characterStatus)
+    return (
+      <motion.div variants={pageVariants} initial="initial" animate="animate" exit="exit" className="min-h-[calc(100vh-3.5rem)] p-8">
+        <div className="max-w-5xl mx-auto">
+          <div className="mb-7">
+            <p className="text-[10px] uppercase tracking-[0.2em] text-accent mb-2">Character continuity</p>
+            <h1 className="text-2xl font-semibold text-text-primary">Approve the recurring cast</h1>
+            <p className="text-sm text-text-secondary mt-2 max-w-2xl leading-relaxed">
+              Sonnet extracts recurring characters from the completed story, the configured image model creates their reference portraits, and scene generation waits for your approval.
+            </p>
+          </div>
+
+          {busy && (
+            <div className="card p-8 flex items-center gap-4 mb-6">
+              <div className="w-5 h-5 border-2 border-accent border-t-transparent rounded-full animate-spin" />
+              <div>
+                <p className="text-sm font-medium text-text-primary">
+                  {characterStatus === 'extracting' ? 'Sonnet is extracting the cast…' : characterStatus === 'generating' ? 'Generating character references…' : 'Sonnet is linking characters to scenes…'}
+                </p>
+                <p className="text-xs text-text-disabled mt-1">Scene images will not start until this continuity pass is complete.</p>
+              </div>
+            </div>
+          )}
+
+          {characterError && (
+            <div className="mb-5 p-4 rounded-xl border border-error/30 bg-error/10">
+              <p className="text-sm text-error">{characterError}</p>
+              <button onClick={() => prepareCharacters()} className="btn-secondary mt-3 text-xs px-3 py-1.5">Retry character preparation</button>
+            </div>
+          )}
+
+          {characters.length > 0 && (
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+              {characters.map(character => (
+                <div key={character.id} className="card overflow-hidden">
+                  <div className="aspect-[3/4] bg-black/40 relative">
+                    {character.image
+                      ? <img src={character.image} alt={character.name} className="w-full h-full object-cover" />
+                      : <div className="w-full h-full flex items-center justify-center text-xs text-text-disabled">{character.generating ? 'Generating…' : 'No image'}</div>}
+                    {character.generating && <div className="absolute inset-0 bg-black/55 flex items-center justify-center"><div className="w-5 h-5 border-2 border-accent border-t-transparent rounded-full animate-spin" /></div>}
+                  </div>
+                  <div className="p-4">
+                    <div className="flex justify-between gap-2">
+                      <div>
+                        <h3 className="text-sm font-semibold text-text-primary">{character.name}</h3>
+                        <p className="text-[10px] uppercase tracking-wider text-accent mt-0.5">{character.role}</p>
+                      </div>
+                      <span className="text-[9px] text-text-disabled">{character.importance}</span>
+                    </div>
+                    <p className="text-xs text-text-secondary leading-relaxed mt-3 line-clamp-4">{character.description}</p>
+                    {character.error && <p className="text-[10px] text-error mt-2">{character.error}</p>}
+                    {(character.image_options || []).length > 1 && (
+                      <div className="flex gap-2 mt-3">
+                        {character.image_options.map((option, index) => (
+                          <button key={index} onClick={() => selectCharacterOption(character.id, option)} className={`w-12 h-14 overflow-hidden rounded border ${character.image === option.url ? 'border-accent' : 'border-border'}`}>
+                            <img src={option.url} alt={`Option ${index + 1}`} className="w-full h-full object-cover" />
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                    <button
+                      onClick={() => setCharacterEditor({ character, prompt: '', count: 1 })}
+                      className="btn-secondary w-full mt-4 py-2 text-xs"
+                    >
+                      Edit with AI
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {characterStatus === 'review' && (
+            <div className="sticky bottom-4 mt-7 p-4 rounded-xl border border-accent/35 bg-surface/95 backdrop-blur flex items-center justify-between gap-4 shadow-2xl">
+              <div>
+                <p className="text-sm font-semibold text-text-primary">Do these references look consistent?</p>
+                <p className="text-xs text-text-disabled mt-0.5">Approval runs the Sonnet scene-link pass, then image prompts begin.</p>
+              </div>
+              <button onClick={() => approveCharacters().catch(error => toast.error(error.message))} disabled={characters.some(character => !character.image)} className="btn-primary px-5 py-2.5 text-sm disabled:opacity-40">
+                Approve cast & continue
+              </button>
+            </div>
+          )}
+
+          {characterEditor && (
+            <div className="fixed inset-0 z-50 bg-black/75 backdrop-blur-sm flex items-center justify-center p-6" onClick={() => setCharacterEditor(null)}>
+              <div className="card p-5 w-full max-w-lg" onClick={event => event.stopPropagation()}>
+                <h2 className="text-base font-semibold text-text-primary">Edit {characterEditor.character.name} with AI</h2>
+                <p className="text-xs text-text-secondary mt-1">The current image is supplied as the first reference; describe only the change.</p>
+                <textarea value={characterEditor.prompt} onChange={event => setCharacterEditor(current => ({ ...current, prompt: event.target.value }))} className="w-full h-28 mt-4 text-sm" placeholder="Keep the same identity and pose, but change…" autoFocus />
+                <div className="flex items-center justify-between mt-4">
+                  <label className="text-xs text-text-secondary">Options <select value={characterEditor.count} onChange={event => setCharacterEditor(current => ({ ...current, count: Number(event.target.value) }))} className="ml-2 text-xs"><option value={1}>1</option><option value={2}>2</option></select></label>
+                  <div className="flex gap-2">
+                    <button onClick={() => setCharacterEditor(null)} className="btn-ghost px-3 py-2 text-xs">Cancel</button>
+                    <button onClick={async () => {
+                      try {
+                        await regenerateCharacter(characterEditor.character.id, characterEditor.prompt, characterEditor.count)
+                        setCharacterEditor(null)
+                      } catch (error) { toast.error(error.message) }
+                    }} disabled={!characterEditor.prompt.trim()} className="btn-primary px-4 py-2 text-xs disabled:opacity-40">Generate</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+      </motion.div>
+    )
+  }
 
   // ── Scene planning loading screen ──────────────────────────────────────────
   // Don't show loading screen when paused — the main grid has the Resume button.
@@ -324,12 +482,14 @@ function SceneImages() {
         className="min-h-[calc(100vh-3.5rem)] flex items-center justify-center p-8"
       >
         <div className="text-center max-w-md">
-          <p className="text-sm text-text-secondary mb-4">Ready to plan your documentary.</p>
+          <p className="text-sm text-text-secondary mb-4">
+            {scenePlan ? 'Ready to generate images for your shots.' : 'Ready to plan your documentary.'}
+          </p>
           <button
-            onClick={() => fetchScenePlan()}
+            onClick={() => scenePlan ? retryImagePrompts() : fetchScenePlan()}
             className="btn-primary px-6 py-2"
           >
-            Start Planning
+            {scenePlan ? 'Generate Images' : 'Start Planning'}
           </button>
         </div>
       </motion.div>
@@ -387,7 +547,7 @@ function SceneImages() {
           <div>
             <h1 className="text-base font-semibold text-text-primary">{selectedStory.title}</h1>
             <p className="text-xs text-text-secondary">
-              {scenePlan?.total_scenes} scenes · {durationMinutes}m {durationSeconds}s · Select one image per scene
+              {scenePlan?.total_scenes} scenes · {totalUnitCount} shots · {durationMinutes}m {durationSeconds}s · Select one image per shot
             </p>
           </div>
 
@@ -410,13 +570,25 @@ function SceneImages() {
               </div>
             )}
 
-            {generationState === 'paused' && generationPhase === 'images' && (
+            {/* Stop mid-run — progress is kept and can be resumed */}
+            {generationState === 'running' && generationPhase === 'images' && (
+              <button
+                onClick={stopGeneration}
+                title="Stop image generation (keeps progress, resume anytime)"
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-error/10 text-error border border-error/20 text-xs font-medium hover:bg-error/20 transition-colors"
+              >
+                <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 24 24"><path d="M6 6h12v12H6z"/></svg>
+                Stop
+              </button>
+            )}
+
+            {(generationState === 'paused' || generationState === 'stopped') && imageProgress.pending.length > 0 && (
               <button
                 onClick={resumeImageGeneration}
                 className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-accent text-white text-xs font-medium hover:bg-accent-hover transition-colors"
               >
                 <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
-                Resume
+                Resume ({imageProgress.pending.length} left)
               </button>
             )}
 
@@ -435,6 +607,83 @@ function SceneImages() {
       {/* Scene grid */}
       <div className="max-w-6xl mx-auto p-8 space-y-10">
 
+        {/* Prompt batches still writing or failed — without this the grid
+            silently shows a partial story (only the batches that finished) */}
+        {imageBatches.some(b => b.status === 'failed' || b.status === 'running' || b.status === 'pending') && (
+          <div className={`flex items-start gap-3 rounded-xl px-4 py-3 border ${
+            imageBatches.some(b => b.status === 'failed')
+              ? 'bg-error/8 border-error/30'
+              : 'bg-accent/8 border-accent/25'
+          }`}>
+            {imageBatches.some(b => b.status === 'failed') ? (
+              <svg className="w-4 h-4 text-error shrink-0 mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v2m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+              </svg>
+            ) : (
+              <div className="w-4 h-4 border-2 border-accent border-t-transparent rounded-full animate-spin shrink-0 mt-0.5" />
+            )}
+            <div className="flex-1 text-xs leading-relaxed">
+              <span className="font-medium text-text-primary">
+                This is a partial view — not all scenes are here yet.
+              </span>{' '}
+              <span className="text-text-secondary">
+                Prompts are written in batches; scenes appear as their batch finishes.
+              </span>
+              <div className="mt-2 space-y-1.5">
+                {imageBatches.map(b => {
+                  const label = `Scenes ${b.sceneNumbers[0]}–${b.sceneNumbers[b.sceneNumbers.length - 1]}`
+                  if (b.status === 'running') return (
+                    <div key={b.batchIndex} className="flex items-center gap-2 text-text-secondary">
+                      <div className="w-2.5 h-2.5 border-[1.5px] border-accent border-t-transparent rounded-full animate-spin" />
+                      <span>{label} — writing prompts now (a few minutes with local Claude)...</span>
+                    </div>
+                  )
+                  if (b.status === 'pending') return (
+                    <div key={b.batchIndex} className="flex items-center gap-2 text-text-disabled">
+                      <span className="w-2 h-2 rounded-full bg-border" />
+                      <span>{label} — queued</span>
+                    </div>
+                  )
+                  if (b.status === 'failed') return (
+                    <div key={b.batchIndex} className="flex items-center gap-2">
+                      <button
+                        onClick={() => {
+                          toast.loading(`Rewriting prompts for ${label.toLowerCase()} — takes a few minutes...`, { id: `batch-${b.batchIndex}`, duration: 6000 })
+                          retryImageBatch(b.batchIndex)
+                            .catch(err => toast.error(`Batch retry failed: ${err.message}`))
+                        }}
+                        className="px-3 py-1 rounded-lg bg-error/15 text-error border border-error/30 text-xs font-medium hover:bg-error/25 transition-colors"
+                      >
+                        Retry {label}
+                      </button>
+                      {b.error && <span className="text-[10px] text-text-disabled">{b.error}</span>}
+                    </div>
+                  )
+                  return null
+                })}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* No measured audio → shots were sized from planned durations only */}
+        {scenes.length > 0 && !Object.values(audio?.sceneAudio || {}).some(a => a?.durationSeconds) && (
+          <div className="flex items-start gap-3 bg-warning/8 border border-warning/25 rounded-xl px-4 py-3">
+            <svg className="w-4 h-4 text-warning shrink-0 mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v2m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+            </svg>
+            <div className="text-xs leading-relaxed">
+              <span className="font-medium text-text-primary">Shots are based on planned scene durations — no audio was measured.</span>{' '}
+              <span className="text-text-secondary">
+                Each scene got exactly the shots its planned length needs (usually one). To fit shots to your real narration,
+                add audio in the <button onClick={() => navigate('/audio')} className="text-accent hover:text-accent-hover underline underline-offset-2">Audio step</button>,
+                then press <span className="font-medium text-text-primary">"Replan Shots from Audio"</span> below — scenes whose audio
+                runs longer than one clip will split into 2+ sequential shots, each needing its own image.
+              </span>
+            </div>
+          </div>
+        )}
+
         {/* Pagination tabs — only shown when > 80 scenes (50 images × 4 variations each) */}
         {isPaginated && (
           <div className="flex items-center gap-2 flex-wrap">
@@ -444,7 +693,7 @@ function SceneImages() {
               const endScene = Math.min((i + 1) * SCENES_PER_PAGE, scenes.length)
               const pageSelectedCount = scenes
                 .slice(i * SCENES_PER_PAGE, (i + 1) * SCENES_PER_PAGE)
-                .filter(s => selectedImages[s.scene_number]).length
+                .filter(s => selectedImages[`${s.scene_number}_${s.segment_index ?? 0}`]).length
               const pageTotal = endScene - startScene + 1
               return (
                 <button
@@ -468,32 +717,74 @@ function SceneImages() {
           </div>
         )}
 
-        {visibleScenes.map((scene) => {
-          const planScene = scenePlan?.scenes?.find(s => s.scene_number === scene.scene_number)
+        {groupedScenes.map(({ sceneNumber, units }) => {
+          const planScene = scenePlan?.scenes?.find(s => s.scene_number === sceneNumber)
+          const multiShot = units.length > 1
+          const selectedShots = units.filter(u => selectedImages[`${sceneNumber}_${u.segment_index ?? 0}`]).length
           return (
-            <div key={scene.scene_number}>
+            <div key={sceneNumber}>
               {/* Scene header */}
               <div className="flex items-center gap-3 mb-3">
                 <div className="flex items-center gap-2">
                   <span className="w-7 h-7 rounded-lg bg-surface-raised border border-border flex items-center justify-center text-xs font-bold text-text-secondary">
-                    {scene.scene_number}
+                    {sceneNumber}
                   </span>
                   <div>
-                    <span className="text-sm font-medium text-text-primary">{scene.scene_title}</span>
+                    <span className="text-sm font-medium text-text-primary">{units[0].scene_title}</span>
                     {planScene && (
                       <span className="ml-2 text-xs text-text-disabled">
                         {planScene.duration_seconds}s · {planScene.shot_type}
                       </span>
                     )}
+                    {multiShot && (
+                      <span className="ml-2 text-xs px-1.5 py-0.5 rounded bg-accent/10 text-accent font-medium">
+                        {units.length} shots — select one image per shot
+                      </span>
+                    )}
                   </div>
                 </div>
-                {selectedImages[scene.scene_number] && (
+                {selectedShots === units.length && units.length > 0 && (
                   <span className="flex items-center gap-1 text-xs text-success font-medium">
                     <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M5 13l4 4L19 7" />
                     </svg>
-                    Selected
+                    {multiShot ? 'All shots selected' : 'Selected'}
                   </span>
+                )}
+                {multiShot && selectedShots > 0 && selectedShots < units.length && (
+                  <span className="text-xs text-text-disabled">{selectedShots}/{units.length} shots selected</span>
+                )}
+                {characters.length > 0 && (
+                  <details className="ml-auto relative">
+                    <summary className="list-none cursor-pointer text-[10px] px-2.5 py-1.5 rounded-lg border border-border bg-surface-raised text-text-secondary hover:border-accent/40">
+                      {(characterSceneLinks[String(sceneNumber)]?.character_ids || []).length
+                        ? `${characterSceneLinks[String(sceneNumber)].character_ids.length} linked character${characterSceneLinks[String(sceneNumber)].character_ids.length > 1 ? 's' : ''}`
+                        : 'Link characters'}
+                    </summary>
+                    <div className="absolute right-0 top-9 z-20 w-64 p-3 rounded-xl border border-border bg-surface shadow-2xl">
+                      <p className="text-[10px] text-text-disabled mb-2">Image references supplied for this scene</p>
+                      <div className="space-y-1.5">
+                        {characters.map(character => {
+                          const current = characterSceneLinks[String(sceneNumber)]?.character_ids || []
+                          const linked = current.includes(character.id)
+                          return (
+                            <label key={character.id} className="flex items-center gap-2 text-xs text-text-secondary cursor-pointer p-1.5 rounded hover:bg-white/[0.03]">
+                              <input
+                                type="checkbox"
+                                checked={linked}
+                                onChange={event => setSceneCharacters(
+                                  sceneNumber,
+                                  event.target.checked ? [...current, character.id] : current.filter(id => id !== character.id)
+                                )}
+                              />
+                              {character.image && <img src={character.image} alt="" className="w-7 h-7 rounded object-cover" />}
+                              <span>{character.name}</span>
+                            </label>
+                          )
+                        })}
+                      </div>
+                    </div>
+                  </details>
                 )}
               </div>
 
@@ -504,25 +795,59 @@ function SceneImages() {
                 </p>
               )}
 
-              {/* Image grid */}
-              <div className="grid grid-cols-2 md:grid-cols-4 gap-3 pl-9">
-                {scene.prompts.map((prompt, idx) => {
-                  const key = `${scene.scene_number}_${idx}`
+              {/* One block per shot (segment) */}
+              <div className="space-y-4">
+                {units.map(unit => {
+                  const segIdx = unit.segment_index ?? 0
+                  const selKey = `${sceneNumber}_${segIdx}`
                   return (
-                    <ImageCard
-                      key={key}
-                      imageKey={key}
-                      image={images[key]}
-                      isLoading={!!imagesLoading[key]}
-                      isSelected={selectedImages[scene.scene_number]?.promptIndex === idx}
-                      onSelect={() => selectImage(scene.scene_number, idx)}
-                      onRegenerate={(newPrompt) => {
-                        regenerateImage(scene.scene_number, idx, newPrompt)
-                          .catch(err => toast.error(`Regeneration failed: ${err.message}`))
-                      }}
-                      onViewFull={() => setSelectedModal({ sceneNumber: scene.scene_number, promptIndex: idx })}
-                      variationLabel={['Establishing', 'Intimate', 'Detail', 'Atmospheric'][idx] || `v${idx + 1}`}
-                    />
+                    <div key={selKey}>
+                      {multiShot && (
+                        <div className="flex items-center gap-2 pl-9 mb-2">
+                          <span className={`text-[11px] font-semibold ${selectedImages[selKey] ? 'text-success' : 'text-text-secondary'}`}>
+                            Shot {segIdx + 1} of {unit.segment_count}
+                          </span>
+                          {unit.target_duration && (
+                            <span className="text-[10px] text-text-disabled">
+                              covers {Math.round(unit.target_duration)}s of audio
+                              {unit.playback_rate && unit.playback_rate < 1
+                                ? ` · ${unit.clip_duration}s clip @ ${Math.round(unit.playback_rate * 100)}% speed`
+                                : unit.clip_duration ? ` · ${unit.clip_duration}s clip` : ''}
+                            </span>
+                          )}
+                          {selectedImages[selKey] && (
+                            <svg className="w-3 h-3 text-success" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M5 13l4 4L19 7" />
+                            </svg>
+                          )}
+                        </div>
+                      )}
+                      <div className="grid grid-cols-2 md:grid-cols-4 gap-3 pl-9">
+                        {unit.prompts.map((prompt, idx) => {
+                          const key = `${sceneNumber}_${segIdx}_${idx}`
+                          return (
+                            <ImageCard
+                              key={key}
+                              imageKey={key}
+                              image={images[key]}
+                              isLoading={!!imagesLoading[key]}
+                              isSelected={selectedImages[selKey]?.promptIndex === idx}
+                              onSelect={() => selectImage(sceneNumber, segIdx, idx)}
+                              onRegenerate={(newPrompt) => {
+                                regenerateImage(sceneNumber, segIdx, idx, newPrompt)
+                                  .catch(err => toast.error(`Regeneration failed: ${err.message}`))
+                              }}
+                              onViewFull={() => setSelectedModal({ sceneNumber, segmentIndex: segIdx, promptIndex: idx })}
+                              variationLabel={
+                                multiShot
+                                  ? `Shot ${segIdx + 1} · v${idx + 1}`
+                                  : ['Establishing', 'Intimate', 'Detail', 'Atmospheric'][idx] || `v${idx + 1}`
+                              }
+                            />
+                          )
+                        })}
+                      </div>
+                    </div>
                   )
                 })}
               </div>
@@ -566,15 +891,26 @@ function SceneImages() {
           <div className="flex items-center gap-4">
             <div className="flex items-baseline gap-1">
               <span className="text-sm font-semibold text-text-primary">{completedCount}</span>
-              <span className="text-sm text-text-secondary">/ {totalSceneCount} scenes selected</span>
+              <span className="text-sm text-text-secondary">/ {totalUnitCount} shots selected</span>
             </div>
             {!allSelected && completedCount > 0 && (
               <span className="text-xs text-text-disabled">
-                {totalSceneCount - completedCount} remaining
+                {totalUnitCount - completedCount} remaining
               </span>
             )}
           </div>
           <div className="flex items-center gap-3">
+            <button
+              onClick={() => {
+                if (!confirm('Re-plan shots from the current audio durations and regenerate all image prompts + images? Existing images for this step will be replaced.')) return
+                retryImagePrompts()
+              }}
+              disabled={scenes.length === 0 || generationState === 'running'}
+              title="Recompute how many shots each scene needs from the latest audio, then regenerate prompts and images"
+              className="btn-secondary px-4 py-2 disabled:opacity-40 disabled:cursor-not-allowed"
+            >
+              Replan Shots from Audio
+            </button>
             <button
               onClick={async () => {
                 if (regeneratingAll) return
@@ -634,14 +970,29 @@ function SceneImages() {
       <AnimatePresence>
         {selectedModal && (
           <ImageModal
-            image={images[`${selectedModal.sceneNumber}_${selectedModal.promptIndex}`]}
-            history={imageHistory[`${selectedModal.sceneNumber}_${selectedModal.promptIndex}`] || []}
+            image={images[`${selectedModal.sceneNumber}_${selectedModal.segmentIndex ?? 0}_${selectedModal.promptIndex}`]}
+            history={imageHistory[`${selectedModal.sceneNumber}_${selectedModal.segmentIndex ?? 0}_${selectedModal.promptIndex}`] || []}
             onClose={() => setSelectedModal(null)}
             onRegenerate={(newPrompt) => {
-              regenerateImage(selectedModal.sceneNumber, selectedModal.promptIndex, newPrompt)
+              regenerateImage(selectedModal.sceneNumber, selectedModal.segmentIndex ?? 0, selectedModal.promptIndex, newPrompt)
                 .catch(err => toast.error(`Regeneration failed: ${err.message}`))
             }}
-            onSelect={(url, prompt) => selectImage(selectedModal.sceneNumber, selectedModal.promptIndex, url, prompt)}
+            onEditWithAI={(instruction, count) => (
+              editSceneImageWithAi(
+                selectedModal.sceneNumber,
+                selectedModal.segmentIndex ?? 0,
+                selectedModal.promptIndex,
+                instruction,
+                count
+              )
+            )}
+            onApplyEdit={(option) => applySceneImageEdit(
+              selectedModal.sceneNumber,
+              selectedModal.segmentIndex ?? 0,
+              selectedModal.promptIndex,
+              option
+            )}
+            onSelect={(url, prompt) => selectImage(selectedModal.sceneNumber, selectedModal.segmentIndex ?? 0, selectedModal.promptIndex, url, prompt)}
           />
         )}
       </AnimatePresence>

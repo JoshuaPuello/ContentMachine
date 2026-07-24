@@ -1,8 +1,21 @@
 import express from 'express';
-import * as fal from '@fal-ai/client';
+import { fal } from '@fal-ai/client';
 import Replicate from 'replicate';
 import { GoogleGenAI } from '@google/genai';
+import { generateVertexImage, isVertexConfigured, vertexConfigError } from '../lib/vertex.js';
 const router = express.Router();
+
+const generateWithVertex = async (prompt, aspectRatio) => {
+  if (!isVertexConfigured()) {
+    throw new Error(vertexConfigError() || 'Vertex AI not configured');
+  }
+  return await generateVertexImage({
+    model: 'gemini-3-pro-image-preview',
+    prompt,
+    aspectRatio: aspectRatio || '16:9',
+    imageSize: '2K',
+  });
+};
 
 const generateWithGemini = async (apiKey, prompt, aspectRatio) => {
   const ai = new GoogleGenAI({ apiKey });
@@ -96,18 +109,32 @@ router.post('/generate', async (req, res) => {
       
     } else if (provider === 'gemini') {
       if (!keys.gemini) throw new Error('Gemini API key not configured');
-      
+
       const results = await Promise.allSettled(
         prompts.map(async (prompt) => {
           const url = await generateWithGemini(keys.gemini, prompt, aspectRatio);
           return { prompt, url, error: null };
         })
       );
-      
+
       const response = results.map((result, i) => {
         if (result.status === 'fulfilled') return result.value;
         return { prompt: prompts[i], url: null, error: result.reason?.message || 'Generation failed' };
       });
+      res.json(response);
+
+    } else if (provider === 'vertex') {
+      // Sequential — the Vertex account pool rate-limits per account, and
+      // thumbnails are only 4 prompts, so latency stays reasonable.
+      const response = [];
+      for (const prompt of prompts) {
+        try {
+          const url = await generateWithVertex(prompt, aspectRatio);
+          response.push({ prompt, url, error: null });
+        } catch (err) {
+          response.push({ prompt, url: null, error: err.message || 'Generation failed' });
+        }
+      }
       res.json(response);
     } else {
       throw new Error('Invalid provider specified');
@@ -161,6 +188,9 @@ router.post('/regenerate', async (req, res) => {
     } else if (provider === 'gemini') {
       if (!keys.gemini) throw new Error('Gemini API key not configured');
       const url = await generateWithGemini(keys.gemini, prompt, aspectRatio);
+      res.json({ url });
+    } else if (provider === 'vertex') {
+      const url = await generateWithVertex(prompt, aspectRatio);
       res.json({ url });
     } else {
       throw new Error('Invalid provider specified');
