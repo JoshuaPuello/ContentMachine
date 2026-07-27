@@ -1,4 +1,8 @@
-import { useState } from 'react'
+import { useRef, useState } from 'react'
+import {
+  windowsVideoDisplayLabel,
+  windowsVideoDisplayState,
+} from '../lib/windowsVideoWorker'
 
 function VideoCard({
   sceneNumber,
@@ -9,9 +13,12 @@ function VideoCard({
   onSelect,
   onDeselect,
   onRegenerate,
-  onViewFull
+  onViewFull,
+  onManualAttach,
+  windowsMode = false,
 }) {
   const [isEditing, setIsEditing] = useState(false)
+  const attachInputRef = useRef(null)
   // Bug fix: always use full_prompt_string (string), not video_prompt (object)
   const promptText = videoPrompt?.full_prompt_string || ''
   const [editedPrompt, setEditedPrompt] = useState(promptText)
@@ -23,10 +30,26 @@ function VideoCard({
 
   const status      = job?.status || 'queued'
   const isSubmitting = status === 'submitting'
-  const isLoading   = status === 'pending' || isSubmitting
+  const isWindows = windowsMode || job?.provider === 'windows-worker'
+  const workerDisplayState = job?.workerDisplayState
+    || windowsVideoDisplayState(job || { status: 'queued' })
+  const workerLabel = windowsVideoDisplayLabel(workerDisplayState)
+  const isWorkerActive = [
+    'claimed',
+    'preparing',
+    'downloading',
+    'waiting-for-veo',
+    'generating',
+    'output-ready',
+    'uploading',
+    'server-validating',
+    'retrying',
+  ].includes(workerDisplayState)
+  const isLoading   = status === 'pending' || isSubmitting || isWorkerActive
   const isCompleted = status === 'completed'
-  const isFailed    = status === 'failed'
-  const isQueued    = status === 'queued'
+  const isFailed    = ['failed', 'canceled', 'superseded'].includes(status)
+    || ['missing', 'orphaned', 'broker-unavailable'].includes(workerDisplayState)
+  const isQueued    = status === 'queued' && !isFailed && !isWorkerActive
 
   const handleDownload = () => {
     if (!job?.url) return
@@ -48,7 +71,7 @@ function VideoCard({
     if (isFailed) return (
       <span className="inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded-full font-medium bg-error/12 text-error border border-error/20">
         <span className="w-1.5 h-1.5 rounded-full bg-error" />
-        Failed
+        {isWindows ? workerLabel : 'Failed'}
       </span>
     )
     if (isQueued) return (
@@ -66,7 +89,7 @@ function VideoCard({
     return (
       <span className="inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded-full font-medium bg-warning/10 text-warning border border-warning/20">
         <span className="w-1.5 h-1.5 rounded-full bg-warning animate-pulse" />
-        Rendering
+        {isWindows ? workerLabel : 'Rendering'}
       </span>
     )
   }
@@ -84,7 +107,7 @@ function VideoCard({
             <div className="w-8 h-8 border-2 border-accent/25 border-t-accent rounded-full animate-spin" />
             <span className="text-xs text-text-secondary">Preparing provider request…</span>
           </div>
-        ) : status === 'pending' ? (
+        ) : status === 'pending' || isWorkerActive ? (
           <div className="absolute inset-0 flex flex-col items-center justify-center gap-3">
             <div className="absolute inset-0 bg-accent/3 animate-pulse" />
             <div className="relative">
@@ -92,13 +115,28 @@ function VideoCard({
               <div className="absolute inset-0 w-10 h-10 border-2 border-accent border-t-transparent rounded-full animate-spin" />
             </div>
             <div className="flex items-center gap-1.5 text-xs text-text-secondary">
-              <span>Generating</span>
+              <span>{isWindows ? workerLabel : 'Generating'}</span>
               <span className="flex gap-0.5">
                 <span className="w-1 h-1 rounded-full bg-text-secondary animate-bounce" style={{ animationDelay: '0ms' }} />
                 <span className="w-1 h-1 rounded-full bg-text-secondary animate-bounce" style={{ animationDelay: '150ms' }} />
                 <span className="w-1 h-1 rounded-full bg-text-secondary animate-bounce" style={{ animationDelay: '300ms' }} />
               </span>
             </div>
+            {isWindows && (
+              <div className="w-40 max-w-[70%]">
+                <div className="h-1 rounded-full bg-border/70 overflow-hidden">
+                  <div
+                    className="h-full rounded-full bg-accent transition-[width] duration-500"
+                    style={{ width: `${Math.max(4, Math.min(100, job?.workerPercent || 0))}%` }}
+                  />
+                </div>
+                {job?.workerMessage && (
+                  <p className="mt-1.5 text-[10px] text-text-disabled text-center line-clamp-2">
+                    {job.workerMessage}
+                  </p>
+                )}
+              </div>
+            )}
           </div>
         ) : isQueued ? (
           <div className="absolute inset-0 flex flex-col items-center justify-center gap-2">
@@ -107,7 +145,9 @@ function VideoCard({
                 <path strokeLinecap="round" strokeLinejoin="round" d="M12 6v6l4 2m5-2a9 9 0 11-18 0 9 9 0 0118 0z" />
               </svg>
             </div>
-            <span className="text-xs text-text-secondary">Waiting for a provider slot</span>
+            <span className="text-xs text-text-secondary">
+              {isWindows ? 'Waiting for the Windows worker' : 'Waiting for a provider slot'}
+            </span>
           </div>
         ) : isFailed ? (
           <div className="absolute inset-0 flex flex-col items-center justify-center p-4 gap-2">
@@ -116,7 +156,9 @@ function VideoCard({
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
               </svg>
             </div>
-            <span className="text-xs text-error">Generation failed</span>
+            <span className="text-xs text-error">
+              {isWindows ? workerLabel : 'Generation failed'}
+            </span>
             <button
               onClick={(e) => { e.stopPropagation(); handleRegenerate() }}
               className="text-xs text-accent hover:text-accent-hover font-medium"
@@ -173,6 +215,17 @@ function VideoCard({
           </div>
           <StatusPill />
         </div>
+
+        {isWindows && job?.attempt > 0 && (
+          <p className="text-[10px] text-text-disabled mb-2">
+            Attempt {job.attempt}{job.maxAttempts ? ` of ${job.maxAttempts}` : ''}
+          </p>
+        )}
+        {isFailed && job?.error && (
+          <p className="text-[10px] text-error/90 leading-relaxed line-clamp-3 mb-2">
+            {job.error}
+          </p>
+        )}
 
         {isEditing ? (
           <div className="space-y-2 flex-1">
@@ -254,6 +307,29 @@ function VideoCard({
                   </svg>
                 )}
               </button>
+
+              {isWindows && !isCompleted && onManualAttach && (
+                <>
+                  <input
+                    ref={attachInputRef}
+                    type="file"
+                    accept="video/mp4,.mp4"
+                    className="hidden"
+                    onChange={(event) => {
+                      const file = event.target.files?.[0]
+                      if (file) onManualAttach(file)
+                      event.target.value = ''
+                    }}
+                  />
+                  <button
+                    onClick={() => attachInputRef.current?.click()}
+                    className="btn-ghost py-1.5 px-2.5 text-xs"
+                    title="Attach a completed MP4 manually"
+                  >
+                    Attach MP4
+                  </button>
+                </>
+              )}
             </div>
           </>
         )}

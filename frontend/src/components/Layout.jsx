@@ -603,7 +603,12 @@ function SettingsDrawer({ onClose }) {
   })
   // Backend-environment capabilities (not UI keys): Vertex service accounts and
   // the local Claude Code CLI.
-  const [envStatus, setEnvStatus] = useState({ vertex: false, claudeCli: false, vertexError: null })
+  const [envStatus, setEnvStatus] = useState({
+    vertex: false,
+    claudeCli: false,
+    vertexError: null,
+    windowsWorker: null,
+  })
   const [validating, setValidating] = useState({})
   const [saving, setSaving] = useState(false)
 
@@ -642,7 +647,15 @@ function SettingsDrawer({ onClose }) {
         elevenlabs: status.elevenlabs ? 'valid' : 'unknown',
         geminigen: status.geminigen ? 'valid' : 'unknown'
       })
-      setEnvStatus({ vertex: !!status.vertex, claudeCli: !!status.claudeCli, vertexError: status.vertexError || null })
+      setEnvStatus({
+        vertex: !!status.vertex,
+        claudeCli: !!status.claudeCli,
+        vertexError: status.vertexError || null,
+        windowsWorker: status.windowsWorker?.configured
+          ?? status.windows_worker?.configured
+          ?? status.windowsWorker
+          ?? null,
+      })
       setKeysConfigured({
         fal: !!status.fal,
         replicate: !!status.replicate,
@@ -729,7 +742,15 @@ function SettingsDrawer({ onClose }) {
         elevenlabs: status.elevenlabs ? 'valid' : 'unknown',
         geminigen: status.geminigen ? 'valid' : 'unknown'
       })
-      setEnvStatus({ vertex: !!status.vertex, claudeCli: !!status.claudeCli, vertexError: status.vertexError || null })
+      setEnvStatus({
+        vertex: !!status.vertex,
+        claudeCli: !!status.claudeCli,
+        vertexError: status.vertexError || null,
+        windowsWorker: status.windowsWorker?.configured
+          ?? status.windows_worker?.configured
+          ?? status.windowsWorker
+          ?? null,
+      })
       setKeysConfigured({ fal: !!status.fal, replicate: !!status.replicate, gemini: !!status.gemini, elevenlabs: !!status.elevenlabs, geminigen: !!status.geminigen, vertex: !!status.vertex, claudeCli: !!status.claudeCli, whisper: !!status.whisper })
       // Refresh displayed keys from storage
       const refreshed = loadKeysFromStorage()
@@ -1126,16 +1147,27 @@ function SettingsDrawer({ onClose }) {
           {/* Video Generation */}
           <section>
             <h3 className="text-xs font-semibold text-text-disabled uppercase tracking-wider mb-3">Video Generation</h3>
-            <div className="grid grid-cols-3 gap-1.5 bg-surface-raised rounded-lg p-1 mb-2">
+            <div className="grid grid-cols-2 gap-1.5 bg-surface-raised rounded-lg p-1 mb-2">
               {[
                 { id: 'fal', label: 'fal.ai (LTX-2)', enabled: isValid('fal') },
                 { id: 'replicate', label: 'Replicate', enabled: isValid('replicate') },
-                { id: 'geminigen', label: 'Gemini Omni', enabled: isValid('geminigen') }
+                { id: 'geminigen', label: 'Gemini Omni', enabled: isValid('geminigen') },
+                {
+                  id: 'windows-worker',
+                  label: 'Windows Worker',
+                  enabled: envStatus.windowsWorker === true,
+                }
               ].map(p => (
                 <button key={p.id}
                   onClick={() => setVideoProvider(p.id)}
                   disabled={!p.enabled}
-                  title={p.id === 'geminigen' && !p.enabled ? 'Add and test a GeminiGen API key above' : undefined}
+                  title={
+                    p.id === 'geminigen' && !p.enabled
+                      ? 'Add and test a GeminiGen API key above'
+                      : p.id === 'windows-worker' && !p.enabled
+                        ? 'The shared StoryForge worker broker is not configured'
+                        : undefined
+                  }
                   className={`py-1.5 rounded-md text-xs font-medium transition-all disabled:opacity-40 ${
                     settings.videoProvider === p.id
                       ? 'bg-surface text-text-primary shadow-sm'
@@ -1190,6 +1222,25 @@ function SettingsDrawer({ onClose }) {
                   {settings.videoModel === 'grok-3'
                     ? 'Grok via GeminiGen (snapgen.ai) — clips of 6/10/15s. Shots are sized to each scene\'s audio.'
                     : 'Veo 3.1 Fast via GeminiGen (snapgen.ai) — 720p, fixed 8s clips. Scenes with longer audio automatically get multiple sequential shots.'}
+                </p>
+              </div>
+            )}
+            {settings.videoProvider === 'windows-worker' && (
+              <div className="rounded-lg border border-accent/20 bg-accent/5 p-3">
+                <div className="flex items-center justify-between gap-3 mb-1">
+                  <span className="text-xs font-medium text-text-primary">StoryForge shared worker</span>
+                  <span className={`text-[10px] px-2 py-0.5 rounded-full border ${
+                    envStatus.windowsWorker !== true
+                      ? 'text-error border-error/20 bg-error/10'
+                      : 'text-success border-success/20 bg-success/10'
+                  }`}>
+                    {envStatus.windowsWorker === true ? 'Configured' : 'Not configured'}
+                  </span>
+                </div>
+                <p className="text-[10px] text-text-secondary leading-relaxed">
+                  Generates fixed 8-second, 16:9 silent clips on the external Windows machine.
+                  ContentMachine queues durable work through StoryForge; narration and the final
+                  audio mix remain independent in this project.
                 </p>
               </div>
             )}

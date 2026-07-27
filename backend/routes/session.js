@@ -17,33 +17,19 @@ import { fileURLToPath } from 'url'
 import https from 'https'
 import http from 'http'
 import { randomUUID } from 'crypto'
-import { deleteProjectAssetsFromR2 } from '../lib/r2.js'
+import { deleteProjectAssetsFromR2, isR2Configured } from '../lib/r2.js'
 import { deleteRenderWorkspacesForSession } from './render.js'
 import { startProxyBuild, jobStatus as proxyJobStatus } from '../lib/previewProxy.js'
 import { normalizeProjectImagePrompts } from '../lib/imagePromptQuality.js'
+import {
+  OUTPUT_ROOT,
+  withSessionMutationLock,
+} from '../lib/sessionStore.js'
+import { mergeWindowsStateIntoProject, cancelWindowsProject } from '../lib/windowsVideo.js'
 
 const router = express.Router()
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
-const OUTPUT_ROOT = path.join(__dirname, '..', '..', 'output')
-
-// Every mutation for one project runs in arrival order. Asset downloads and
-// JSON writes can take long enough for several browser auto-saves to overlap;
-// without this lock an older snapshot can finish last and roll the project
-// backwards (or two writers can fight over the same temporary file).
-const sessionMutationChains = new Map()
-export const withSessionMutationLock = async (sessionId, operation) => {
-  const previous = sessionMutationChains.get(sessionId) || Promise.resolve()
-  const current = previous.catch(() => {}).then(operation)
-  sessionMutationChains.set(sessionId, current)
-  try {
-    return await current
-  } finally {
-    if (sessionMutationChains.get(sessionId) === current) sessionMutationChains.delete(sessionId)
-  }
-}
-
-// Ensure output root exists on startup
-await fs.mkdir(OUTPUT_ROOT, { recursive: true })
+export { withSessionMutationLock } from '../lib/sessionStore.js'
 
 export const hasPopulatedProjectCore = (project) => Boolean(
   project?.story
@@ -290,7 +276,7 @@ export const restoreImageReferencesFromDisk = async (snapshot, sessionDir) => {
 router.post('/save', async (req, res) => {
   try {
     const { sessionId, project } = req.body
-    if (!sessionId || !project) {
+    if (!validSessionId(sessionId) || !project) {
       return res.status(400).json({ error: 'sessionId and project required' })
     }
 
@@ -337,6 +323,7 @@ router.post('/save', async (req, res) => {
     const snapshot = JSON.parse(JSON.stringify(project))
     normalizeProjectImagePrompts(snapshot)
     mergeDurableAssetReferences(snapshot, existingSnapshot)
+    await mergeWindowsStateIntoProject(snapshot, sessionId)
 
     // ── Save all image variants ──────────────────────────────────────────
     for (const [key, img] of Object.entries(snapshot.images || {})) {
@@ -430,6 +417,10 @@ router.post('/save', async (req, res) => {
     // CDN links expire. Videos are written to videos/ and videos/history/.
     for (const [sceneNum, job] of Object.entries(snapshot.video_jobs || {})) {
       if (!job?.url) continue
+      // Broker-completed Windows videos are permanent R2 objects validated by
+      // StoryForge. Keep that canonical remote evidence instead of downloading
+      // hundreds of megabytes during an unrelated browser autosave.
+      if (job.provider === 'windows-worker' && job.objectKey) continue
       const relPath = `videos/${unitFileLabel(sceneNum)}_selected.mp4`
       try {
         const saved = await saveAsset(job.url, relPath, sessionDir, sessionId)
@@ -443,6 +434,7 @@ router.post('/save', async (req, res) => {
       if (!job?.url || job.url.startsWith('__session_file__')) continue
       // If video_jobs already wrote this URL to disk, skip (same URL)
       const existingJob = snapshot.video_jobs?.[sceneNum]
+      if (existingJob?.provider === 'windows-worker' && existingJob?.objectKey && existingJob.url === job.url) continue
       if (existingJob?.url?.startsWith('__session_file__')) continue
       const relPath = `videos/${unitFileLabel(sceneNum)}_selected.mp4`
       try {
@@ -583,6 +575,7 @@ router.patch('/:id/name', async (req, res) => {
     const jsonPath = path.join(OUTPUT_ROOT, id, 'session.json')
     const raw = await fs.readFile(jsonPath, 'utf8')
     const data = JSON.parse(raw)
+    await mergeWindowsStateIntoProject(data, id)
     data._session = { ...(data._session || { id }), name }
     // Keep the snapshot-level copy in sync so a later frontend save
     // (which writes _session from project_name) can't roll the name back.
@@ -730,17 +723,21 @@ router.get('/:id/preview-proxy/:file', (req, res) => {
 router.delete('/:id', async (req, res) => {
   try {
     const { id } = req.params
-    if (id.includes('..') || id.includes('/') || id.includes('\\')) {
+    if (!validSessionId(id)) {
       return res.status(400).json({ error: 'Invalid session id' })
     }
+    if (!isR2Configured()) {
+      throw new Error('Project deletion requires R2 configuration so remote assets cannot be orphaned')
+    }
+    // Broker cancellation owns its own per-session mutation. Complete it before
+    // entering the deletion lock to avoid lock re-entry and to fail closed when
+    // remote Windows work cannot be scoped and canceled safely.
+    await cancelWindowsProject(id, { deleteAssets: true, reason: 'Content Machine project deleted' })
     const result = await withSessionMutationLock(id, async () => {
       // Delete remote data first. If R2 refuses the operation, keep the local
       // project visible so deletion can be retried instead of silently leaving
       // inaccessible orphaned objects in the bucket.
       const r2 = await deleteProjectAssetsFromR2(id)
-      if (!r2.configured) {
-        throw new Error('Project deletion requires R2 configuration so remote assets cannot be orphaned')
-      }
       const renderWorkspacesDeleted = await deleteRenderWorkspacesForSession(id)
       const sessionDir = path.join(OUTPUT_ROOT, id)
       await fs.rm(sessionDir, { recursive: true, force: true })

@@ -26,6 +26,7 @@ export const MIN_SEGMENT_SECONDS = 5
 // Clip lengths per video model (ascending). Models not listed fall back to a
 // single fixed clip equal to the scene plan duration.
 export const MODEL_CLIP_OPTIONS = {
+  'windows-default':            [8],
   'veo-3.1-fast':               [8],
   'grok-3':                     [6, 10, 15],
   'lightricks/ltx-2-pro':       [6, 8, 10],

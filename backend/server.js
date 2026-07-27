@@ -99,6 +99,8 @@ import sessionRoutes from './routes/session.js';
 import audioRoutes from './routes/audio.js';
 import renderRoutes from './routes/render.js';
 import directorRoutes from './routes/director.js';
+import windowsVideosRoutes, { manualWindowsVideoRouter } from './routes/windowsVideos.js';
+import { startWindowsReconciler } from './lib/windowsVideo.js';
 
 app.use('/api/settings', settingsRoutes);
 app.use('/api/claude', claudeRoutes);
@@ -111,6 +113,8 @@ app.use('/api/session', sessionRoutes);
 app.use('/api/audio', audioRoutes);
 app.use('/api/render', renderRoutes);
 app.use('/api/director', directorRoutes);
+app.use('/api/videos/windows', windowsVideosRoutes);
+app.use('/api/videos', manualWindowsVideoRouter);
 
 app.use((err, _req, res, _next) => {
   console.error('Error:', err);
@@ -119,4 +123,7 @@ app.use((err, _req, res, _next) => {
 
 app.listen(PORT, () => {
   console.log(`Backend server running on http://localhost:${PORT}`);
+  startWindowsReconciler().catch((error) => {
+    console.warn(`[windows-video] reconciler could not start: ${error.message}`);
+  });
 });

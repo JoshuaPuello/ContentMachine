@@ -34,6 +34,26 @@ import {
   effectiveFilmTreatment,
 } from '../lib/filmTreatment'
 import { buildBulkImageSelection } from '../lib/imageSelection'
+import {
+  WINDOWS_VIDEO_MODEL,
+  WINDOWS_VIDEO_PROVIDER,
+  isWindowsVideoActive,
+  mergeWindowsTasksIntoJobs,
+  normalizeWindowsVideoStatus,
+  usesWindowsVideoBackend,
+} from '../lib/windowsVideoWorker'
+
+const emptyWindowsVideoStatus = () => ({
+  paused: false,
+  brokerAvailable: false,
+  workerConnected: false,
+  workerName: null,
+  occupiedSlots: 0,
+  maxSlots: 0,
+  tasks: [],
+  updatedAt: null,
+  error: null,
+})
 
 // One session ID per browser tab — survives refresh but not tab close.
 // Format: session_YYYY-MM-DD_<random> so output folders are human-readable.
@@ -270,6 +290,7 @@ export const usePipelineStore = create(
         claudeModel: 'claude-3-5-sonnet',
         videoProvider: 'fal',
         videoModel: 'lightricks/ltx-2-pro',
+        videoGenerationBackend: 'hosted-provider',
         videoResolution: '1080p',
         aspectRatio: '16:9',
         audioMode: 'manual',
@@ -352,6 +373,7 @@ export const usePipelineStore = create(
       selectedVideos: {},      // keyed `${scene}_${segment}`
       // videoHistory: keyed `${scene}_${segment}`, array of { url, prompt } oldest-first
       videoHistory: {},
+      windowsVideoStatus: emptyWindowsVideoStatus(),
       ttsScript: null,
       ttsLoading: false,
       ttsError: null,
@@ -521,11 +543,16 @@ export const usePipelineStore = create(
         settings: {
           ...state.settings,
           videoProvider: provider,
+          videoGenerationBackend: provider === WINDOWS_VIDEO_PROVIDER
+            ? 'windows-worker'
+            : 'hosted-provider',
           // Reset model to default for the chosen provider
           videoModel: provider === 'replicate' ? 'lightricks/ltx-2-pro'
             : provider === 'geminigen' ? 'veo-3.1-fast'
+            : provider === WINDOWS_VIDEO_PROVIDER ? WINDOWS_VIDEO_MODEL
             : 'lightricks/ltx-2-pro',
-          videoClipDuration: null,
+          videoClipDuration: provider === WINDOWS_VIDEO_PROVIDER ? 8 : null,
+          aspectRatio: provider === WINDOWS_VIDEO_PROVIDER ? '16:9' : state.settings.aspectRatio,
         }
       })),
 
@@ -538,7 +565,10 @@ export const usePipelineStore = create(
       })),
 
       setAspectRatio: (ratio) => set((state) => ({
-        settings: { ...state.settings, aspectRatio: ratio }
+        settings: {
+          ...state.settings,
+          aspectRatio: usesWindowsVideoBackend(state.settings) ? '16:9' : ratio,
+        }
       })),
 
       setAudioMode: (mode) => set((state) => ({
@@ -868,6 +898,7 @@ export const usePipelineStore = create(
           videoJobs: {},
           videoHistory: {},
           selectedVideos: {},
+          windowsVideoStatus: emptyWindowsVideoStatus(),
           videoProgress: { total: 0, completed: [], pending: [] },
           ttsScript: null,
           expressiveScript: null,
@@ -1113,6 +1144,7 @@ export const usePipelineStore = create(
             videoJobs: {},
             videoHistory: {},
             selectedVideos: {},
+            windowsVideoStatus: emptyWindowsVideoStatus(),
             videoProgress: { total: 0, completed: [], pending: [] },
             timeline: { items: [], sceneWindows: {}, directorPlan: null, chapters: null, built: false },
             timelineDirty: false,
@@ -2064,6 +2096,7 @@ export const usePipelineStore = create(
           videoJobs: {},
           videoHistory: {},
           selectedVideos: {},
+          windowsVideoStatus: emptyWindowsVideoStatus(),
           videoProgress: { total: 0, completed: [], pending: [] },
           timeline: { items: [], sceneWindows: {}, directorPlan: null, chapters: null, built: false },
           timelineDirty: false,
@@ -2342,7 +2375,10 @@ export const usePipelineStore = create(
         // Don't snapshot videoJobs here — read it fresh after the async API call
         // to avoid overwriting concurrent store mutations (e.g. regenerateVideo)
 
-        if (videoPrompts.some(prompt => prompt.motion_prompt_version !== 'seedance-2-0-v1')) {
+        if (
+          !usesWindowsVideoBackend(settings)
+          && videoPrompts.some(prompt => prompt.motion_prompt_version !== 'seedance-2-0-v1')
+        ) {
           throw new Error('These motion prompts predate the Seedance continuity safeguards. Regenerate Video Prompts before submitting new video jobs.')
         }
         const mismatchedPrompt = videoPrompts.find(prompt => prompt.video_model && prompt.video_model !== settings.videoModel)
@@ -2394,6 +2430,82 @@ export const usePipelineStore = create(
             get().logActivity('Resumed — polling in-flight video jobs', 'info')
           }
           return []
+        }
+
+        if (usesWindowsVideoBackend(settings)) {
+          const unitIds = scenesToProcess.map(scene => String(scene.scene_number))
+          const allUnitKeys = videoPrompts.map(vp =>
+            unitKey(vp.scene_number, vp.segment_index ?? 0)
+          )
+          set(state => ({
+            videoJobs: {
+              ...state.videoJobs,
+              ...Object.fromEntries(unitIds.map(unitId => [
+                unitId,
+                {
+                  ...state.videoJobs[unitId],
+                  jobId: state.videoJobs[unitId]?.jobId || null,
+                  provider: WINDOWS_VIDEO_PROVIDER,
+                  status: 'queued',
+                  url: state.videoJobs[unitId]?.url || null,
+                  error: null,
+                },
+              ])),
+            },
+            generationState: 'running',
+            generationPhase: 'videos',
+            ...(!resumeFromPending ? {
+              videoProgress: {
+                total: allUnitKeys.length,
+                completed: allUnitKeys.filter(key => state.videoJobs[key]?.status === 'completed'),
+                pending: allUnitKeys.filter(key => state.videoJobs[key]?.status !== 'completed'),
+              },
+            } : {}),
+          }))
+          get().logActivity(
+            `Queued ${unitIds.length} shot${unitIds.length === 1 ? '' : 's'} for the Windows video worker`,
+            'running'
+          )
+          try {
+            // The ContentMachine backend builds broker tasks from the durable
+            // project snapshot, so persist selected images/prompts first.
+            await get().autoSaveSession()
+            const response = await api.generateWindowsVideos(scope.sessionId, unitIds, get().sessionWriteToken)
+            if (!isProjectScopeCurrent(get, scope)) return []
+            const snapshot = normalizeWindowsVideoStatus(response)
+            if (snapshot.tasks.length > 0) {
+              set(state => ({
+                videoJobs: mergeWindowsTasksIntoJobs(state.videoJobs, snapshot),
+                windowsVideoStatus: snapshot,
+              }))
+            }
+            await get().refreshWindowsVideoStatus()
+            void get().autoSaveSession()
+            return snapshot.tasks
+          } catch (error) {
+            if (!isProjectScopeCurrent(get, scope)) return []
+            set(state => ({
+              videoJobs: {
+                ...state.videoJobs,
+                ...Object.fromEntries(unitIds.map(unitId => [
+                  unitId,
+                  {
+                    ...state.videoJobs[unitId],
+                    provider: WINDOWS_VIDEO_PROVIDER,
+                    status: 'failed',
+                    error: error.message,
+                  },
+                ])),
+              },
+              generationState: 'stopped',
+              windowsVideoStatus: {
+                ...state.windowsVideoStatus,
+                error: error.message,
+              },
+            }))
+            get().logActivity(`Windows worker queue failed: ${error.message}`, 'error')
+            throw error
+          }
         }
 
         const currentJobs = get().videoJobs
@@ -2540,8 +2652,204 @@ export const usePipelineStore = create(
         set({ generationState: 'running', generationPhase: 'videos' })
       },
 
+      refreshWindowsVideoStatus: async () => {
+        const scope = captureProjectScope(get)
+        try {
+          const response = await api.getWindowsVideoStatus(scope.sessionId, get().sessionWriteToken)
+          if (!isProjectScopeCurrent(get, scope)) return null
+          const snapshot = normalizeWindowsVideoStatus(response)
+          const previousJobs = get().videoJobs
+          const allUnitIds = get().videoPrompts.map(prompt =>
+            unitKey(prompt.scene_number, prompt.segment_index ?? 0)
+          )
+          const mergedJobs = mergeWindowsTasksIntoJobs(previousJobs, snapshot)
+          const completed = allUnitIds.filter(unitId => mergedJobs[unitId]?.status === 'completed')
+          const pending = allUnitIds.filter(unitId => !completed.includes(unitId))
+          const hasActiveTasks = snapshot.tasks.some(task =>
+            isWindowsVideoActive(task.status)
+          )
+          const newlyTerminal = snapshot.tasks.some(task => {
+            const before = previousJobs[task.unitId]?.status
+            return ['completed', 'failed', 'canceled', 'superseded'].includes(task.status)
+              && before !== task.status
+          })
+
+          set(state => ({
+            videoJobs: mergedJobs,
+            windowsVideoStatus: snapshot,
+            videoProgress: {
+              total: allUnitIds.length,
+              completed,
+              pending,
+            },
+            generationPhase: pending.length > 0 ? 'videos' : state.generationPhase,
+            generationState: snapshot.paused
+              ? 'paused'
+              : hasActiveTasks
+                ? 'running'
+                : pending.length === 0 && allUnitIds.length > 0
+                  ? 'stopped'
+                  : state.generationState,
+          }))
+
+          if (newlyTerminal) void get().autoSaveSession()
+          return snapshot
+        } catch (error) {
+          if (!isProjectScopeCurrent(get, scope)) return null
+          set(state => ({
+            windowsVideoStatus: {
+              ...state.windowsVideoStatus,
+              error: error.message,
+              updatedAt: new Date().toISOString(),
+            },
+          }))
+          return null
+        }
+      },
+
+      pauseWindowsVideoGeneration: async () => {
+        const scope = captureProjectScope(get)
+        const response = await api.pauseWindowsVideos(scope.sessionId, get().sessionWriteToken)
+        if (!isProjectScopeCurrent(get, scope)) return null
+        const snapshot = normalizeWindowsVideoStatus(response)
+        set(state => ({
+          generationState: 'paused',
+          generationPhase: 'videos',
+          windowsVideoStatus: snapshot.tasks.length
+            ? snapshot
+            : { ...state.windowsVideoStatus, ...snapshot, paused: true },
+          videoJobs: snapshot.tasks.length
+            ? mergeWindowsTasksIntoJobs(state.videoJobs, snapshot)
+            : state.videoJobs,
+        }))
+        get().logActivity('Windows video queue paused; active worker operations will stop safely', 'info')
+        void get().autoSaveSession()
+        return snapshot
+      },
+
+      resumeWindowsVideoGeneration: async () => {
+        const scope = captureProjectScope(get)
+        const response = await api.resumeWindowsVideos(scope.sessionId, get().sessionWriteToken)
+        if (!isProjectScopeCurrent(get, scope)) return null
+        const snapshot = normalizeWindowsVideoStatus(response)
+        set(state => ({
+          generationState: 'running',
+          generationPhase: 'videos',
+          windowsVideoStatus: snapshot.tasks.length
+            ? snapshot
+            : { ...state.windowsVideoStatus, ...snapshot, paused: false },
+          videoJobs: snapshot.tasks.length
+            ? mergeWindowsTasksIntoJobs(state.videoJobs, snapshot)
+            : state.videoJobs,
+        }))
+        get().logActivity('Windows video queue resumed', 'info')
+        await get().refreshWindowsVideoStatus()
+        return snapshot
+      },
+
+      retryMissingWindowsVideos: async (unitIds) => {
+        const scope = captureProjectScope(get)
+        const allUnitIds = get().videoPrompts.map(prompt =>
+          unitKey(prompt.scene_number, prompt.segment_index ?? 0)
+        )
+        const requested = (unitIds?.length ? unitIds : allUnitIds.filter(unitId =>
+          get().videoJobs[unitId]?.status !== 'completed'
+        )).map(String)
+        if (requested.length === 0) return null
+        const response = await api.retryMissingWindowsVideos(scope.sessionId, requested, get().sessionWriteToken)
+        if (!isProjectScopeCurrent(get, scope)) return null
+        const snapshot = normalizeWindowsVideoStatus(response)
+        set(state => ({
+          generationState: 'running',
+          generationPhase: 'videos',
+          windowsVideoStatus: snapshot.tasks.length
+            ? snapshot
+            : { ...state.windowsVideoStatus, paused: false, error: null },
+          videoJobs: snapshot.tasks.length
+            ? mergeWindowsTasksIntoJobs(state.videoJobs, snapshot)
+            : {
+                ...state.videoJobs,
+                ...Object.fromEntries(requested.map(unitId => [
+                  unitId,
+                  {
+                    ...state.videoJobs[unitId],
+                    provider: WINDOWS_VIDEO_PROVIDER,
+                    status: 'queued',
+                    error: null,
+                  },
+                ])),
+              },
+        }))
+        get().logActivity(`Retrying ${requested.length} missing Windows video${requested.length === 1 ? '' : 's'}`, 'running')
+        await get().refreshWindowsVideoStatus()
+        return snapshot
+      },
+
+      cancelWindowsVideoGeneration: async (unitIds) => {
+        const scope = captureProjectScope(get)
+        const requested = (unitIds?.length
+          ? unitIds
+          : Object.entries(get().videoJobs)
+            .filter(([, job]) => job.provider === WINDOWS_VIDEO_PROVIDER && isWindowsVideoActive(job.status))
+            .map(([unitId]) => unitId)
+        ).map(String)
+        const response = await api.cancelWindowsVideos(scope.sessionId, requested, get().sessionWriteToken)
+        if (!isProjectScopeCurrent(get, scope)) return null
+        const snapshot = normalizeWindowsVideoStatus(response)
+        set(state => ({
+          generationState: 'stopped',
+          generationPhase: 'videos',
+          windowsVideoStatus: snapshot.tasks.length
+            ? snapshot
+            : { ...state.windowsVideoStatus, paused: false },
+          videoJobs: snapshot.tasks.length
+            ? mergeWindowsTasksIntoJobs(state.videoJobs, snapshot)
+            : {
+                ...state.videoJobs,
+                ...Object.fromEntries(requested.map(unitId => [
+                  unitId,
+                  {
+                    ...state.videoJobs[unitId],
+                    provider: WINDOWS_VIDEO_PROVIDER,
+                    status: 'canceled',
+                    error: null,
+                  },
+                ])),
+              },
+        }))
+        get().logActivity(`Canceled ${requested.length} Windows video task${requested.length === 1 ? '' : 's'}`, 'info')
+        void get().autoSaveSession()
+        return snapshot
+      },
+
+      attachWindowsVideo: async (unitId, file) => {
+        if (
+          !file
+          || (file.type && file.type !== 'video/mp4')
+          || !String(file.name || '').toLowerCase().endsWith('.mp4')
+        ) {
+          throw new Error('Choose an MP4 video file')
+        }
+        const scope = captureProjectScope(get)
+        const response = await api.attachWindowsVideo(scope.sessionId, String(unitId), file, get().sessionWriteToken)
+        if (!isProjectScopeCurrent(get, scope)) return null
+        const snapshot = normalizeWindowsVideoStatus(response)
+        if (snapshot.tasks.length > 0) {
+          set(state => ({
+            videoJobs: mergeWindowsTasksIntoJobs(state.videoJobs, snapshot),
+            windowsVideoStatus: snapshot,
+          }))
+        }
+        await get().refreshWindowsVideoStatus()
+        void get().autoSaveSession()
+        return response
+      },
+
       resumeVideoGeneration: async () => {
-        const { videoPrompts, videoJobs } = get()
+        const { videoPrompts, videoJobs, settings } = get()
+        if (usesWindowsVideoBackend(settings)) {
+          return get().resumeWindowsVideoGeneration()
+        }
         if (videoPrompts.length > 0) {
           // Rebuild progress from the source-of-truth jobs. Older runs could
           // display jobless cards as "generating" even though their progress
@@ -2574,6 +2882,12 @@ export const usePipelineStore = create(
         const scope = captureProjectScope(get)
         const { videoJobs } = get()
         const job = videoJobs[unitId]
+        if (job?.provider === WINDOWS_VIDEO_PROVIDER) {
+          const snapshot = await get().refreshWindowsVideoStatus()
+          return snapshot?.tasks.find(task => task.unitId === String(unitId))
+            || get().videoJobs[unitId]
+            || null
+        }
         if (!job?.jobId) return null
 
         const [sceneNum, segIdx] = String(unitId).split('_').map(Number)
@@ -2698,22 +3012,69 @@ export const usePipelineStore = create(
       regenerateVideo: async (unitId, newPrompt) => {
         const scope = captureProjectScope(get)
         const { selectedImages, images, videoPrompts, settings } = get()
-        if (activeVideoRequestCount(get().videoJobs) >= MAX_CONCURRENT_VIDEO_REQUESTS) {
+        if (
+          !usesWindowsVideoBackend(settings)
+          && activeVideoRequestCount(get().videoJobs) >= MAX_CONCURRENT_VIDEO_REQUESTS
+        ) {
           throw new Error(`All ${MAX_CONCURRENT_VIDEO_REQUESTS} video provider slots are currently in use. Try again when one finishes.`)
         }
         const [sceneNum, segIdx] = String(unitId).split('_').map(Number)
         const vp = videoPrompts.find(v =>
           v.scene_number === sceneNum && (v.segment_index ?? 0) === (segIdx || 0)
         )
-        if (!vp || vp.motion_prompt_version !== 'seedance-2-0-v1') {
+        if (!vp) {
+          throw new Error('This shot has no video prompt. Regenerate Video Prompts first.')
+        }
+        if (
+          !usesWindowsVideoBackend(settings)
+          && vp.motion_prompt_version !== 'seedance-2-0-v1'
+        ) {
           throw new Error('Regenerate this scene\'s Video Prompt first so the Seedance identity and style locks are applied.')
         }
         if (vp.video_model && vp.video_model !== settings.videoModel) {
           throw new Error(`This prompt targets ${vp.video_model}; regenerate it for ${settings.videoModel} before creating another video.`)
         }
         const prompt = newPrompt
-          ? preserveProtectedMotionPrompt(vp?.full_prompt_string || '', newPrompt)
+          ? usesWindowsVideoBackend(settings)
+            ? newPrompt.trim()
+            : preserveProtectedMotionPrompt(vp?.full_prompt_string || '', newPrompt)
           : vp?.full_prompt_string || ''
+
+        if (usesWindowsVideoBackend(settings)) {
+          set(state => {
+            const oldJob = state.videoJobs[unitId]
+            const prevHistory = state.videoHistory[unitId] || []
+            const newHistory = oldJob?.url
+              ? [...prevHistory, { url: oldJob.url, prompt: vp?.full_prompt_string || '' }]
+              : prevHistory
+            return {
+              videoHistory: { ...state.videoHistory, [unitId]: newHistory },
+              videoPrompts: state.videoPrompts.map(candidate =>
+                candidate.scene_number === sceneNum
+                  && (candidate.segment_index ?? 0) === (segIdx || 0)
+                  && prompt
+                  ? { ...candidate, full_prompt_string: prompt }
+                  : candidate
+              ),
+              videoJobs: {
+                ...state.videoJobs,
+                [unitId]: {
+                  ...oldJob,
+                  provider: WINDOWS_VIDEO_PROVIDER,
+                  status: 'queued',
+                  url: null,
+                  error: null,
+                },
+              },
+              generationState: 'running',
+              generationPhase: 'videos',
+            }
+          })
+          // The shared broker reads the durable ContentMachine session. Ensure
+          // an edited prompt is persisted before requesting a fresh attempt.
+          await get().autoSaveSession()
+          return get().retryMissingWindowsVideos([unitId])
+        }
 
         // selectedImages[unitId].url is stripped from localStorage persist —
         // fall back to the images store which holds the full URL/base64
@@ -2844,6 +3205,7 @@ export const usePipelineStore = create(
           videoJobs: {},
           videoHistory: {},
           selectedVideos: {},
+          windowsVideoStatus: emptyWindowsVideoStatus(),
           videoProgress: { total: 0, completed: [], pending: [] },
           timeline: { items: [], sceneWindows: {}, directorPlan: null, chapters: null, built: false },
           timelineDirty: false,
@@ -4486,6 +4848,7 @@ export const usePipelineStore = create(
           videoJobs,
           videoHistory: project.video_history || {},
           selectedVideos,
+          windowsVideoStatus: emptyWindowsVideoStatus(),
           imageBatches: project.image_batches || [],
           imageProgress: savedImageProgress,
           ttsScript: loadedTtsScript,
@@ -4564,6 +4927,11 @@ export const usePipelineStore = create(
               ...(project.settings.claude_model     ? { claudeModel:     project.settings.claude_model     } : {}),
               ...(project.settings.video_provider   ? { videoProvider:   project.settings.video_provider   } : {}),
               ...(project.settings.video_model      ? { videoModel:      project.settings.video_model      } : {}),
+              videoGenerationBackend:
+                project.settings.video_generation_backend
+                || (project.settings.video_provider === WINDOWS_VIDEO_PROVIDER
+                  ? 'windows-worker'
+                  : 'hosted-provider'),
               ...(project.settings.video_resolution ? { videoResolution: project.settings.video_resolution } : {}),
               ...(project.settings.aspect_ratio     ? { aspectRatio:     project.settings.aspect_ratio     } : {}),
               ...(project.settings.chapters_enabled != null ? { chaptersEnabled: !!project.settings.chapters_enabled } : {}),
@@ -4673,6 +5041,10 @@ export const usePipelineStore = create(
             claude_model:     state.settings.claudeModel,
             video_provider:   state.settings.videoProvider,
             video_model:      state.settings.videoModel,
+            video_generation_backend: state.settings.videoGenerationBackend
+              || (state.settings.videoProvider === WINDOWS_VIDEO_PROVIDER
+                ? 'windows-worker'
+                : 'hosted-provider'),
             video_resolution: state.settings.videoResolution,
             aspect_ratio:     state.settings.aspectRatio,
             chapters_enabled: state.settings.chaptersEnabled,
@@ -4978,6 +5350,7 @@ export const usePipelineStore = create(
           videoJobs: {},
           videoHistory: {},
           selectedVideos: {},
+          windowsVideoStatus: emptyWindowsVideoStatus(),
           ttsScript: null,
           ttsLoading: false,
           ttsError: null,
@@ -5059,6 +5432,7 @@ export const usePipelineStore = create(
         ),
         videoPrompts: state.videoPrompts,
         videoJobs: state.videoJobs,              // persist job IDs so polling can resume
+        windowsVideoStatus: state.windowsVideoStatus,
         selectedVideos: state.selectedVideos,
         ttsScript: state.ttsScript,
         youtubeMetadata: state.youtubeMetadata,

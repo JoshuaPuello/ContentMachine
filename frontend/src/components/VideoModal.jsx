@@ -69,7 +69,15 @@ function VideoModal({ job, history = [], videoPrompt, sceneNumber, onClose, onRe
     onClose()
   }
 
-  const isPending = job?.status === 'pending' || job?.status === 'processing'
+  const isPending = [
+    'pending',
+    'processing',
+    'queued',
+    'leased',
+    'generating',
+    'uploading',
+    'validating',
+  ].includes(job?.status)
 
   return (
     <>

@@ -13,6 +13,9 @@ import toast from 'react-hot-toast'
 
 // Derive human-readable duration range from the selected video model
 const getDurationHint = (videoModel) => {
+  if (videoModel === 'windows-default')              return 'fixed 8s'
+  if (videoModel === 'veo-3.1-fast')                 return 'fixed 8s'
+  if (videoModel === 'grok-3')                       return '6s / 10s / 15s'
   if (videoModel === 'lightricks/ltx-2-fast')        return '6–20s (even steps)'
   if (videoModel === 'kwaivgi/kling-v3-video')        return '3–15s'
   if (videoModel === 'kwaivgi/kling-v2.5-turbo-pro') return '5s or 10s'

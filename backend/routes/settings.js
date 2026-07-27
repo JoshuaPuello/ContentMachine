@@ -6,6 +6,7 @@ import { GoogleGenAI } from '@google/genai';
 import { ElevenLabsClient } from '@elevenlabs/elevenlabs-js';
 import { isVertexConfigured, vertexConfigError, vertexAccountCount } from '../lib/vertex.js';
 import { isR2Configured } from '../lib/r2.js';
+import { isMediaBrokerConfigured } from '../lib/mediaBrokerClient.js';
 const router = express.Router();
 
 // Detect the local Claude Code CLI once and cache the result.
@@ -46,6 +47,7 @@ router.get('/', async (req, res) => {
     elevenlabs: !!(keys.elevenlabs && keys.elevenlabs.trim()),
     geminigen: !!(keys.geminigen && keys.geminigen.trim()),
     r2: isR2Configured(),
+    windowsWorker: isMediaBrokerConfigured(),
     // Environment-based capabilities (configured in backend/.env, not via UI keys)
     vertex,
     vertexAccounts: vertexAccountCount(),

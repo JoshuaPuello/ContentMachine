@@ -1,4 +1,5 @@
 import axios from 'axios'
+import { WINDOWS_VIDEO_API_ROUTES } from '../lib/windowsVideoWorker'
 
 const api = axios.create({
   baseURL: '/api',
@@ -206,6 +207,52 @@ const exportedApi = {
       videoModel,
       sessionId
     }).then(r => r.data),
+
+  // Windows generation is asynchronous. ContentMachine persists project
+  // intent while StoryForge remains the shared broker/control plane.
+  generateWindowsVideos: (sessionId, unitIds, sessionToken) =>
+    api.post(WINDOWS_VIDEO_API_ROUTES.generate, { sessionId, unitIds }, {
+      headers: { 'X-Content-Machine-Session-Token': sessionToken },
+    }).then(r => r.data),
+
+  getWindowsVideoStatus: (sessionId, sessionToken) =>
+    api.get(WINDOWS_VIDEO_API_ROUTES.status(sessionId), {
+      headers: { 'X-Content-Machine-Session-Token': sessionToken },
+    }).then(r => r.data),
+
+  pauseWindowsVideos: (sessionId, sessionToken) =>
+    api.post(WINDOWS_VIDEO_API_ROUTES.pause, { sessionId }, {
+      headers: { 'X-Content-Machine-Session-Token': sessionToken },
+    }).then(r => r.data),
+
+  resumeWindowsVideos: (sessionId, sessionToken) =>
+    api.post(WINDOWS_VIDEO_API_ROUTES.resume, { sessionId }, {
+      headers: { 'X-Content-Machine-Session-Token': sessionToken },
+    }).then(r => r.data),
+
+  retryMissingWindowsVideos: (sessionId, unitIds, sessionToken) =>
+    api.post(WINDOWS_VIDEO_API_ROUTES.retryMissing, { sessionId, unitIds }, {
+      headers: { 'X-Content-Machine-Session-Token': sessionToken },
+    }).then(r => r.data),
+
+  cancelWindowsVideos: (sessionId, unitIds, sessionToken) =>
+    api.post(WINDOWS_VIDEO_API_ROUTES.cancel, { sessionId, unitIds }, {
+      headers: { 'X-Content-Machine-Session-Token': sessionToken },
+    }).then(r => r.data),
+
+  attachWindowsVideo: (sessionId, unitId, file, sessionToken) => {
+    const form = new FormData()
+    form.append('sessionId', sessionId)
+    form.append('unitId', unitId)
+    form.append('file', file)
+    return api.post(WINDOWS_VIDEO_API_ROUTES.manualAttach, form, {
+      headers: {
+        'Content-Type': 'multipart/form-data',
+        'X-Content-Machine-Session-Token': sessionToken,
+      },
+      timeout: 1000000,
+    }).then(r => r.data)
+  },
   
   generateThumbnails: (prompts, provider, aspectRatio) =>
     api.post('/thumbnail/generate', { prompts, provider, aspectRatio }).then(r => r.data),

@@ -7,10 +7,12 @@
 import {
   S3Client,
   PutObjectCommand,
+  DeleteObjectCommand,
   ListObjectsV2Command,
   DeleteObjectsCommand,
 } from '@aws-sdk/client-s3';
 import { randomUUID } from 'crypto';
+import { createReadStream } from 'fs';
 
 const R2_REQUEST_TIMEOUT_MS = 30_000;
 const R2_PUBLIC_CHECK_TIMEOUT_MS = 10_000;
@@ -115,6 +117,31 @@ export const uploadToR2 = async (buffer, mimeType, { sessionId, relativePath } =
     ContentType: mimeType,
   }), 'R2 upload');
   return `${publicUrl}/${key}`;
+};
+
+// Stream a large local artifact directly to R2 without retaining it in server memory.
+export const uploadFileToR2 = async (filePath, sizeBytes, mimeType, { sessionId, relativePath } = {}) => {
+  const { client, bucketName, publicUrl } = getClient();
+  if (!client) throw new Error('R2 storage is not configured in backend/.env');
+  const key = projectR2AssetKey(sessionId, relativePath, mimeType);
+  await sendR2Command(client, new PutObjectCommand({
+    Bucket: bucketName,
+    Key: key,
+    Body: createReadStream(filePath),
+    ContentLength: sizeBytes,
+    ContentType: mimeType,
+  }), 'R2 upload');
+  return `${publicUrl}/${key}`;
+};
+
+export const deleteProjectAssetFromR2 = async (sessionId, relativePath, mimeType = 'video/mp4') => {
+  const { client, bucketName } = getClient();
+  if (!client) return false;
+  await sendR2Command(client, new DeleteObjectCommand({
+    Bucket: bucketName,
+    Key: projectR2AssetKey(sessionId, relativePath, mimeType),
+  }), 'R2 asset cleanup');
+  return true;
 };
 
 // Return the existing project object when it has already been synchronized;

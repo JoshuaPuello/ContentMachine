@@ -6,6 +6,11 @@ import {
   MAX_CONCURRENT_VIDEO_REQUESTS,
   queuedVideoUnitIds,
 } from '../lib/videoConcurrency'
+import {
+  WINDOWS_VIDEO_PROVIDER,
+  isWindowsVideoActive,
+  usesWindowsVideoBackend,
+} from '../lib/windowsVideoWorker'
 import VideoCard from '../components/VideoCard'
 import VideoModal from '../components/VideoModal'
 import ExportModal from '../components/ExportModal'
@@ -169,6 +174,7 @@ function VideoGeneration() {
     videoJobs,
     videoHistory,
     selectedVideos,
+    windowsVideoStatus,
     ttsScript,
     ttsLoading,
     ttsError,
@@ -193,18 +199,28 @@ function VideoGeneration() {
     resumeVideoPolling,
     resumeVideoGeneration,
     selectVideoVersion,
+    refreshWindowsVideoStatus,
+    pauseWindowsVideoGeneration,
+    resumeWindowsVideoGeneration,
+    retryMissingWindowsVideos,
+    cancelWindowsVideoGeneration,
+    attachWindowsVideo,
   } = usePipelineStore()
 
   const completedCount = Object.values(videoJobs).filter(j => j.status === 'completed').length
-  const failedCount    = Object.values(videoJobs).filter(j => j.status === 'failed').length
+  const failedCount    = Object.values(videoJobs).filter(j =>
+    ['failed', 'canceled', 'superseded'].includes(j.status)
+  ).length
   const totalCount     = videoPrompts.length || scenes.length
   const selectedCount  = Object.keys(selectedVideos).length
   const allSelected    = completedCount > 0 && selectedCount >= completedCount
   const progress       = totalCount > 0 ? Math.round((completedCount / totalCount) * 100) : 0
   const allJobsDone    = totalCount > 0 && (completedCount + failedCount) === totalCount
+  const isWindowsWorker = usesWindowsVideoBackend(settings)
   const remainingVideoCount = videoPrompts.filter(prompt => {
     const job = videoJobs[`${prompt.scene_number}_${prompt.segment_index ?? 0}`]
-    return !['completed', 'failed'].includes(job?.status)
+    if (isWindowsWorker) return job?.status !== 'completed'
+    return !['completed', 'failed', 'canceled', 'superseded'].includes(job?.status)
   }).length
 
   // Pagination — only active when videoPrompts exceed threshold
@@ -257,6 +273,13 @@ function VideoGeneration() {
           if (!ttsScript) fetchTtsScript().catch(() => {})
         } else if (videoPrompts.length > 0 && Object.keys(videoJobs).length > 0) {
           // Jobs exist from a previous run — resume polling for any still-pending jobs
+          if (usesWindowsVideoBackend(settings)) {
+            const snapshot = await refreshWindowsVideoStatus()
+            const hasActive = snapshot?.tasks?.some(task => isWindowsVideoActive(task.status))
+            if (hasActive && !snapshot.paused) resumeVideoPolling()
+            if (!ttsScript) fetchTtsScript().catch(() => {})
+            return
+          }
           const hasPending = Object.values(videoJobs).some(j => j.status === 'pending')
           if (hasPending) {
             resumeVideoPolling()
@@ -279,10 +302,43 @@ function VideoGeneration() {
     const tick = async () => {
       if (!pollingActiveRef.current) return
 
-      const { videoJobs, generationState } = usePipelineStore.getState()
+      const { videoJobs, generationState, settings: currentSettings } = usePipelineStore.getState()
 
       if (generationState === 'paused' || generationState === 'stopped') {
         pollingActiveRef.current = false
+        return
+      }
+
+      if (usesWindowsVideoBackend(currentSettings)) {
+        const snapshot = await usePipelineStore.getState().refreshWindowsVideoStatus()
+        if (!snapshot) {
+          pollingTimerRef.current = setTimeout(tick, 5000)
+          return
+        }
+        if (snapshot.paused) {
+          pollingActiveRef.current = false
+          return
+        }
+        const active = snapshot.tasks.some(task => isWindowsVideoActive(task.status))
+        if (!active) {
+          pollingActiveRef.current = false
+          const state = usePipelineStore.getState()
+          const missing = state.videoPrompts.filter(prompt => {
+            const unitId = `${prompt.scene_number}_${prompt.segment_index ?? 0}`
+            return state.videoJobs[unitId]?.status !== 'completed'
+          }).length
+          stopGeneration()
+          if (missing === 0) {
+            toast.success('All Windows worker videos are ready!', { id: 'all-done' })
+          } else {
+            toast(`${missing} shot${missing === 1 ? '' : 's'} still need a video`, {
+              icon: '⚠️',
+              id: 'windows-missing',
+            })
+          }
+          return
+        }
+        pollingTimerRef.current = setTimeout(tick, 3000)
         return
       }
 
@@ -569,7 +625,7 @@ function VideoGeneration() {
 
               {/* Stop mid-run — in-flight jobs keep processing remotely; polling
                   and further submissions halt. Resume restarts both. */}
-              {generationState === 'running' && generationPhase === 'videos' && (
+              {!isWindowsWorker && generationState === 'running' && generationPhase === 'videos' && (
                 <button
                   onClick={stopGeneration}
                   title="Stop video generation (keeps progress, resume anytime)"
@@ -580,7 +636,7 @@ function VideoGeneration() {
                 </button>
               )}
 
-              {(generationState === 'stopped' || generationState === 'paused') && remainingVideoCount > 0 && (
+              {!isWindowsWorker && (generationState === 'stopped' || generationState === 'paused') && remainingVideoCount > 0 && (
                 <button
                   onClick={resumeVideoGeneration}
                   className="flex items-center gap-1.5 py-1 px-3 text-xs rounded-lg bg-accent text-white font-medium hover:bg-accent-hover transition-colors"
@@ -590,10 +646,61 @@ function VideoGeneration() {
                 </button>
               )}
 
-              {generationState === 'stopped' && (
+              {!isWindowsWorker && generationState === 'stopped' && (
                 <button onClick={handleStartFresh}
                   className="py-1 px-3 text-xs rounded-lg border border-error/40 text-error hover:bg-error/10 transition-colors">
                   Start Fresh
+                </button>
+              )}
+
+              {isWindowsWorker && !windowsVideoStatus.paused && remainingVideoCount > 0 && (
+                <button
+                  onClick={() => pauseWindowsVideoGeneration().catch(err =>
+                    toast.error(`Could not pause: ${err.message}`)
+                  )}
+                  className="flex items-center gap-1.5 py-1 px-3 text-xs rounded-lg border border-warning/30 text-warning hover:bg-warning/10 transition-colors"
+                >
+                  <span className="font-bold">Ⅱ</span>
+                  Pause queue
+                </button>
+              )}
+
+              {isWindowsWorker && windowsVideoStatus.paused && remainingVideoCount > 0 && (
+                <button
+                  onClick={() => resumeWindowsVideoGeneration().catch(err =>
+                    toast.error(`Could not resume: ${err.message}`)
+                  )}
+                  className="flex items-center gap-1.5 py-1 px-3 text-xs rounded-lg bg-accent text-white font-medium hover:bg-accent-hover transition-colors"
+                >
+                  <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
+                  Resume queue
+                </button>
+              )}
+
+              {isWindowsWorker && remainingVideoCount > 0 && (
+                <button
+                  onClick={() => retryMissingWindowsVideos().catch(err =>
+                    toast.error(`Retry failed: ${err.message}`)
+                  )}
+                  className="py-1 px-3 text-xs rounded-lg border border-accent/30 text-accent hover:bg-accent/10 transition-colors"
+                >
+                  Retry missing ({remainingVideoCount})
+                </button>
+              )}
+
+              {isWindowsWorker && Object.values(videoJobs).some(job =>
+                job.provider === WINDOWS_VIDEO_PROVIDER && isWindowsVideoActive(job.status)
+              ) && (
+                <button
+                  onClick={() => {
+                    if (!confirm('Cancel every active Windows video task for this project? Completed videos will be kept.')) return
+                    cancelWindowsVideoGeneration().catch(err =>
+                      toast.error(`Cancel failed: ${err.message}`)
+                    )
+                  }}
+                  className="py-1 px-3 text-xs rounded-lg border border-error/30 text-error hover:bg-error/10 transition-colors"
+                >
+                  Cancel active
                 </button>
               )}
             </div>
@@ -615,6 +722,47 @@ function VideoGeneration() {
       </div>
 
       <div className="max-w-6xl mx-auto p-8 space-y-8">
+        {isWindowsWorker && (
+          <div className="rounded-xl border border-border bg-surface overflow-hidden">
+            <div className="px-4 py-3 flex flex-wrap items-center gap-x-5 gap-y-2 border-b border-border">
+              <div className="flex items-center gap-2">
+                <span className={`w-2 h-2 rounded-full ${
+                  windowsVideoStatus.brokerAvailable ? 'bg-success' : 'bg-text-disabled'
+                }`} />
+                <span className="text-xs font-medium text-text-primary">
+                  {windowsVideoStatus.brokerAvailable
+                    ? 'StoryForge broker available'
+                    : 'StoryForge broker unavailable'}
+                </span>
+              </div>
+              {windowsVideoStatus.maxSlots > 0 && (
+                <span className="text-xs text-text-secondary">
+                  {windowsVideoStatus.occupiedSlots}/{windowsVideoStatus.maxSlots} slots occupied
+                </span>
+              )}
+              <span className="text-xs text-text-disabled">
+                Fixed 8s · 16:9 · silent
+              </span>
+              {windowsVideoStatus.paused && (
+                <span className="text-[10px] px-2 py-0.5 rounded-full border border-warning/20 bg-warning/10 text-warning">
+                  Queue paused
+                </span>
+              )}
+            </div>
+            <div className="px-4 py-3">
+              <p className="text-xs text-text-secondary leading-relaxed">
+                ContentMachine saves the selected image and motion prompt, then StoryForge brokers
+                durable work to the external Windows generator. Closing or refreshing this page does
+                not discard queued work. Completed clips remain unselected until you explicitly choose
+                the version you want.
+              </p>
+              {windowsVideoStatus.error && (
+                <p className="mt-2 text-xs text-error">{windowsVideoStatus.error}</p>
+              )}
+            </div>
+          </div>
+        )}
+
         {/* Pagination tabs — only shown when > 80 scenes */}
         {isPaginated && (
           <div className="flex items-center gap-2 flex-wrap">
@@ -661,7 +809,12 @@ function VideoGeneration() {
                 sceneNumber={uk}
                 label={label}
                 videoPrompt={vp}
-                job={videoJobs[uk]}
+                job={videoJobs[uk] || (isWindowsWorker ? {
+                  provider: WINDOWS_VIDEO_PROVIDER,
+                  status: 'queued',
+                  workerDisplayState: 'missing',
+                } : undefined)}
+                windowsMode={isWindowsWorker}
                 isSelected={!!selectedVideos[uk]}
                 onSelect={() => selectVideo(uk)}
                 onDeselect={() => deselectVideo(uk)}
@@ -671,6 +824,11 @@ function VideoGeneration() {
                   )
                 }}
                 onViewFull={() => setSelectedModal(uk)}
+                onManualAttach={isWindowsWorker ? (file) => {
+                  attachWindowsVideo(uk, file)
+                    .then(() => toast.success(`${label} MP4 attached`))
+                    .catch(err => toast.error(`Attach failed: ${err.message}`))
+                } : undefined}
               />
             )
           })}
