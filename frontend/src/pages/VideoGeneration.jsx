@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from 'react'
+import { useState, useEffect, useMemo, useRef, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { motion, AnimatePresence } from 'framer-motion'
 import { usePipelineStore } from '../store/pipelineStore'
@@ -6,6 +6,10 @@ import {
   MAX_CONCURRENT_VIDEO_REQUESTS,
   queuedVideoUnitIds,
 } from '../lib/videoConcurrency'
+import {
+  adjacentPreviewItems,
+  buildVideoPreviewItems,
+} from '../lib/mediaPreviewNavigation'
 import {
   WINDOWS_VIDEO_PROVIDER,
   isWindowsVideoActive,
@@ -233,6 +237,24 @@ function VideoGeneration() {
   // Reset to page 0 when a new generation run loads a fresh prompt list
   const firstPromptScene = videoPrompts[0]?.scene_number ?? 0
   useEffect(() => { setCurrentPage(0) }, [firstPromptScene])
+
+  const videoPreviewItems = useMemo(
+    () => buildVideoPreviewItems(videoPrompts, videoJobs, videoHistory),
+    [videoPrompts, videoJobs, videoHistory]
+  )
+  const selectedVideoNavigation = selectedModal !== null
+    ? adjacentPreviewItems(videoPreviewItems, String(selectedModal))
+    : { previous: null, next: null, position: 0, total: videoPreviewItems.length }
+  const navigateToVideoPreview = (unitId) => {
+    if (!unitId) return
+    setSelectedModal(unitId)
+    const promptIndex = videoPrompts.findIndex(prompt =>
+      `${prompt.scene_number}_${prompt.segment_index ?? 0}` === unitId
+    )
+    if (isPaginated && promptIndex >= 0) {
+      setCurrentPage(Math.floor(promptIndex / VIDEO_SCENES_PER_PAGE))
+    }
+  }
 
   // Toast errors
   useEffect(() => {
@@ -971,6 +993,13 @@ function VideoGeneration() {
               )
             }}
             onSelectVersion={(url) => selectVideoVersion(selectedModal, url)}
+            onPrevious={selectedVideoNavigation.previous
+              ? () => navigateToVideoPreview(selectedVideoNavigation.previous)
+              : undefined}
+            onNext={selectedVideoNavigation.next
+              ? () => navigateToVideoPreview(selectedVideoNavigation.next)
+              : undefined}
+            positionLabel={`Video ${selectedVideoNavigation.position} of ${selectedVideoNavigation.total}`}
           />
         )}
       </AnimatePresence>

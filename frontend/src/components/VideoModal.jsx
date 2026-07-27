@@ -6,7 +6,18 @@ import { motion } from 'framer-motion'
 // videoPrompt: the videoPrompts entry for this scene
 // onRegenerate(newPrompt): triggers regen with optional edited prompt
 // onSelectVersion(url): called when user selects a historical version as active
-function VideoModal({ job, history = [], videoPrompt, sceneNumber, onClose, onRegenerate, onSelectVersion }) {
+function VideoModal({
+  job,
+  history = [],
+  videoPrompt,
+  sceneNumber,
+  onClose,
+  onRegenerate,
+  onSelectVersion,
+  onPrevious,
+  onNext,
+  positionLabel,
+}) {
   const promptText = videoPrompt?.full_prompt_string || ''
 
   // Build full version list: history + current (if completed)
@@ -21,7 +32,8 @@ function VideoModal({ job, history = [], videoPrompt, sceneNumber, onClose, onRe
 
   useEffect(() => {
     setViewIndex(allVersions.length - 1)
-  }, [allVersions.length])
+    setIsEditing(false)
+  }, [allVersions.length, job?.url, sceneNumber])
 
   useEffect(() => {
     const viewed = allVersions[viewIndex]
@@ -32,12 +44,22 @@ function VideoModal({ job, history = [], videoPrompt, sceneNumber, onClose, onRe
   useEffect(() => {
     const handleKeyDown = (e) => {
       if (e.key === 'Escape') onClose()
-      if (e.key === 'ArrowLeft')  setViewIndex(i => Math.max(0, i - 1))
-      if (e.key === 'ArrowRight') setViewIndex(i => Math.min(allVersions.length - 1, i + 1))
+      const tag = e.target?.tagName
+      const isInteractive = e.target?.isContentEditable
+        || ['INPUT', 'TEXTAREA', 'SELECT', 'BUTTON', 'VIDEO'].includes(tag)
+      if (isInteractive || isEditing) return
+      if (e.key === 'ArrowLeft' && onPrevious) {
+        e.preventDefault()
+        onPrevious()
+      }
+      if (e.key === 'ArrowRight' && onNext) {
+        e.preventDefault()
+        onNext()
+      }
     }
     window.addEventListener('keydown', handleKeyDown)
     return () => window.removeEventListener('keydown', handleKeyDown)
-  }, [onClose, allVersions.length])
+  }, [onClose, onPrevious, onNext, isEditing])
 
   const viewed   = allVersions[viewIndex]
   const isLatest = viewIndex === allVersions.length - 1
@@ -92,6 +114,32 @@ function VideoModal({ job, history = [], videoPrompt, sceneNumber, onClose, onRe
         className="fixed inset-0 z-50 flex items-center justify-center p-8"
         onClick={onClose}
       >
+        {onPrevious && !isEditing && (
+          <button
+            type="button"
+            onClick={(event) => { event.stopPropagation(); onPrevious() }}
+            aria-label="Previous video"
+            title="Previous video (Left arrow)"
+            className="fixed left-4 md:left-7 top-1/2 -translate-y-1/2 z-[60] w-12 h-12 rounded-full border border-white/20 bg-black/65 backdrop-blur-md text-white flex items-center justify-center hover:bg-black/85 hover:border-white/40 transition-all shadow-xl"
+          >
+            <svg className="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M15 19l-7-7 7-7" />
+            </svg>
+          </button>
+        )}
+        {onNext && !isEditing && (
+          <button
+            type="button"
+            onClick={(event) => { event.stopPropagation(); onNext() }}
+            aria-label="Next video"
+            title="Next video (Right arrow)"
+            className="fixed right-4 md:right-7 top-1/2 -translate-y-1/2 z-[60] w-12 h-12 rounded-full border border-white/20 bg-black/65 backdrop-blur-md text-white flex items-center justify-center hover:bg-black/85 hover:border-white/40 transition-all shadow-xl"
+          >
+            <svg className="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M9 5l7 7-7 7" />
+            </svg>
+          </button>
+        )}
         <div
           className="bg-surface border border-border rounded-xl overflow-hidden max-w-[80vw] max-h-[90vh] flex flex-col shadow-2xl"
           onClick={e => e.stopPropagation()}
@@ -155,6 +203,11 @@ function VideoModal({ job, history = [], videoPrompt, sceneNumber, onClose, onRe
 
           {/* Info & actions */}
           <div className="p-4 border-t border-border">
+            {positionLabel && (
+              <p className="text-[10px] uppercase tracking-[0.16em] text-text-disabled mb-2">
+                {positionLabel}
+              </p>
+            )}
             <div className="flex items-center justify-between mb-2">
               <span className="text-sm font-semibold text-text-primary">Scene {String(sceneNumber).replace(/_(\d+)$/, (m, seg) => Number(seg) > 0 ? ` · shot ${Number(seg) + 1}` : '')}</span>
               <span className="text-xs text-text-disabled">{videoPrompt?.duration_seconds}s</span>

@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import {
   WINDOWS_VIDEO_PROVIDER,
   WINDOWS_VIDEO_API_ROUTES,
+  isPromptCompatibleWithVideoSettings,
   isWindowsVideoActive,
   mergeWindowsTasksIntoJobs,
   normalizeWindowsVideoStatus,
@@ -10,6 +11,20 @@ import {
   windowsVideoDisplayLabel,
   windowsVideoStateLabel,
 } from './windowsVideoWorker.js'
+
+test('Windows accepts an existing Gemini/Veo prompt without reauthoring it', () => {
+  const prompt = { video_model: 'veo-3.1-fast', duration_seconds: 8 }
+  assert.equal(isPromptCompatibleWithVideoSettings(prompt, {
+    videoGenerationBackend: 'windows-worker',
+    videoProvider: WINDOWS_VIDEO_PROVIDER,
+    videoModel: 'windows-default',
+  }), true)
+  assert.equal(isPromptCompatibleWithVideoSettings(prompt, {
+    videoGenerationBackend: 'hosted-provider',
+    videoProvider: 'geminigen',
+    videoModel: 'grok-3',
+  }), false)
+})
 
 test('publishes the ContentMachine backend API contract', () => {
   assert.equal(WINDOWS_VIDEO_API_ROUTES.generate, '/videos/windows/generate')

@@ -5,7 +5,9 @@ import fs from 'fs/promises'
 import { randomUUID } from 'crypto'
 import {
   buildWindowsPrompt,
+  cancelWindowsProject,
   mergeWindowsStateIntoProject,
+  missingWindowsUnits,
   queueWindowsUnits,
   readWindowsState,
   recoverBrokerProjectTasks,
@@ -24,6 +26,12 @@ test('Windows prompt preserves the full prompt and negative constraints without 
     'A precise human movement.\n\nAvoid: extra people, style drift',
   )
   assert.throws(() => buildWindowsPrompt({ full_prompt_string: 'x'.repeat(5001) }), /maximum is 5000/)
+})
+
+test('Windows prompt does not duplicate an already embedded negative block', () => {
+  const negative = 'extra figures, human skin, unstable edges'
+  const full = `One continuous documentary shot.\n\nAvoid: ${negative}.`
+  assert.equal(buildWindowsPrompt({ full_prompt_string: full, negative_prompt: negative }), full)
 })
 
 test('Windows snapshot uses the exact selected bytes, fixed adapter contract, and stable unit mapping', async () => {
@@ -111,8 +119,18 @@ test('Windows snapshot rejects oversized remote images before buffering the resp
   assert.equal(canceled, true)
 })
 
-const startFakeBroker = async ({ appliedFailures = 0 } = {}) => {
-  const seen = { headers: [], uploads: 0, tasks: new Map(), applied: 0, appliedFailures }
+const startFakeBroker = async ({ appliedFailures = 0, inputDelayMs = 0 } = {}) => {
+  const seen = {
+    headers: [],
+    uploads: 0,
+    tasks: new Map(),
+    taskRequests: [],
+    projectCancellations: [],
+    activeInputSessions: 0,
+    maxActiveInputSessions: 0,
+    applied: 0,
+    appliedFailures,
+  }
   const server = http.createServer(async (request, response) => {
     const pathname = new URL(request.url, 'http://127.0.0.1').pathname
     const chunks = []
@@ -130,6 +148,15 @@ const startFakeBroker = async ({ appliedFailures = 0 } = {}) => {
       response.writeHead(200); response.end(); return
     }
     if (pathname === '/api/media-producers/v1/inputs/session') {
+      seen.activeInputSessions += 1
+      seen.maxActiveInputSessions = Math.max(
+        seen.maxActiveInputSessions,
+        seen.activeInputSessions,
+      )
+      if (inputDelayMs) {
+        await new Promise((resolve) => setTimeout(resolve, inputDelayMs))
+      }
+      seen.activeInputSessions -= 1
       send({ method: 'PUT', objectKey: `media-jobs/v1/producer-inputs/content-machine/${body.projectId}/${body.itemId}/${body.sha256}.png`, uploadUrl: `http://127.0.0.1:${server.address().port}/upload`, requiredHeaders: { 'Content-Type': body.contentType, 'Content-Length': String(body.sizeBytes), 'x-amz-meta-sha256': body.sha256 }, expiresAt: new Date(Date.now() + 60_000).toISOString(), alreadyExists: false }); return
     }
     if (pathname === '/api/media-producers/v1/tasks' && request.method === 'POST') {
@@ -140,7 +167,21 @@ const startFakeBroker = async ({ appliedFailures = 0 } = {}) => {
         input: { prompt: body.prompt, image: { sha256: body.image.sha256, contentType: body.image.contentType }, settings: body.settings },
         attempt: 0, maxAttempts: 3, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
       }
+      seen.taskRequests.push(body)
       seen.tasks.set(id, task); send(task, 202); return
+    }
+    const projectCancelMatch = pathname.match(/^\/api\/media-producers\/v1\/projects\/([^/]+)\/cancel$/)
+    if (projectCancelMatch && request.method === 'POST') {
+      seen.projectCancellations.push({
+        projectId: decodeURIComponent(projectCancelMatch[1]),
+        body,
+      })
+      for (const task of seen.tasks.values()) {
+        if (task.owner.projectId !== decodeURIComponent(projectCancelMatch[1])) continue
+        task.cancelRequestedAt = new Date().toISOString()
+        if (task.status === 'queued') task.status = 'canceled'
+      }
+      send({ accepted: true }); return
     }
     if (pathname === '/api/media-producers/v1/tasks' && request.method === 'GET') {
       send({ tasks: [...seen.tasks.values()], pagination: { limit: 500, returned: seen.tasks.size, nextCursor: null } }); return
@@ -256,6 +297,81 @@ test('resuming a complete project is a clean no-op', async (t) => {
   const result = await resumeWindowsProject(sessionId, true)
   assert.deepEqual(result.queued, [])
   assert.equal(result.status.paused, false)
+})
+
+test('orphan repair preserves completed canonical videos from hosted providers', async (t) => {
+  const sessionId = `session_worker_hosted_${randomUUID().replaceAll('-', '')}`
+  t.after(() => fs.rm(sessionDirectory(sessionId), { recursive: true, force: true }))
+  await writeSessionSnapshot(sessionId, {
+    video_prompts: [
+      { scene_number: 1, segment_index: 0, full_prompt_string: 'Already complete' },
+      { scene_number: 2, segment_index: 0, full_prompt_string: 'Still missing' },
+    ],
+    video_jobs: {
+      '1_0': { status: 'completed', provider: 'geminigen', url: 'https://cdn.example/hosted.mp4' },
+      '2_0': { status: 'failed', provider: 'geminigen', error: 'Provider failed' },
+    },
+  })
+
+  assert.deepEqual(await missingWindowsUnits(sessionId), ['2_0'])
+})
+
+test('Content Machine queues four shots with project concurrency four and deletion cancels only that project', async (t) => {
+  const sessionId = `session_worker_parallel_${randomUUID().replaceAll('-', '')}`
+  const broker = await startFakeBroker({ inputDelayMs: 25 })
+  t.after(async () => {
+    await new Promise((resolve) => broker.server.close(resolve))
+    await fs.rm(sessionDirectory(sessionId), { recursive: true, force: true })
+  })
+  process.env.MEDIA_BROKER_URL = broker.url
+  process.env.MEDIA_BROKER_PRODUCER_TOKEN = 'test-producer-secret'
+  process.env.MEDIA_BROKER_PROJECT_CONCURRENCY = '4'
+  const unitIds = ['1_0', '2_0', '3_0', '4_0']
+  await writeSessionSnapshot(sessionId, {
+    selected_images: Object.fromEntries(unitIds.map((unitId) => [
+      unitId,
+      { url: `data:image/png;base64,${onePixelPng}` },
+    ])),
+    video_prompts: unitIds.map((unitId) => ({
+      scene_number: Number(unitId.split('_')[0]),
+      segment_index: 0,
+      full_prompt_string: `Motion for ${unitId}`,
+    })),
+    video_jobs: {},
+    selected_videos: {},
+  })
+
+  const queued = await queueWindowsUnits(sessionId, unitIds)
+  assert.equal(queued.filter((result) => !result.error).length, 4)
+  assert.equal(broker.seen.maxActiveInputSessions, 4)
+  assert.equal(broker.seen.taskRequests.length, 4)
+  assert.equal(
+    broker.seen.taskRequests.every((request) =>
+      request.projectConcurrency === 4
+      && request.owner.batchId === `content-machine:${sessionId}`
+    ),
+    true,
+  )
+
+  await cancelWindowsProject(sessionId, {
+    deleteAssets: true,
+    reason: 'Content Machine project deleted',
+  })
+  assert.deepEqual(broker.seen.projectCancellations, [{
+    projectId: sessionId,
+    body: {
+      deleteAssets: true,
+      reason: 'Content Machine project deleted',
+    },
+  }])
+  assert.equal(
+    [...broker.seen.tasks.values()].every((task) =>
+      task.owner.projectId === sessionId
+      && task.status === 'canceled'
+      && Boolean(task.cancelRequestedAt)
+    ),
+    true,
+  )
 })
 
 test('restart recovery adopts a broker task created before local persistence', async (t) => {

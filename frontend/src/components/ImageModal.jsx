@@ -5,7 +5,18 @@ import { motion } from 'framer-motion'
 // image:   current/latest { url, prompt, error, loading }
 // onSelect(url, prompt): called with the viewed version's data
 // onRegenerate(prompt): called with the viewed version's prompt (or edited)
-function ImageModal({ image, history = [], onClose, onRegenerate, onEditWithAI, onApplyEdit, onSelect }) {
+function ImageModal({
+  image,
+  history = [],
+  onClose,
+  onRegenerate,
+  onEditWithAI,
+  onApplyEdit,
+  onSelect,
+  onPrevious,
+  onNext,
+  positionLabel,
+}) {
   // Build full version list: history entries + current (latest)
   const allVersions = useMemo(() => {
     const current = image?.url ? [{ url: image.url, prompt: image.prompt }] : []
@@ -35,17 +46,30 @@ function ImageModal({ image, history = [], onClose, onRegenerate, onEditWithAI, 
   // Always start at latest when modal opens
   useEffect(() => {
     setViewIndex(allVersions.length - 1)
-  }, [allVersions.length])
+    setGeneratedOptions([])
+    setGeneratedIndex(0)
+    setIsEditing(false)
+  }, [allVersions.length, image?.url])
 
   useEffect(() => {
     const handleKeyDown = (e) => {
       if (e.key === 'Escape') onClose()
-      if (e.key === 'ArrowLeft')  setViewIndex(i => Math.max(0, i - 1))
-      if (e.key === 'ArrowRight') setViewIndex(i => Math.min(allVersions.length - 1, i + 1))
+      const tag = e.target?.tagName
+      const isInteractive = e.target?.isContentEditable
+        || ['INPUT', 'TEXTAREA', 'SELECT', 'BUTTON', 'VIDEO'].includes(tag)
+      if (isInteractive || isEditing || generatedOptions.length) return
+      if (e.key === 'ArrowLeft' && onPrevious) {
+        e.preventDefault()
+        onPrevious()
+      }
+      if (e.key === 'ArrowRight' && onNext) {
+        e.preventDefault()
+        onNext()
+      }
     }
     window.addEventListener('keydown', handleKeyDown)
     return () => window.removeEventListener('keydown', handleKeyDown)
-  }, [onClose, allVersions.length])
+  }, [onClose, onPrevious, onNext, isEditing, generatedOptions.length])
 
   const handleSelect = () => {
     if (generatedOptions.length && onApplyEdit) {
@@ -99,6 +123,32 @@ function ImageModal({ image, history = [], onClose, onRegenerate, onEditWithAI, 
         className="fixed inset-0 z-50 flex items-center justify-center p-8"
         onClick={onClose}
       >
+        {onPrevious && !isEditing && !generatedOptions.length && (
+          <button
+            type="button"
+            onClick={(event) => { event.stopPropagation(); onPrevious() }}
+            aria-label="Previous image"
+            title="Previous image (Left arrow)"
+            className="fixed left-4 md:left-7 top-1/2 -translate-y-1/2 z-[60] w-12 h-12 rounded-full border border-white/20 bg-black/65 backdrop-blur-md text-white flex items-center justify-center hover:bg-black/85 hover:border-white/40 transition-all shadow-xl"
+          >
+            <svg className="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M15 19l-7-7 7-7" />
+            </svg>
+          </button>
+        )}
+        {onNext && !isEditing && !generatedOptions.length && (
+          <button
+            type="button"
+            onClick={(event) => { event.stopPropagation(); onNext() }}
+            aria-label="Next image"
+            title="Next image (Right arrow)"
+            className="fixed right-4 md:right-7 top-1/2 -translate-y-1/2 z-[60] w-12 h-12 rounded-full border border-white/20 bg-black/65 backdrop-blur-md text-white flex items-center justify-center hover:bg-black/85 hover:border-white/40 transition-all shadow-xl"
+          >
+            <svg className="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M9 5l7 7-7 7" />
+            </svg>
+          </button>
+        )}
         <div
           className="bg-surface border border-border rounded-xl overflow-hidden max-w-4xl max-h-[90vh] flex flex-col shadow-2xl"
           onClick={e => e.stopPropagation()}
@@ -152,6 +202,11 @@ function ImageModal({ image, history = [], onClose, onRegenerate, onEditWithAI, 
 
           {/* Info & actions */}
           <div className="p-4 border-t border-border flex-shrink-0">
+            {positionLabel && (
+              <p className="text-[10px] uppercase tracking-[0.16em] text-text-disabled mb-2">
+                {positionLabel}
+              </p>
+            )}
             {generatedOptions.length ? (
               <div>
                 <div className="flex items-center justify-between gap-3 mb-3">

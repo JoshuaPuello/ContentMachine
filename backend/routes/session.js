@@ -23,13 +23,50 @@ import { startProxyBuild, jobStatus as proxyJobStatus } from '../lib/previewProx
 import { normalizeProjectImagePrompts } from '../lib/imagePromptQuality.js'
 import {
   OUTPUT_ROOT,
+  validSessionId,
   withSessionMutationLock,
 } from '../lib/sessionStore.js'
-import { mergeWindowsStateIntoProject, cancelWindowsProject } from '../lib/windowsVideo.js'
+import {
+  mergeWindowsStateIntoProject,
+  cancelWindowsProject,
+  forgetWindowsProject,
+} from '../lib/windowsVideo.js'
 
 const router = express.Router()
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
+const DELETED_SESSIONS_PATH = path.join(OUTPUT_ROOT, '.deleted-sessions.json')
+let deletedSessionsMutation = Promise.resolve()
 export { withSessionMutationLock } from '../lib/sessionStore.js'
+
+const readDeletedSessionIds = async () => {
+  try {
+    const parsed = JSON.parse(await fs.readFile(DELETED_SESSIONS_PATH, 'utf8'))
+    return new Set(Array.isArray(parsed?.sessionIds) ? parsed.sessionIds : [])
+  } catch (error) {
+    if (error.code === 'ENOENT') return new Set()
+    throw error
+  }
+}
+
+export const isSessionDeleted = async (sessionId) => (
+  (await readDeletedSessionIds()).has(sessionId)
+)
+
+export const markSessionDeleted = async (sessionId) => {
+  const mutation = deletedSessionsMutation.catch(() => {}).then(async () => {
+    const sessionIds = await readDeletedSessionIds()
+    sessionIds.add(sessionId)
+    const tmpPath = `${DELETED_SESSIONS_PATH}.tmp.${randomUUID()}`
+    await fs.mkdir(OUTPUT_ROOT, { recursive: true })
+    await fs.writeFile(tmpPath, JSON.stringify({
+      sessionIds: [...sessionIds].sort(),
+      updatedAt: new Date().toISOString(),
+    }, null, 2), 'utf8')
+    await fs.rename(tmpPath, DELETED_SESSIONS_PATH)
+  })
+  deletedSessionsMutation = mutation
+  return mutation
+}
 
 export const hasPopulatedProjectCore = (project) => Boolean(
   project?.story
@@ -281,6 +318,15 @@ router.post('/save', async (req, res) => {
     }
 
     await withSessionMutationLock(sessionId, async () => {
+    // A browser tab may still hold an autosave captured before deletion.
+    // A durable tombstone prevents that stale request from recreating the
+    // project directory after its local and R2 assets have been removed.
+    if (await isSessionDeleted(sessionId)) {
+      return res.status(410).json({
+        error: 'This project was deleted and cannot be restored by an older browser snapshot.',
+        code: 'SESSION_DELETED',
+      })
+    }
     const sessionDir = path.join(OUTPUT_ROOT, sessionId)
     await fs.mkdir(sessionDir, { recursive: true })
 
@@ -740,7 +786,12 @@ router.delete('/:id', async (req, res) => {
       const r2 = await deleteProjectAssetsFromR2(id)
       const renderWorkspacesDeleted = await deleteRenderWorkspacesForSession(id)
       const sessionDir = path.join(OUTPUT_ROOT, id)
+      // Persist the tombstone before removing the directory. Any already
+      // queued browser autosave will then receive 410 instead of resurrecting
+      // a deleted project with stale state.
+      await markSessionDeleted(id)
       await fs.rm(sessionDir, { recursive: true, force: true })
+      forgetWindowsProject(id)
       return { r2, renderWorkspacesDeleted }
     })
     res.json({

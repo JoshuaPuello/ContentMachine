@@ -1,5 +1,5 @@
 import { create } from 'zustand'
-import { persist } from 'zustand/middleware'
+import { createJSONStorage, persist } from 'zustand/middleware'
 import api from '../services/api'
 import { planSceneSegments, getClipOptions, unitKey, MIN_SEGMENT_SECONDS } from '../lib/segmentation'
 import { deriveBaseTimeline, applyDirectorPlan, buildNarrationSfxItems, newItemId, normalizeTimeline, trackOf } from '../lib/timeline'
@@ -35,13 +35,19 @@ import {
 } from '../lib/filmTreatment'
 import { buildBulkImageSelection } from '../lib/imageSelection'
 import {
+  compactPipelineState,
+  createQuotaResilientStorage,
+} from '../lib/projectPersistence'
+import {
   WINDOWS_VIDEO_MODEL,
   WINDOWS_VIDEO_PROVIDER,
+  isPromptCompatibleWithVideoSettings,
   isWindowsVideoActive,
   mergeWindowsTasksIntoJobs,
   normalizeWindowsVideoStatus,
   usesWindowsVideoBackend,
 } from '../lib/windowsVideoWorker'
+import { reconcileTimelineVideoSelections } from '../lib/videoSelectionTimeline'
 
 const emptyWindowsVideoStatus = () => ({
   paused: false,
@@ -88,6 +94,7 @@ const isProjectScopeCurrent = (get, scope) => (
 // from finishing after a newer one and rolling the project backwards.
 const sessionSaveSchedulers = new Map()
 const sessionWriteTokens = new Map()
+const abandonedSessionIds = new Set()
 // Three bounded Opus authoring attempts plus proof/final Remotion renders.
 // The backend emits live authoring/render progress throughout this window.
 // Three ten-minute executor ceilings plus optional ideation/review/rendering.
@@ -114,6 +121,11 @@ const drainSessionSaves = async (sessionId, scheduler) => {
     while (scheduler.pending) {
       const pending = scheduler.pending
       scheduler.pending = null
+      if (abandonedSessionIds.has(sessionId)) {
+        const error = new Error('Project was deleted')
+        pending.waiters.forEach(({ reject }) => reject(error))
+        continue
+      }
       try {
         const latestToken = sessionWriteTokens.get(sessionId)
         const payload = {
@@ -138,6 +150,9 @@ const drainSessionSaves = async (sessionId, scheduler) => {
 }
 
 const enqueueSessionSave = (sessionId, snapshot, initialToken) => {
+  if (abandonedSessionIds.has(sessionId)) {
+    return Promise.reject(new Error('Project was deleted'))
+  }
   if (!sessionWriteTokens.has(sessionId) && initialToken) {
     sessionWriteTokens.set(sessionId, initialToken)
   }
@@ -157,6 +172,19 @@ const enqueueSessionSave = (sessionId, snapshot, initialToken) => {
     }
     void drainSessionSaves(sessionId, scheduler)
   })
+}
+
+const abandonSessionSaves = (sessionId) => {
+  if (!sessionId) return
+  abandonedSessionIds.add(sessionId)
+  sessionWriteTokens.delete(sessionId)
+  const scheduler = sessionSaveSchedulers.get(sessionId)
+  if (scheduler?.pending) {
+    const error = new Error('Project was deleted')
+    scheduler.pending.waiters.forEach(({ reject }) => reject(error))
+    scheduler.pending = null
+  }
+  sessionSaveSchedulers.delete(sessionId)
 }
 
 // Convert any image URL to a base64 data URI so it survives in the saved JSON
@@ -288,15 +316,15 @@ export const usePipelineStore = create(
         imageModel: 'fal-ai/flux-pro',
         claudeProvider: 'fal',
         claudeModel: 'claude-3-5-sonnet',
-        videoProvider: 'fal',
-        videoModel: 'lightricks/ltx-2-pro',
-        videoGenerationBackend: 'hosted-provider',
+        videoProvider: WINDOWS_VIDEO_PROVIDER,
+        videoModel: WINDOWS_VIDEO_MODEL,
+        videoGenerationBackend: 'windows-worker',
         videoResolution: '1080p',
         aspectRatio: '16:9',
         audioMode: 'manual',
         // ── Segmentation knobs ──
         // Max clip length to request from the video model (null = model default/max)
-        videoClipDuration: null,
+        videoClipDuration: 8,
         // Minimum playback rate when stretching a clip over longer audio
         // (0.8 = clip may be slowed to 80% speed; 1 = never slow down)
         videoSpeedFactor: 0.8,
@@ -2381,7 +2409,9 @@ export const usePipelineStore = create(
         ) {
           throw new Error('These motion prompts predate the Seedance continuity safeguards. Regenerate Video Prompts before submitting new video jobs.')
         }
-        const mismatchedPrompt = videoPrompts.find(prompt => prompt.video_model && prompt.video_model !== settings.videoModel)
+        const mismatchedPrompt = videoPrompts.find(prompt =>
+          !isPromptCompatibleWithVideoSettings(prompt, settings)
+        )
         if (mismatchedPrompt) {
           throw new Error(`Motion prompts were authored for ${mismatchedPrompt.video_model}, but ${settings.videoModel} is selected. Regenerate Video Prompts so shot timing and motion match the active model.`)
         }
@@ -2433,6 +2463,8 @@ export const usePipelineStore = create(
         }
 
         if (usesWindowsVideoBackend(settings)) {
+          // scene_number is already the opaque composite unit ID ("12_1")
+          // created above. Appending another segment would queue "12_1_0".
           const unitIds = scenesToProcess.map(scene => String(scene.scene_number))
           const allUnitKeys = videoPrompts.map(vp =>
             unitKey(vp.scene_number, vp.segment_index ?? 0)
@@ -2472,6 +2504,28 @@ export const usePipelineStore = create(
             await get().autoSaveSession()
             const response = await api.generateWindowsVideos(scope.sessionId, unitIds, get().sessionWriteToken)
             if (!isProjectScopeCurrent(get, scope)) return []
+            const queueErrors = (response.results || []).filter(result => result?.error)
+            if (queueErrors.length > 0) {
+              const messages = queueErrors.map(result =>
+                `${result.unitId}: ${result.error.message || 'Queue failed'}`
+              )
+              set(state => ({
+                videoJobs: {
+                  ...state.videoJobs,
+                  ...Object.fromEntries(queueErrors.map(result => [
+                    result.unitId,
+                    {
+                      ...state.videoJobs[result.unitId],
+                      provider: WINDOWS_VIDEO_PROVIDER,
+                      status: 'failed',
+                      error: result.error.message || 'Queue failed',
+                    },
+                  ])),
+                },
+              }))
+              get().logActivity(`Windows queue rejected ${queueErrors.length} shot${queueErrors.length === 1 ? '' : 's'}: ${messages.join('; ')}`, 'error')
+              if (queueErrors.length === response.results.length) throw new Error(messages.join('; '))
+            }
             const snapshot = normalizeWindowsVideoStatus(response)
             if (snapshot.tasks.length > 0) {
               set(state => ({
@@ -2758,6 +2812,29 @@ export const usePipelineStore = create(
         if (requested.length === 0) return null
         const response = await api.retryMissingWindowsVideos(scope.sessionId, requested, get().sessionWriteToken)
         if (!isProjectScopeCurrent(get, scope)) return null
+        const queueErrors = (response.results || []).filter(result => result?.error)
+        const queuedResults = (response.results || []).filter(result => !result?.error)
+        if (queueErrors.length > 0) {
+          const messages = queueErrors.map(result =>
+            `${result.unitId}: ${result.error.message || 'Queue failed'}`
+          )
+          set(state => ({
+            videoJobs: {
+              ...state.videoJobs,
+              ...Object.fromEntries(queueErrors.map(result => [
+                result.unitId,
+                {
+                  ...state.videoJobs[result.unitId],
+                  provider: WINDOWS_VIDEO_PROVIDER,
+                  status: 'failed',
+                  error: result.error.message || 'Queue failed',
+                },
+              ])),
+            },
+          }))
+          get().logActivity(`Windows retry rejected ${queueErrors.length} shot${queueErrors.length === 1 ? '' : 's'}: ${messages.join('; ')}`, 'error')
+          if (queuedResults.length === 0) throw new Error(messages.join('; '))
+        }
         const snapshot = normalizeWindowsVideoStatus(response)
         set(state => ({
           generationState: 'running',
@@ -2960,8 +3037,8 @@ export const usePipelineStore = create(
         )
 
         if (job?.url) {
-          set((state) => ({
-            selectedVideos: {
+          set((state) => {
+            const selectedVideos = {
               ...state.selectedVideos,
               [unitId]: {
                 url: job.url,
@@ -2973,7 +3050,18 @@ export const usePipelineStore = create(
                 segment_index: segIdx || 0,
               }
             }
-          }))
+            const timelineItems = state.timeline?.built
+              ? reconcileTimelineVideoSelections(state.timeline.items, selectedVideos)
+              : state.timeline?.items
+            return {
+              selectedVideos,
+              ...(state.timeline?.built && timelineItems !== state.timeline.items ? {
+                timeline: { ...state.timeline, items: timelineItems },
+                timelineDirty: true,
+              } : {}),
+            }
+          })
+          void get().autoSaveSession()
         }
       },
 
@@ -2992,8 +3080,8 @@ export const usePipelineStore = create(
           v.scene_number === sceneNum && (v.segment_index ?? 0) === (segIdx || 0)
         )
         if (url) {
-          set((state) => ({
-            selectedVideos: {
+          set((state) => {
+            const selectedVideos = {
               ...state.selectedVideos,
               [unitId]: {
                 url,
@@ -3005,7 +3093,18 @@ export const usePipelineStore = create(
                 segment_index: segIdx || 0,
               }
             }
-          }))
+            const timelineItems = state.timeline?.built
+              ? reconcileTimelineVideoSelections(state.timeline.items, selectedVideos)
+              : state.timeline?.items
+            return {
+              selectedVideos,
+              ...(state.timeline?.built && timelineItems !== state.timeline.items ? {
+                timeline: { ...state.timeline, items: timelineItems },
+                timelineDirty: true,
+              } : {}),
+            }
+          })
+          void get().autoSaveSession()
         }
       },
 
@@ -3031,7 +3130,7 @@ export const usePipelineStore = create(
         ) {
           throw new Error('Regenerate this scene\'s Video Prompt first so the Seedance identity and style locks are applied.')
         }
-        if (vp.video_model && vp.video_model !== settings.videoModel) {
+        if (!isPromptCompatibleWithVideoSettings(vp, settings)) {
           throw new Error(`This prompt targets ${vp.video_model}; regenerate it for ${settings.videoModel} before creating another video.`)
         }
         const prompt = newPrompt
@@ -4681,11 +4780,25 @@ export const usePipelineStore = create(
 
       renderFilm: async () => {
         const scope = captureProjectScope(get)
-        const { timeline, settings, selectedStory, selectedTitle } = get()
+        const { timeline, settings, selectedStory, selectedTitle, selectedVideos } = get()
         if (!timeline.built || !timeline.items.length) {
           throw new Error('Build the timeline in the Editor first')
         }
-        const normalized = normalizeTimeline(timeline.items)
+        // The timeline may have been built before a shot was regenerated and
+        // re-selected. Reconcile again at the render boundary so an old MP4
+        // can never leak into the final film even if the editor stayed open.
+        const currentTimelineItems = reconcileTimelineVideoSelections(
+          timeline.items,
+          selectedVideos,
+        )
+        if (currentTimelineItems !== timeline.items) {
+          set({
+            timeline: { ...timeline, items: currentTimelineItems },
+            timelineDirty: true,
+          })
+          void get().autoSaveSession()
+        }
+        const normalized = normalizeTimeline(currentTimelineItems)
         // Maps still rendering/failed have no video yet — render without them
         const items = normalized.filter(it => it.kind !== 'map' || it.payload?.src)
         if (items.length < normalized.length) {
@@ -4803,6 +4916,7 @@ export const usePipelineStore = create(
               built: project.timeline.built !== false,
             }
           : { items: [], sceneWindows: {}, directorPlan: null, chapters: null, built: false }
+        let timelineSelectionRepaired = false
         if (loadedTimeline.built) {
           const narrationSfx = buildNarrationSfxItems({
             ttsScript: loadedTtsScript,
@@ -4817,6 +4931,14 @@ export const usePipelineStore = create(
               ...loadedTimeline.items.filter(item => item.payload?.source !== 'narration-cue'),
               ...narrationSfx,
             ],
+          }
+          const reconciledItems = reconcileTimelineVideoSelections(
+            loadedTimeline.items,
+            selectedVideos,
+          )
+          timelineSelectionRepaired = reconciledItems !== loadedTimeline.items
+          if (timelineSelectionRepaired) {
+            loadedTimeline = { ...loadedTimeline, items: reconciledItems }
           }
         }
 
@@ -4876,7 +4998,7 @@ export const usePipelineStore = create(
           })(),
           // Studio timeline — version-tolerant: older projects have none
           timeline: loadedTimeline,
-          timelineDirty: false,
+          timelineDirty: timelineSelectionRepaired,
           timelineHistory: { past: [], future: [] },
           renderJob: null,
           renderHistory: [],
@@ -5094,17 +5216,15 @@ export const usePipelineStore = create(
       restoreSessionAssets: async () => {
         const sessionId = getSessionId()
         try {
-          const raw = await api.loadSession(sessionId, { force: true, optional: true }).catch(() => null)
+          const raw = await api.loadSession(sessionId, { force: true, optional: true })
           // Ignore a mount-time response if the user opened another project
           // while this request was in flight.
           if (getSessionId() !== sessionId) return
           if (!raw) {
-            if (get().activeSessionId !== sessionId) get().clearProject()
-            set({
-              activeSessionId: sessionId,
-              sessionRestoreDone: true,
-              sessionWriteToken: null,
-            })
+            // The persisted browser session no longer exists (most commonly
+            // because it was deleted in this or another tab). Do not retain
+            // its project data or allow a delayed autosave to recreate it.
+            get().discardDeletedProject(sessionId)
             return
           }
           const project = migrateProjectToSegments(raw)
@@ -5243,8 +5363,42 @@ export const usePipelineStore = create(
           activeSessionId: newId,
           imageBatches: [],
           projectName: null,
+          settings: {
+            ...get().settings,
+            videoProvider: WINDOWS_VIDEO_PROVIDER,
+            videoModel: WINDOWS_VIDEO_MODEL,
+            videoGenerationBackend: 'windows-worker',
+            videoClipDuration: 8,
+            aspectRatio: '16:9',
+          },
           // The fresh session has nothing to restore — unblock auto-save so
           // the new project starts persisting immediately
+          sessionRestoreDone: true,
+          sessionWriteToken: null,
+        })
+        return newId
+      },
+
+      // Move the browser off a deleted/missing project without saving its
+      // stale snapshot. The backend tombstone is the final race barrier; this
+      // reset also makes route guards leave pages such as /videos immediately.
+      discardDeletedProject: (sessionId = getSessionId()) => {
+        abandonSessionSaves(sessionId)
+        const newId = generateSessionId()
+        sessionStorage.setItem('pipeline_session_id', newId)
+        get().clearProject()
+        set({
+          activeSessionId: newId,
+          imageBatches: [],
+          projectName: null,
+          settings: {
+            ...get().settings,
+            videoProvider: WINDOWS_VIDEO_PROVIDER,
+            videoModel: WINDOWS_VIDEO_MODEL,
+            videoGenerationBackend: 'windows-worker',
+            videoClipDuration: 8,
+            aspectRatio: '16:9',
+          },
           sessionRestoreDone: true,
           sessionWriteToken: null,
         })
@@ -5396,106 +5550,8 @@ export const usePipelineStore = create(
     {
       name: 'content-pipeline-state-v6',
       version: 6,
-      partialize: (state) => ({
-        settings: state.settings,
-        activeSessionId: state.activeSessionId,
-        sessionWriteToken: state.sessionWriteToken,
-        projectName: state.projectName,
-        topic: state.topic,
-        maxMinutes: state.maxMinutes,
-        storyInputMode: state.storyInputMode,
-        storyTitle: state.storyTitle,
-        storyContext: state.storyContext,
-        suppliedVoiceover: state.suppliedVoiceover,
-        stories: state.stories,
-        selectedStory: state.selectedStory,
-        scenePlan: state.scenePlan,
-        scenes: state.scenes,
-        sceneSegments: state.sceneSegments,
-        characters: state.characters.map(character => ({
-          ...character,
-          image: character.image?.startsWith?.('data:') ? null : character.image,
-          image_options: (character.image_options || []).map(option => ({
-            ...option,
-            url: option.url?.startsWith?.('data:') ? null : option.url,
-          })),
-        })),
-        characterSceneLinks: state.characterSceneLinks,
-        characterAudit: state.characterAudit,
-        characterStatus: state.characterStatus,
-        expressiveScript: state.expressiveScript,
-        // images/thumbnails/selectedImages are NOT persisted — base64 blobs blow out localStorage
-        // Use project export/import to save them to a file instead
-        // Persist only prompt+index from selectedImages (not the base64 URL)
-        selectedImages: Object.fromEntries(
-          Object.entries(state.selectedImages).map(([k, v]) => [k, { prompt: v.prompt, promptIndex: v.promptIndex }])
-        ),
-        videoPrompts: state.videoPrompts,
-        videoJobs: state.videoJobs,              // persist job IDs so polling can resume
-        windowsVideoStatus: state.windowsVideoStatus,
-        selectedVideos: state.selectedVideos,
-        ttsScript: state.ttsScript,
-        youtubeMetadata: state.youtubeMetadata,
-        selectedTitle: state.selectedTitle,
-        selectedThumbnail: state.selectedThumbnail,
-        thumbnailPrompts: state.thumbnailPrompts,
-        imageProgress: state.imageProgress,
-        videoProgress: state.videoProgress,
-        // A browser refresh destroys the async worker. Rehydrate every active
-        // run as paused (never "running") so work cannot restart implicitly,
-        // while preserving the phase needed by the Resume control.
-        generationState:
-          state.generationState === 'running' || state.generationState === 'paused'
-            ? 'paused'
-            : state.generationState,
-        generationPhase: state.generationPhase,
-        imageBatches: state.imageBatches,
-        videoBatches: state.videoBatches,
-        // Studio timeline — persisted with heavy chapter portrait data URIs
-        // stripped (they restore from the backend session save)
-        timeline: (() => {
-          const stripChapter = (c) =>
-            c?.image?.startsWith?.('data:') ? { ...c, image: null, stripped: true } : c
-          return {
-            built: state.timeline.built,
-            sceneWindows: state.timeline.sceneWindows,
-            directorPlan: state.timeline.directorPlan,
-            chapters: state.timeline.chapters
-              ? state.timeline.chapters.map(stripChapter)
-              : null,
-            items: state.timeline.items.map(it =>
-              (it.kind === 'chapter-reveal' || it.kind === 'chapter-active') && it.payload?.chapters
-                ? { ...it, payload: { ...it.payload, chapters: it.payload.chapters.map(stripChapter) } }
-                : it
-            ),
-          }
-        })(),
-        customPrompts: state.customPrompts,
-        includeThumbnail: state.includeThumbnail,
-        includeMetadata: state.includeMetadata,
-        // Audio entries are small server URLs now (never base64), so the
-        // audio step survives refreshes via localStorage directly.
-        // Safety net: strip any base64 blob that sneaks in — one oversized
-        // write would silently kill ALL localStorage persistence.
-        audio: {
-          sceneAudio: Object.fromEntries(
-            Object.entries(state.audio.sceneAudio || {}).map(([k, v]) => [k, !v?.parts ? v : {
-              ...v,
-              parts: v.parts.map(p =>
-                p?.content?.startsWith?.('data:') ? { ...p, content: null, stripped: true } : p
-              )
-            }])
-          ),
-          sfxAudio: Object.fromEntries(
-            Object.entries(state.audio.sfxAudio || {}).map(([k, v]) => [k,
-              v?.audio?.startsWith?.('data:') ? { ...v, audio: null, stripped: true } : v
-            ])
-          ),
-          fullAudio: state.audio.fullAudio?.dataUri
-            ? { ...state.audio.fullAudio, dataUri: undefined }
-            : state.audio.fullAudio,
-        },
-      })
+      storage: createJSONStorage(() => createQuotaResilientStorage(localStorage)),
+      partialize: compactPipelineState,
     }
   )
 )

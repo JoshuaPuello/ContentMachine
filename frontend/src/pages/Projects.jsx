@@ -192,7 +192,7 @@ function Projects() {
   const [sessions, setSessions] = useState([])
   const [loading, setLoading] = useState(true)
   const [creating, setCreating] = useState(false)
-  const { startNewProject, openProject, renameProject } = usePipelineStore()
+  const { startNewProject, openProject, renameProject, discardDeletedProject } = usePipelineStore()
 
   const currentId = sessionStorage.getItem('pipeline_session_id')
 
@@ -255,6 +255,7 @@ function Projects() {
   const handleDelete = async (id) => {
     try {
       await api.deleteSession(id)
+      if (id === currentId) discardDeletedProject(id)
       setSessions(prev => prev.filter(s => s.id !== id))
       toast.success('Project deleted')
     } catch (error) {

@@ -2,6 +2,7 @@ import { useState, useRef, useEffect } from 'react'
 import { useNavigate, useLocation } from 'react-router-dom'
 import { motion, AnimatePresence } from 'framer-motion'
 import { usePipelineStore } from '../store/pipelineStore'
+import { usesWindowsVideoBackend } from '../lib/windowsVideoWorker'
 import api from '../services/api'
 import toast from 'react-hot-toast'
 import ActivityFeed from './ActivityFeed'
@@ -106,13 +107,18 @@ function Layout({ children }) {
     videoProgress,
     videoPrompts,
     videoJobs,
+    settings,
     pauseGeneration,
     resumeGeneration,
     stopGeneration,
     resumeImageGeneration,
     resumeVideoGeneration,
+    pauseWindowsVideoGeneration,
+    resumeWindowsVideoGeneration,
+    cancelWindowsVideoGeneration,
     loadProject,
     autoSaveSession,
+    discardDeletedProject,
   } = usePipelineStore()
 
   // 60s auto-save fallback — catches anything not covered by event triggers
@@ -132,6 +138,7 @@ function Layout({ children }) {
     const job = videoJobs[`${prompt.scene_number}_${prompt.segment_index ?? 0}`]
     return !['completed', 'failed'].includes(job?.status)
   })
+  const isWindowsVideoRun = generationPhase === 'videos' && usesWindowsVideoBackend(settings)
 
   // Progress label shown in header when active
   const progressLabel = (() => {
@@ -151,13 +158,37 @@ function Layout({ children }) {
   })()
 
   const handleResume = () => {
-    if (generationPhase === 'images' && hasPendingImages) {
+    if (isWindowsVideoRun) {
+      resumeWindowsVideoGeneration().catch(error => {
+        toast.error(`Resume failed: ${error.message}`)
+      })
+    } else if (generationPhase === 'images' && hasPendingImages) {
       resumeImageGeneration()
     } else if (generationPhase === 'videos' && hasPendingVideos) {
       resumeVideoGeneration()
     } else {
       resumeGeneration()
     }
+  }
+
+  const handlePause = () => {
+    if (isWindowsVideoRun) {
+      pauseWindowsVideoGeneration().catch(error => {
+        toast.error(`Pause failed: ${error.message}`)
+      })
+      return
+    }
+    pauseGeneration()
+  }
+
+  const handleStop = () => {
+    if (isWindowsVideoRun) {
+      cancelWindowsVideoGeneration().catch(error => {
+        toast.error(`Stop failed: ${error.message}`)
+      })
+      return
+    }
+    stopGeneration()
   }
 
   const currentStepIndex = steps.findIndex(s => s.path === location.pathname)
@@ -210,6 +241,10 @@ function Layout({ children }) {
     e.stopPropagation()
     try {
       await api.deleteSession(sessionId)
+      if (sessionId === sessionStorage.getItem('pipeline_session_id')) {
+        discardDeletedProject(sessionId)
+        navigate('/projects')
+      }
       setSessions(prev => prev.filter(s => s.id !== sessionId))
       toast.success('Session deleted')
     } catch (error) {
@@ -299,7 +334,7 @@ function Layout({ children }) {
                   </button>
                 ) : (
                   <button
-                    onClick={pauseGeneration}
+                    onClick={handlePause}
                     title="Pause generation"
                     className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-md bg-warning/15 text-warning border border-warning/30 text-xs font-medium hover:bg-warning/25 transition-colors"
                   >
@@ -310,7 +345,7 @@ function Layout({ children }) {
                   </button>
                 )}
                 <button
-                  onClick={stopGeneration}
+                  onClick={handleStop}
                   title="Stop generation"
                   className="w-7 h-7 flex items-center justify-center rounded-md bg-error/10 text-error border border-error/20 hover:bg-error/20 transition-colors"
                 >

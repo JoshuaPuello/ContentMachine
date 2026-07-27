@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useMemo, useRef } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { motion, AnimatePresence } from 'framer-motion'
 import { usePipelineStore } from '../store/pipelineStore'
@@ -9,6 +9,10 @@ import {
   areAllSelectableImageUnitsSelected,
   selectableImageUnitCount,
 } from '../lib/imageSelection'
+import {
+  adjacentPreviewItems,
+  buildImagePreviewItems,
+} from '../lib/mediaPreviewNavigation'
 import toast from 'react-hot-toast'
 
 // Derive human-readable duration range from the selected video model
@@ -320,6 +324,31 @@ function SceneImages() {
   useEffect(() => {
     setCurrentPage(0)
   }, [firstSceneNumber])
+
+  const imagePreviewItems = useMemo(
+    () => buildImagePreviewItems(scenes, images, imageHistory),
+    [scenes, images, imageHistory]
+  )
+  const selectedImageNavigation = selectedModal
+    ? adjacentPreviewItems(
+        imagePreviewItems,
+        `${selectedModal.sceneNumber}_${selectedModal.segmentIndex ?? 0}_${selectedModal.promptIndex}`,
+        item => item.id
+      )
+    : { previous: null, next: null, position: 0, total: imagePreviewItems.length }
+  const navigateToImagePreview = (item) => {
+    if (!item) return
+    setSelectedModal({
+      sceneNumber: item.sceneNumber,
+      segmentIndex: item.segmentIndex,
+      promptIndex: item.promptIndex,
+    })
+    const sceneIndex = scenes.findIndex(scene =>
+      scene.scene_number === item.sceneNumber
+      && (scene.segment_index ?? 0) === item.segmentIndex
+    )
+    if (isPaginated && sceneIndex >= 0) setCurrentPage(Math.floor(sceneIndex / SCENES_PER_PAGE))
+  }
 
   const pageVariants = {
     initial: { opacity: 0, y: 8 },
@@ -1057,6 +1086,13 @@ function SceneImages() {
               option
             )}
             onSelect={(url, prompt) => selectImage(selectedModal.sceneNumber, selectedModal.segmentIndex ?? 0, selectedModal.promptIndex, url, prompt)}
+            onPrevious={selectedImageNavigation.previous
+              ? () => navigateToImagePreview(selectedImageNavigation.previous)
+              : undefined}
+            onNext={selectedImageNavigation.next
+              ? () => navigateToImagePreview(selectedImageNavigation.next)
+              : undefined}
+            positionLabel={`Image ${selectedImageNavigation.position} of ${selectedImageNavigation.total}`}
           />
         )}
       </AnimatePresence>

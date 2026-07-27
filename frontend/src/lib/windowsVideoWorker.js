@@ -17,6 +17,16 @@ export const usesWindowsVideoBackend = (settings = {}) =>
     && settings.videoProvider === WINDOWS_VIDEO_PROVIDER
   )
 
+// Prompt provenance is advisory for the shared Windows/Veo route. The worker
+// consumes the immutable full prompt and fixed Windows settings; it does not
+// require the prompt to have been authored while "windows-default" was
+// selected. Hosted providers retain their stricter model-specific gate.
+export const isPromptCompatibleWithVideoSettings = (prompt = {}, settings = {}) => (
+  usesWindowsVideoBackend(settings)
+  || !prompt.video_model
+  || prompt.video_model === settings.videoModel
+)
+
 export const WINDOWS_VIDEO_STATES = Object.freeze([
   'queued',
   'leased',

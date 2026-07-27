@@ -25,10 +25,16 @@ export const WINDOWS_SETTINGS = Object.freeze({
 const ACTIVE_STATUSES = new Set(['queued', 'leased', 'generating', 'uploading', 'validating'])
 const TERMINAL_STATUSES = new Set(['completed', 'failed', 'canceled', 'superseded'])
 const MAX_INPUT_IMAGE_BYTES = 50 * 1024 * 1024
+const windowsProjectConcurrency = () =>
+  Math.min(4, Math.max(1, Number(process.env.MEDIA_BROKER_PROJECT_CONCURRENCY) || 4))
 const stateFile = (sessionId) => path.join(sessionDirectory(sessionId), 'media-worker-state.json')
 const activeProjects = new Set()
 let reconcileTimer = null
 let reconciling = false
+
+export const forgetWindowsProject = (sessionId) => {
+  activeProjects.delete(sessionId)
+}
 
 const emptyState = () => ({
   version: 1,
@@ -255,7 +261,14 @@ export const buildWindowsPrompt = (prompt) => {
   const full = String(prompt?.full_prompt_string || prompt?.video_prompt || prompt?.prompt || '').trim()
   if (!full) throw new Error('The shot has no complete motion prompt')
   const negative = String(prompt?.negative_prompt || '').trim()
-  const combined = negative ? `${full}\n\nAvoid: ${negative}` : full
+  // Prompt authoring already embeds the negative block in many
+  // full_prompt_string values. Appending it a second time wastes Veo's strict
+  // 5,000-character budget and can reject an otherwise valid prompt. Preserve
+  // every constraint, but include an identical block only once.
+  const negativeBlock = negative ? `Avoid: ${negative}` : ''
+  const combined = negativeBlock && !full.includes(negativeBlock)
+    ? `${full}\n\n${negativeBlock}`
+    : full
   if (combined.length > 5000) throw new Error(`Windows/Veo prompt is ${combined.length} characters; maximum is 5000`)
   return combined
 }
@@ -315,8 +328,25 @@ const taskRequest = (sessionId, unitId, snapshot, objectKey) => ({
   settings: snapshot.settings,
   priority: 0,
   maxAttempts: 3,
-  projectConcurrency: Math.min(4, Math.max(1, Number(process.env.MEDIA_BROKER_PROJECT_CONCURRENCY) || 4)),
+  projectConcurrency: windowsProjectConcurrency(),
 })
+
+const mapWithConcurrency = async (items, concurrency, operation) => {
+  const results = new Array(items.length)
+  let cursor = 0
+  const workers = Array.from(
+    { length: Math.min(concurrency, items.length) },
+    async () => {
+      while (cursor < items.length) {
+        const index = cursor
+        cursor += 1
+        results[index] = await operation(items[index], index)
+      }
+    },
+  )
+  await Promise.all(workers)
+  return results
+}
 
 const producerTaskMapsToProject = (sessionId, unitId, task, snapshot) => {
   const owner = task?.owner || {}
@@ -395,10 +425,13 @@ export const queueWindowsUnits = async (sessionId, requestedUnitIds) => {
   const required = new Set((project.video_prompts || []).map(unitIdForPrompt))
   const unitIds = [...new Set(requestedUnitIds || [])]
   if (unitIds.length === 0 || unitIds.length > 100) throw new Error('unitIds must contain 1-100 shots')
-  const results = []
-  for (const unitId of unitIds) {
+  return mapWithConcurrency(unitIds, windowsProjectConcurrency(), async (unitId) => {
     try {
       if (!required.has(unitId)) throw new Error(`Unknown video unit ${unitId}`)
+      const canonicalVideo = project.video_jobs?.[unitId]
+      if (canonicalVideo?.status === 'completed' && canonicalVideo?.url) {
+        return { unitId, reused: true, completed: true, task: resolvedJob(canonicalVideo) }
+      }
       const existing = state.jobs?.[unitId]
       const snapshot = await snapshotWindowsInput(project, sessionId, unitId)
       const sameInputs = existing
@@ -406,18 +439,16 @@ export const queueWindowsUnits = async (sessionId, requestedUnitIds) => {
         && snapshot.prompt === existing.promptSnapshot
         && JSON.stringify(snapshot.settings) === JSON.stringify(existing.settingsSnapshot)
       if (sameInputs && (existing.status === 'completed' || (ACTIVE_STATUSES.has(existing.status) && !existing.cancelRequestedAt))) {
-        results.push({ unitId, reused: true, task: resolvedJob(existing) })
-        continue
+        return { unitId, reused: true, task: resolvedJob(existing) }
       }
       const objectKey = await uploadSnapshot(sessionId, unitId, snapshot)
       const task = await mediaBroker.enqueue(taskRequest(sessionId, unitId, snapshot, objectKey))
       await persistQueued(sessionId, unitId, task, snapshot, objectKey)
-      results.push({ unitId, reused: Boolean(task.reused), task })
+      return { unitId, reused: Boolean(task.reused), task }
     } catch (error) {
-      results.push({ unitId, error: { code: error.code || 'QUEUE_FAILED', message: error.message, retryable: error.retryable !== false } })
+      return { unitId, error: { code: error.code || 'QUEUE_FAILED', message: error.message, retryable: error.retryable !== false } }
     }
-  }
-  return results
+  })
 }
 
 const currentSnapshotMatches = async (project, sessionId, unitId, job) => {
@@ -677,7 +708,13 @@ export const windowsStatus = async (sessionId, reconcile = true) => {
     const required = (project.video_prompts || []).map(unitIdForPrompt)
     status.counts.required = required.length
     status.counts.selected = required.filter((unitId) => project.selected_videos?.[unitId]?.url).length
+    status.counts.completed = required.filter((unitId) => {
+      const canonicalVideo = project.video_jobs?.[unitId]
+      return canonicalVideo?.status === 'completed' && Boolean(canonicalVideo.url)
+    }).length
     status.counts.missing = required.filter((unitId) => {
+      const canonicalVideo = project.video_jobs?.[unitId]
+      if (canonicalVideo?.status === 'completed' && canonicalVideo?.url) return false
       const job = status.jobs[unitId]
       return !job || ['failed', 'canceled', 'superseded'].includes(job.status)
     }).length
@@ -761,6 +798,8 @@ export const missingWindowsUnits = async (sessionId) => {
   const state = await readWindowsState(sessionId)
   const required = (project.video_prompts || []).map(unitIdForPrompt)
   return required.filter((unitId) => {
+    const canonicalVideo = project.video_jobs?.[unitId]
+    if (canonicalVideo?.status === 'completed' && canonicalVideo?.url) return false
     const job = state.jobs[unitId]
     return !job || Boolean(job.cancelRequestedAt) || (!ACTIVE_STATUSES.has(job.status) && job.status !== 'completed')
   })
