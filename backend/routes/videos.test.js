@@ -1,9 +1,11 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import {
+  applySubmissionLedgerEntry,
   buildFalInput,
   buildReplicateInput,
   requireHttpsImageUrl,
+  selectedImageReferenceFromProject,
   validateVideoSubmission,
 } from './videos.js'
 
@@ -83,6 +85,64 @@ test('rejects facialization and invented entities in an edited creative section'
     }).join(' ')
     assert.match(issues, /unsafe identity\/entity drift/i, `Expected rejection for: ${unsafe}`)
   }
+})
+
+test('does not treat narration or prior-frame context as a new motion instruction', () => {
+  const contextualPrompt = protectedPrompt
+    .replace(
+      'The subject turns the wrench.',
+      'The subject turns the wrench.\nNarration covered by this clip: Earlier, she smiled for the camera.\nPrevious selected-frame reference: a faint smile suggested by the pose.'
+    )
+  assert.deepEqual(validateVideoSubmission({
+    ...validScene,
+    video_prompt: contextualPrompt,
+  }), [])
+})
+
+test('restores a durable selected image reference from the project session', () => {
+  const project = {
+    selected_images: {
+      '34_0': {
+        promptIndex: 0,
+        url: '__session_file__/images/selected/scene_34.jpg',
+      },
+    },
+  }
+  assert.equal(
+    selectedImageReferenceFromProject(project, '34_0', 'session_safe'),
+    '/api/session/session_safe/files/images/selected/scene_34.jpg'
+  )
+})
+
+test('terminal GeminiGen failures invalidate only their matching durable job', () => {
+  const entries = new Map()
+  applySubmissionLedgerEntry(entries, {
+    fingerprint: 'same-request',
+    jobId: 'old-failed-job',
+    status: 'submitted',
+  })
+  assert.equal(entries.get('same-request').jobId, 'old-failed-job')
+
+  applySubmissionLedgerEntry(entries, {
+    fingerprint: 'same-request',
+    jobId: 'old-failed-job',
+    status: 'failed',
+    invalidated: true,
+  })
+  assert.equal(entries.has('same-request'), false)
+
+  applySubmissionLedgerEntry(entries, {
+    fingerprint: 'same-request',
+    jobId: 'fresh-job',
+    status: 'submitted',
+  })
+  applySubmissionLedgerEntry(entries, {
+    fingerprint: 'same-request',
+    jobId: 'old-failed-job',
+    status: 'failed',
+    invalidated: true,
+  })
+  assert.equal(entries.get('same-request').jobId, 'fresh-job')
 })
 
 test('requires a provider-accessible HTTPS selected image URL', () => {

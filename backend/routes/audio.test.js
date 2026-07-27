@@ -23,7 +23,7 @@ test('zero-confidence hallucinations do not anchor a scene boundary', () => {
   ])
 })
 
-test('scene cut uses the midpoint of measured waveform silence', () => {
+test('scene cut never follows detected silence past the next spoken word', () => {
   const alignments = [
     { sceneId: 's03', matchRatio: 1, lastWordEnd: 45.44 },
     { sceneId: 's04', matchRatio: 1, firstWordStart: 45.84 },
@@ -35,8 +35,8 @@ test('scene cut uses the midpoint of measured waveform silence', () => {
     [{ start: 45.811, end: 47.28 }],
   )
 
-  assert.equal(segments[0].endSeconds, 46.55)
-  assert.equal(segments[1].startSeconds, 46.55)
+  assert.equal(segments[0].endSeconds, 45.64)
+  assert.equal(segments[1].startSeconds, 45.64)
 })
 
 test('word-gap midpoint is the safe fallback when waveform analysis is unavailable', () => {

@@ -104,6 +104,8 @@ function Layout({ children }) {
     generationPhase,
     imageProgress,
     videoProgress,
+    videoPrompts,
+    videoJobs,
     pauseGeneration,
     resumeGeneration,
     stopGeneration,
@@ -126,7 +128,10 @@ function Layout({ children }) {
   const isActive   = isRunning || isPaused   // show controls
 
   const hasPendingImages = imageProgress.pending.length > 0
-  const hasPendingVideos = videoProgress.pending.length > 0
+  const hasPendingVideos = videoProgress.pending.length > 0 || videoPrompts.some(prompt => {
+    const job = videoJobs[`${prompt.scene_number}_${prompt.segment_index ?? 0}`]
+    return !['completed', 'failed'].includes(job?.status)
+  })
 
   // Progress label shown in header when active
   const progressLabel = (() => {

@@ -31,6 +31,7 @@ The LLM may author scene intent and motion choreography. Code must compose the l
 ## Mannequin Continuity Contract
 
 - Preserve every visible figure as a seamless glossy porcelain mannequin for every frame.
+- Porcelain is a visual surface treatment only. The figure is not a toy, statue, robot, puppet, or rigid display mannequin; it represents a living human and must move exactly like one.
 - Preserve featureless faces. Never generate eyes, noses, mouths, skin pores, flesh, realistic human faces, or live-action humans.
 - Preserve the exact porcelain tone, sculpted or painted hair, silhouette, clothing, footwear, accessories, and body proportions visible in the source.
 - Preserve the source-frame character count. Never duplicate, remove, merge, or replace a figure.
@@ -40,13 +41,25 @@ The LLM may author scene intent and motion choreography. Code must compose the l
 
 If no figure appears, state: `No people or human-like figures appear. Do not add a face, hand, body, silhouette, or reflection.`
 
+## Human Biomechanics Contract
+
+Every figure that represents a person must use natural human biomechanics, regardless of its porcelain mannequin appearance.
+
+- Choreograph movement from a real human body: natural center of gravity, weight transfer, balance, foot planting, joint arcs, reach limits, grip mechanics, inertia, anticipation, follow-through, and recovery.
+- Preserve realistic coordination between the pelvis, torso, shoulders, head, arms, hands, legs, and feet. A step shifts weight before the other foot lifts; a reach begins through the shoulder and torso; lifting or pushing shows believable effort and counterbalance.
+- Respect the represented person's age, build, physical condition, injury, clothing, carried weight, terrain, and emotional state. These factors may change speed and posture, but never turn motion into toy or puppet mechanics.
+- Keep motion temporally natural: purposeful actions have a readable preparation, execution, and settle. Small idle behavior should resemble subtle human breathing, postural correction, balance adjustment, or hand tension—not mechanical oscillation.
+- Hands contact and manipulate objects with plausible finger placement, grip pressure, leverage, and resistance. Feet remain grounded unless the documented action physically requires a jump or fall.
+- Never use robotic stiffness, hinge-only articulation, puppet-like jerks, doll motion, statue motion, synchronized limb swings, foot skating, ground sliding, floating, weightless movement, impossible balance, rubber limbs, or mechanically repeated gestures.
+- The seamless porcelain surface must bend over human joint geometry without revealing seams, hinges, ball joints, or mechanical internals.
+
 ## Storyboard Grid
 
 Create exactly one beat per two seconds. The last beat absorbs a one-second remainder: a 15-second clip ends with `SHOT 7 — 00:12–00:15`.
 
 Each beat must specify:
 
-- the subject's concrete physical action and small behavior;
+- the subject's concrete physical action and small behavior, choreographed with natural human biomechanics;
 - how the single camera move progresses;
 - one compatible environmental motion at most;
 - continuity with the previous beat.
@@ -64,7 +77,7 @@ The first beat begins at the source pose and composition. The last beat complete
 
 ## Negative Constraints
 
-Always suppress: extra or missing figures, extra limbs, duplicate subjects, human skin, realistic human faces, facial features, identity drift, wardrobe drift, new props, object replacement, morphing, melting, cracks, seams, joints, cuts, montage, teleports, abrupt camera changes, readable text, subtitles, captions, UI, logos, watermark, letterboxing, and unstable edges.
+Always suppress: extra or missing figures, extra limbs, duplicate subjects, human skin, realistic human faces, facial features, identity drift, wardrobe drift, new props, object replacement, morphing, melting, cracks, seams, visible mechanical joints, robotic stiffness, puppet motion, doll motion, statue motion, foot skating, ground sliding, floating, weightless movement, impossible balance, rubber limbs, repeated mechanical gestures, cuts, montage, teleports, abrupt camera changes, readable text, subtitles, captions, UI, logos, watermark, letterboxing, and unstable edges.
 
 ## Output Discipline
 

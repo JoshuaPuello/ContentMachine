@@ -15,6 +15,11 @@ import {
   auditNarrationContinuity,
   buildNarrationSkillPrompt,
 } from '../lib/narrationSkills.js';
+import {
+  buildCharacterSceneContext,
+  normalizeExtractedCharacters,
+} from '../lib/characterContinuity.js';
+import { hardenImagePromptScenes } from '../lib/imagePromptQuality.js';
 const router = express.Router();
 
 // Local Claude Code CLI (`claude -p`) — runs on the same machine as the backend,
@@ -893,12 +898,17 @@ VISUAL STYLE MANDATE (NON-NEGOTIABLE):
 - Figures: Seamless glossy porcelain mannequins with perfectly smooth finish - like high-quality ceramic figurines or museum display mannequins.
 - Surface: Smooth glossy porcelain, pristine and unblemished - NO cracks, NO texture, NO weathering on the mannequin itself.
 - NO doll joints, NO visible articulation points, NO seams.
+- Hands and limbs bend with correct underlying human joint anatomy beneath an uninterrupted porcelain surface; never show finger-segment lines, wrist seams, ball joints, hinges, or panel lines.
 - NO visible stands, rods, or support structures attached to the mannequins. Mannequins appear free-standing or naturally posed.
 - Faces: Featureless smooth porcelain surface (no eyes, nose, mouth details carved in).
 - Skin tone: Off-white/cream porcelain OR warm brown porcelain depending on character ethnicity. NEVER realistic human skin colors.
 - Hair: Mannequins CAN have painted or sculpted hair appropriate to the character and era.
-- CRITICAL CLOTHING RULE: Mannequins MUST ALWAYS be fully clothed in complete, period-accurate outfits from head to toe. MANDATORY: (1) upper body garment explicitly named, (2) lower body garment explicitly named (trousers, breeches, skirt, etc.), (3) NAMED footwear with specific type (e.g. "brown leather ankle boots", "iron-buckled knee-high riding boots", "worn canvas sandals", "hobnail leather brogues", "pointed black leather court shoes") — NEVER just "shoes" or "boots" without qualifier. Use the exact clothing from mannequin_details.clothing in full. NEVER show bare legs, bare feet, or incomplete lower-body clothing. The entire outfit must be visible and highly detailed.
+- WARDROBE CONTINUITY RULE: Mannequins wear complete, period-accurate outfits. For wide or full-body shots, explicitly name the upper garment, lower garment, and footwear. For medium shots and close-ups, describe ONLY the garments naturally visible in the requested crop; keep the remaining outfit consistent but off-frame. NEVER force trousers, skirts, legs, or footwear into a close-up that does not naturally show them.
 - Pose: Body language and gestures convey emotion despite featureless faces.
+- ANATOMY: Every mannequin uses life-size, age-appropriate realistic human proportions and physically plausible joints, hands, fingers, posture, balance, and limb lengths. Never render toy-like, chibi, doll, bobblehead, miniature, compressed, fused, duplicated, or malformed anatomy.
+- STYLE AT EVERY IMAGE PLANE: Every visible person is a porcelain mannequin even when unnamed, blurred, distant, reflected, photographed, or shown inside a monitor, television, phone, projection, bodycam recording, or archival footage. A nested image or screen is NEVER permission to render photorealistic humans.
+- COUNT ZERO DOES NOT OVERRIDE STYLE: mannequin_details.count=0 means no direct foreground cast member is staged. If the scene description still includes people in a crowd, background, reflection, screen, photograph, or recording, those people remain anatomically correct porcelain mannequins.
+- MATERIAL SEPARATION: Porcelain applies only to people. Props and environments retain their real materials, weight, and texture—wood stays natural wood, metal stays metal, fabric stays fabric, glass stays glass. Never turn a gavel, weapon, furniture, vehicle, tool, or other prop into a glossy porcelain toy or fuse it into the mannequin.
 
 CRITICAL: Do NOT include "Unreal Engine 5" or any engine names as text in the image.
 
@@ -978,15 +988,17 @@ Atmospheric / rendering texture:
 - Heat haze / atmospheric distortion: Shimmering air above hot surfaces
 
 COMPOSITION FRAMEWORK:
-"Photorealistic render, ray tracing, Octane render, [lens + camera angle + shot type], [environment/weather], fully clothed seamless glossy porcelain mannequin in [complete period-accurate outfit: upper garment + lower garment + named footwear type] showing EXACTLY what narrator describes, [specific lighting setup], [atmospheric texture], [props], 8K resolution, [DOF specification], no visible stands or supports, hyperrealistic"
+"Photorealistic render, ray tracing, Octane render, [lens + camera angle + shot type], [environment/weather], [only the porcelain mannequin anatomy and clothing naturally visible inside this crop] showing EXACTLY what narrator describes, [specific lighting setup], [atmospheric texture], [props], 8K resolution, [DOF specification], no visible stands or supports, hyperrealistic"
 
 MANDATORY RULES FOR EVERY PROMPT (ALL 4 VARIATIONS PER SCENE):
-- EVERY prompt must contain "seamless glossy porcelain mannequin" with the FULL outfit from mannequin_details.clothing — upper garment, lower garment, AND named footwear type (e.g. "brown leather ankle boots", not just "boots")
-- NEVER omit lower-body clothing or footwear — mannequins must NEVER appear bare-legged or bare-footed
-- EVERY prompt must include "featureless smooth porcelain face, no eyes/nose/mouth"
+- EVERY prompt containing any visible person must contain "seamless glossy porcelain mannequin"; this includes people visible only inside screens, photos, reflections, or recordings
+- WIDE/FULL-BODY shots must specify the complete outfit: upper garment, lower garment, and named footwear
+- MEDIUM/CLOSE-UP/DETAIL shots must specify only the clothing and anatomy visible inside the crop. Never mention a face when the frame is on hands; never mention trousers or footwear when legs and feet are outside frame
+- Include "featureless smooth porcelain face, no eyes/nose/mouth" only when a face is actually visible. For hand/object inserts, explicitly state that head, face, torso, legs, and footwear are outside frame
 - EVERY prompt must include the specific action from mannequin_details.action
 - EVERY prompt must include "8K resolution, no visible stands or supports, hyperrealistic"
-- ALL 4 variations must include the mannequin — Detail and Atmospheric are NOT environment-only shots
+- Do not invent a foreground mannequin in a truly figure-free environment or object insert. If a person or human body part is visible anywhere, the porcelain style is mandatory
+- Every visible figure must have life-size realistic human anatomy and proportions, natural limb lengths and joints, and exactly five proportional fingers per visible hand. Explicitly reject toy, chibi, doll, bobblehead, miniature, compressed, fused, extra-limbed, or malformed anatomy
 - EVERY prompt must specify a NAMED lighting setup (e.g. "chiaroscuro single-source torchlight", "golden hour raking backlight", "moonlit rim light with deep shadow fill") — never just "dramatic lighting" or "cinematic lighting"
 - EVERY prompt must specify a LENS CHARACTER (e.g. "14mm ultra-wide", "85mm portrait lens", "anamorphic widescreen", "fisheye") matched to the emotional intent of the variation
 - EVERY prompt must specify a DEPTH OF FIELD (e.g. "razor-thin DOF f/1.8, background dissolves to amber bokeh", "deep focus f/11, every plane sharp")
@@ -1157,6 +1169,7 @@ ${JSON.stringify(scenesData, null, 2)}`;
       });
     }
 
+    scenes = hardenImagePromptScenes(scenes, sourceScenes);
     res.json(scenes);
   } catch (error) {
     console.error('Image prompts error:', error);
@@ -1687,27 +1700,31 @@ ${JSON.stringify(draft.data, null, 2)}`;
   }
 });
 
-const CHARACTER_EXTRACTION_SYSTEM = `You are a documentary continuity supervisor. Extract recurring, visually identifiable people or recurring personified subjects from the supplied story and scene plan. Use Claude Sonnet-level precision. Do not create anonymous crowds, generic guards, or one-shot background extras as characters. Return only valid JSON.`;
+const CHARACTER_EXTRACTION_SYSTEM = `You are a documentary continuity supervisor performing a cast-completeness audit.
+
+Identify every stable visual identity that needs a reusable reference image across a documentary. Work from BOTH the finalized narration and the visual scene plan. Include:
+- every named primary subject, even when only a small number of scenes depict them;
+- every named or unnamed person whose same identity must remain recognizable across two or more visual scenes;
+- a one-scene person only when that person's identity is narratively central and must be recognizable elsewhere in the film.
+
+Exclude anonymous crowds, generic officers/guards/workers, archival background figures, and genuinely one-shot roles whose identity never needs to recur. Never impose an arbitrary cast-size limit.
+
+Before returning, audit every narration unit and visual scene for named people, role-based recurring people, aliases, and pronouns. Merge aliases for the same person. List every excluded candidate and the exact continuity reason for excluding them. Return only valid JSON.`;
 
 router.post('/characters/extract', async (req, res) => {
   try {
-    const { story, scenePlan } = req.body;
+    const { story, scenePlan, narration } = req.body;
     if (!story || !Array.isArray(scenePlan?.scenes)) {
       return res.status(400).json({ error: true, message: 'story and scenePlan.scenes are required' });
     }
+    const sceneContext = buildCharacterSceneContext(scenePlan, narration);
     const text = await callClaudeCli('sonnet', CHARACTER_EXTRACTION_SYSTEM, `Extract the recurring visual cast for this documentary.
 
 STORY:
 ${JSON.stringify(story, null, 2)}
 
 SCENES:
-${JSON.stringify(scenePlan.scenes.map(scene => ({
-  scene_id: scene.scene_id,
-  scene_number: scene.scene_number,
-  narration: scene.source_narration,
-  visual_description: scene.visual_description,
-  mannequin_details: scene.mannequin_details,
-})), null, 2)}
+${JSON.stringify(sceneContext, null, 2)}
 
 Return:
 {
@@ -1716,22 +1733,22 @@ Return:
     "name": "display name",
     "role": "narrative role",
     "character_type": "person|animal|personified-object",
-    "description": "identity-defining physical traits, approximate age, ethnicity when documented, hair, build, and immutable appearance only",
-    "visual_prompt": "A museum-quality full-body neutral character reference sheet on a simple dark studio background, matching the project's featureless glossy porcelain mannequin style, complete period-accurate neutral outfit, no text, no labels",
+    "description": "identity-defining physical traits, approximate age, ethnicity when documented, hair silhouette, build, posture, immutable appearance, and the neutral identity-defining wardrobe",
     "scene_numbers": [1, 3],
     "importance": "primary|supporting"
-  }]
+  }],
+  "candidate_audit": {
+    "candidate_count": 7,
+    "excluded": [{
+      "name": "candidate name or stable role",
+      "reason": "specific reason this identity is scene-local and needs no reusable reference"
+    }],
+    "coverage_notes": "brief confirmation of which narration and visual material was checked"
+  }
 }`, { noSessionPersistence: true, timeoutMs: 15 * 60_000 });
     const data = safeParseJSON(text);
-    const characters = (data.characters || []).map((character, index) => ({
-      ...character,
-      id: String(character.id || character.name || `character-${index + 1}`)
-        .toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, ''),
-      approved: false,
-      image: null,
-      image_options: [],
-    }));
-    res.json({ characters, model: 'sonnet' });
+    const normalized = normalizeExtractedCharacters(data, scenePlan.scenes.length);
+    res.json({ ...normalized, model: 'sonnet' });
   } catch (error) {
     console.error('Character extraction error:', error);
     res.status(500).json({ error: true, message: error.message, code: 'CHARACTER_EXTRACTION_ERROR' });
@@ -1740,22 +1757,20 @@ Return:
 
 router.post('/characters/link', async (req, res) => {
   try {
-    const { characters, scenePlan } = req.body;
+    const { characters, scenePlan, narration } = req.body;
     if (!Array.isArray(characters) || !Array.isArray(scenePlan?.scenes)) {
       return res.status(400).json({ error: true, message: 'characters and scenePlan.scenes are required' });
     }
     if (characters.length === 0) return res.json({ links: {}, model: 'sonnet' });
+    const sceneContext = buildCharacterSceneContext(scenePlan, narration);
     const text = await callClaudeCli('sonnet',
       'You are a strict visual continuity editor. Link only characters who must visibly appear in each scene. Narration mentions alone are insufficient when the person is not shown. Return only valid JSON.',
       `AVAILABLE CHARACTERS:
 ${JSON.stringify(characters.map(({ id, name, role, description }) => ({ id, name, role, description })), null, 2)}
 
 SCENES:
-${JSON.stringify(scenePlan.scenes.map(scene => ({
-  scene_id: scene.scene_id,
-  scene_number: scene.scene_number,
-  narration: scene.source_narration,
-  visual_description: scene.visual_description,
+${JSON.stringify(sceneContext.map(scene => ({
+  ...scene,
   action: scene.mannequin_details?.action,
 })), null, 2)}
 

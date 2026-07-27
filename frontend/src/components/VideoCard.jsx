@@ -21,10 +21,12 @@ function VideoCard({
     if (isEditing) setIsEditing(false)
   }
 
-  const status      = job?.status || 'pending'
-  const isLoading   = status === 'pending'
+  const status      = job?.status || 'queued'
+  const isSubmitting = status === 'submitting'
+  const isLoading   = status === 'pending' || isSubmitting
   const isCompleted = status === 'completed'
   const isFailed    = status === 'failed'
+  const isQueued    = status === 'queued'
 
   const handleDownload = () => {
     if (!job?.url) return
@@ -49,6 +51,18 @@ function VideoCard({
         Failed
       </span>
     )
+    if (isQueued) return (
+      <span className="inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded-full font-medium bg-surface-raised text-text-secondary border border-border">
+        <span className="w-1.5 h-1.5 rounded-full bg-text-disabled" />
+        Queued
+      </span>
+    )
+    if (isSubmitting) return (
+      <span className="inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded-full font-medium bg-accent/10 text-accent border border-accent/20">
+        <span className="w-1.5 h-1.5 rounded-full bg-accent animate-pulse" />
+        Submitting
+      </span>
+    )
     return (
       <span className="inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded-full font-medium bg-warning/10 text-warning border border-warning/20">
         <span className="w-1.5 h-1.5 rounded-full bg-warning animate-pulse" />
@@ -64,7 +78,13 @@ function VideoCard({
         className="relative aspect-video cursor-pointer overflow-hidden bg-surface-raised"
         onClick={() => isCompleted && onViewFull()}
       >
-        {isLoading ? (
+        {isSubmitting ? (
+          <div className="absolute inset-0 flex flex-col items-center justify-center gap-3">
+            <div className="absolute inset-0 bg-accent/3 animate-pulse" />
+            <div className="w-8 h-8 border-2 border-accent/25 border-t-accent rounded-full animate-spin" />
+            <span className="text-xs text-text-secondary">Preparing provider request…</span>
+          </div>
+        ) : status === 'pending' ? (
           <div className="absolute inset-0 flex flex-col items-center justify-center gap-3">
             <div className="absolute inset-0 bg-accent/3 animate-pulse" />
             <div className="relative">
@@ -79,6 +99,15 @@ function VideoCard({
                 <span className="w-1 h-1 rounded-full bg-text-secondary animate-bounce" style={{ animationDelay: '300ms' }} />
               </span>
             </div>
+          </div>
+        ) : isQueued ? (
+          <div className="absolute inset-0 flex flex-col items-center justify-center gap-2">
+            <div className="w-8 h-8 rounded-full border border-border bg-surface flex items-center justify-center">
+              <svg className="w-4 h-4 text-text-disabled" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.8}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M12 6v6l4 2m5-2a9 9 0 11-18 0 9 9 0 0118 0z" />
+              </svg>
+            </div>
+            <span className="text-xs text-text-secondary">Waiting for a provider slot</span>
           </div>
         ) : isFailed ? (
           <div className="absolute inset-0 flex flex-col items-center justify-center p-4 gap-2">

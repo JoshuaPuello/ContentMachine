@@ -20,6 +20,7 @@ import { randomUUID } from 'crypto'
 import { deleteProjectAssetsFromR2 } from '../lib/r2.js'
 import { deleteRenderWorkspacesForSession } from './render.js'
 import { startProxyBuild, jobStatus as proxyJobStatus } from '../lib/previewProxy.js'
+import { normalizeProjectImagePrompts } from '../lib/imagePromptQuality.js'
 
 const router = express.Router()
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -334,6 +335,7 @@ router.post('/save', async (req, res) => {
 
     // Deep clone project so we can replace URLs with local paths
     const snapshot = JSON.parse(JSON.stringify(project))
+    normalizeProjectImagePrompts(snapshot)
     mergeDurableAssetReferences(snapshot, existingSnapshot)
 
     // ── Save all image variants ──────────────────────────────────────────
@@ -614,6 +616,8 @@ router.get('/:id', async (req, res) => {
     const raw = await fs.readFile(jsonPath, 'utf8')
     const data = JSON.parse(raw)
     let changed = await restoreImageReferencesFromDisk(data, path.join(OUTPUT_ROOT, id))
+    const promptNormalization = normalizeProjectImagePrompts(data)
+    changed = changed || promptNormalization.changed
     if (!data._session?.write_token) {
       data._session = { ...(data._session || { id }), write_token: randomUUID() }
       changed = true

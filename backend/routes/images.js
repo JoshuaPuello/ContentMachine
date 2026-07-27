@@ -3,6 +3,8 @@ import { fal } from '@fal-ai/client';
 import Replicate from 'replicate';
 import { GoogleGenAI } from '@google/genai';
 import { generateVertexImage } from '../lib/vertex.js';
+import { buildCharacterReferencePrompt } from '../lib/characterContinuity.js';
+import { hardenDocumentaryImagePrompt } from '../lib/imagePromptQuality.js';
 const router = express.Router();
 const IMAGE_GENERATION_TIMEOUT_MS = Math.max(
   30_000,
@@ -280,7 +282,7 @@ const prepareReplicateCharacterImages = async (replicate, characterImages) => {
 
 router.post('/generate', async (req, res) => {
   try {
-    const { prompts, provider, model, aspectRatio, characterImages, characterDescription } = req.body;
+    const { prompts, provider, model, aspectRatio, characterImages, characterDescription, characterReference } = req.body;
 
     // Validate required fields
     if (!Array.isArray(prompts) || prompts.length === 0) {
@@ -289,8 +291,12 @@ router.post('/generate', async (req, res) => {
     if (typeof provider !== 'string' || !provider) {
       return res.status(400).json({ error: true, message: 'provider is required', code: 'INVALID_INPUT' });
     }
+    const authoredPrompts = characterReference?.name
+      ? prompts.map(prompt => buildCharacterReferencePrompt(characterReference, prompt))
+      : prompts;
+    const effectivePrompts = authoredPrompts.map(prompt => hardenDocumentaryImagePrompt(prompt));
     // Validate each prompt is a non-empty string
-    for (const p of prompts) {
+    for (const p of effectivePrompts) {
       if (typeof p !== 'string' || !p.trim()) {
         return res.status(400).json({ error: true, message: 'Each prompt must be a non-empty string', code: 'INVALID_INPUT' });
       }
@@ -317,7 +323,7 @@ router.post('/generate', async (req, res) => {
     }
     
     const results = await Promise.allSettled(
-      prompts.map((prompt) => withImageGenerationTimeout(async (abortSignal) => {
+      effectivePrompts.map((prompt) => withImageGenerationTimeout(async (abortSignal) => {
         if (provider === 'fal') {
           const falClient = getFalClient(req);
           const selectedModel = model || 'fal-ai/flux-pro';
@@ -422,7 +428,7 @@ router.post('/generate', async (req, res) => {
       if (result.status === 'fulfilled') {
         return result.value;
       }
-      return { prompt: prompts[index], url: null, error: result.reason?.message || 'Generation failed' };
+      return { prompt: effectivePrompts[index], url: null, error: result.reason?.message || 'Generation failed' };
     });
     
     res.json(response);
@@ -443,6 +449,7 @@ router.post('/regenerate', async (req, res) => {
     if (typeof provider !== 'string' || !provider) {
       return res.status(400).json({ error: true, message: 'provider is required', code: 'INVALID_INPUT' });
     }
+    const effectivePrompt = hardenDocumentaryImagePrompt(prompt);
 
     // Validate and filter characterImages — silently drop any that are malformed
     const rawCharImgs = Array.isArray(characterImages) ? characterImages.filter(Boolean) : [];
@@ -455,14 +462,14 @@ router.post('/regenerate', async (req, res) => {
       ? characterDescription.trim().slice(0, MAX_CHAR_DESC_LENGTH)
       : '';
     
-    console.log('Regenerate request:', { provider, model, aspectRatio, promptLength: prompt?.length, charImgCount: charImgs.length, charDesc: charDesc || '(none)' });
+    console.log('Regenerate request:', { provider, model, aspectRatio, promptLength: effectivePrompt.length, charImgCount: charImgs.length, charDesc: charDesc || '(none)' });
     
     if (provider === 'fal') {
       const falClient = getFalClient(req);
       const selectedModel = model || 'fal-ai/flux-pro';
       const augmentedPrompt = charImgs.length > 0
-        ? buildCharacterPromptPrefix(charImgs.length > 0, charDesc) + prompt
-        : prompt;
+        ? buildCharacterPromptPrefix(charImgs.length > 0, charDesc) + effectivePrompt
+        : effectivePrompt;
       const result = await withImageGenerationTimeout((abortSignal) =>
         generateWithFal(falClient, selectedModel, augmentedPrompt, aspectRatio, [], abortSignal)
       );
@@ -470,11 +477,11 @@ router.post('/regenerate', async (req, res) => {
       res.json({ url: result.url });
     } else if (provider === 'gemini') {
       const genAI = getGeminiClient(req);
-      const result = await generateWithGemini(genAI, prompt, aspectRatio, model, charImgs, charDesc);
+      const result = await generateWithGemini(genAI, effectivePrompt, aspectRatio, model, charImgs, charDesc);
       console.log('Gemini result URL:', result.url?.substring(0, 50) + '...');
       res.json({ url: result.url });
     } else if (provider === 'vertex') {
-      const result = await generateWithVertex(prompt, aspectRatio, model, charImgs, charDesc);
+      const result = await generateWithVertex(effectivePrompt, aspectRatio, model, charImgs, charDesc);
       console.log('Vertex result URL:', result.url?.substring(0, 50) + '...');
       res.json({ url: result.url });
     } else if (provider === 'replicate') {
@@ -490,8 +497,8 @@ router.post('/regenerate', async (req, res) => {
       let output;
       if (selectedModel === 'black-forest-labs/flux-2-pro') {
         const augPrompt = charImgs.length > 0
-          ? buildCharacterPromptPrefix(charImgs.length > 0, charDesc) + prompt
-          : prompt;
+          ? buildCharacterPromptPrefix(charImgs.length > 0, charDesc) + effectivePrompt
+          : effectivePrompt;
         output = await replicate.run('black-forest-labs/flux-2-pro', {
           input: { 
             prompt: augPrompt, 
@@ -509,7 +516,7 @@ router.post('/regenerate', async (req, res) => {
           : '';
         output = await replicate.run('google/nano-banana-pro', {
           input: { 
-            prompt: charInstruction + prompt, 
+            prompt: charInstruction + effectivePrompt,
             aspect_ratio: aspectRatio || '16:9',
             resolution: '2K',
             output_format: 'png',
@@ -519,8 +526,8 @@ router.post('/regenerate', async (req, res) => {
         });
       } else if (selectedModel === 'google/imagen-4') {
         const augPrompt = charImgs.length > 0
-          ? buildCharacterPromptPrefix(charImgs.length > 0, charDesc) + prompt
-          : prompt;
+          ? buildCharacterPromptPrefix(charImgs.length > 0, charDesc) + effectivePrompt
+          : effectivePrompt;
         output = await replicate.run('google/imagen-4', {
           input: {
             prompt: augPrompt,
@@ -532,8 +539,8 @@ router.post('/regenerate', async (req, res) => {
         });
       } else {
         const augPrompt = charImgs.length > 0
-          ? buildCharacterPromptPrefix(charImgs.length > 0, charDesc) + prompt
-          : prompt;
+          ? buildCharacterPromptPrefix(charImgs.length > 0, charDesc) + effectivePrompt
+          : effectivePrompt;
         output = await replicate.run(selectedModel, {
           input: { prompt: augPrompt, aspect_ratio: aspectRatio || '16:9' }
         });

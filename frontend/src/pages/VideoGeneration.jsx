@@ -202,6 +202,10 @@ function VideoGeneration() {
   const allSelected    = completedCount > 0 && selectedCount >= completedCount
   const progress       = totalCount > 0 ? Math.round((completedCount / totalCount) * 100) : 0
   const allJobsDone    = totalCount > 0 && (completedCount + failedCount) === totalCount
+  const remainingVideoCount = videoPrompts.filter(prompt => {
+    const job = videoJobs[`${prompt.scene_number}_${prompt.segment_index ?? 0}`]
+    return !['completed', 'failed'].includes(job?.status)
+  }).length
 
   // Pagination — only active when videoPrompts exceed threshold
   const totalPages     = Math.ceil(videoPrompts.length / VIDEO_SCENES_PER_PAGE)
@@ -285,8 +289,13 @@ function VideoGeneration() {
       let pending = Object.entries(videoJobs).filter(
         ([, j]) => j.status === 'pending' && j.jobId
       )
+      const hasSubmitting = Object.values(videoJobs).some(j => j.status === 'submitting')
 
       if (pending.length === 0) {
+        if (hasSubmitting) {
+          pollingTimerRef.current = setTimeout(tick, 1000)
+          return
+        }
         const state = usePipelineStore.getState()
         const queued = queuedVideoUnitIds(state.videoProgress, state.videoJobs)
         if (queued.length > 0) {
@@ -344,9 +353,11 @@ function VideoGeneration() {
       const latestState = usePipelineStore.getState()
       const stillPending = Object.values(latestState.videoJobs)
         .filter(j => j.status === 'pending' && j.jobId)
+      const stillSubmitting = Object.values(latestState.videoJobs)
+        .some(j => j.status === 'submitting')
       const stillQueued = queuedVideoUnitIds(latestState.videoProgress, latestState.videoJobs)
 
-      if (stillPending.length === 0) {
+      if (stillPending.length === 0 && !stillSubmitting) {
         pollingActiveRef.current = false
         stopGeneration()
         if (stillQueued.length > 0) {
@@ -569,13 +580,13 @@ function VideoGeneration() {
                 </button>
               )}
 
-              {(generationState === 'stopped' || generationState === 'paused') && videoProgress.pending.length > 0 && (
+              {(generationState === 'stopped' || generationState === 'paused') && remainingVideoCount > 0 && (
                 <button
                   onClick={resumeVideoGeneration}
                   className="flex items-center gap-1.5 py-1 px-3 text-xs rounded-lg bg-accent text-white font-medium hover:bg-accent-hover transition-colors"
                 >
                   <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
-                  Resume ({videoProgress.pending.length} left)
+                  Resume ({remainingVideoCount} left)
                 </button>
               )}
 

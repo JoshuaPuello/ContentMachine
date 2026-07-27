@@ -6,6 +6,12 @@ import { fileURLToPath } from 'url';
 import { randomUUID } from 'crypto';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
+import {
+  analyzeNarrationBoundaries,
+  analyzePcmSignal,
+  publicAudit,
+  summarizeAudit,
+} from '../lib/narrationAudioQuality.js';
 
 const execFileAsync = promisify(execFile);
 const router = express.Router();
@@ -23,6 +29,12 @@ const safeSegment = (value, fallback) => {
 
 const sessionAudioDir = async (sessionId) => {
   const dir = path.join(OUTPUT_ROOT, safeSegment(sessionId, 'session'), 'audio');
+  await fs.mkdir(dir, { recursive: true });
+  return dir;
+};
+
+const sessionAuditDir = async (sessionId) => {
+  const dir = path.join(await sessionAudioDir(sessionId), 'audits');
   await fs.mkdir(dir, { recursive: true });
   return dir;
 };
@@ -202,15 +214,18 @@ export const alignScenesToTranscript = (scenes, transcriptWords) => {
 const findBestSilenceMidpoint = (silenceIntervals, previousWordEnd, nextWordStart) => {
   const semanticMidpoint = (previousWordEnd + nextWordStart) / 2;
   const candidates = silenceIntervals
-    .filter(interval => (
-      interval.end - interval.start >= 0.06
-      && interval.start >= previousWordEnd - 0.25
-      && interval.end <= nextWordStart + 2.5
-    ))
     .map(interval => ({
-      midpoint: (interval.start + interval.end) / 2,
-      distance: Math.abs(((interval.start + interval.end) / 2) - semanticMidpoint),
+      start: Math.max(interval.start, previousWordEnd),
+      end: Math.min(interval.end, nextWordStart),
     }))
+    .filter(interval => interval.end - interval.start >= 0.04)
+    .map(interval => {
+      const midpoint = (interval.start + interval.end) / 2;
+      return {
+        midpoint,
+        distance: Math.abs(midpoint - semanticMidpoint),
+      };
+    })
     .sort((a, b) => a.distance - b.distance);
   return candidates[0]?.midpoint;
 };
@@ -338,6 +353,277 @@ const sliceAudio = async (inputPath, start, end, outputPath) => {
   ], { timeout: 5 * 60_000 });
 };
 
+const normalizeScenes = (scenes) => scenes.map(scene => {
+  const text = scene.text || '';
+  const wordCount = text.split(/\s+/).filter(Boolean).length;
+  return {
+    sceneId: scene.scene_id,
+    unit_id: scene.scene_id,
+    kind: scene.kind || 'scene',
+    text,
+    speechText: text,
+    expectedSeconds: Math.max(1, wordCount / 2.5),
+  };
+});
+
+const decodeMonoPcm = async (audioPath) => {
+  const { stdout } = await execFileAsync('ffmpeg', [
+    '-v', 'error',
+    '-i', audioPath,
+    '-vn',
+    '-ac', '1',
+    '-ar', '16000',
+    '-f', 'f32le',
+    'pipe:1',
+  ], {
+    timeout: 10 * 60_000,
+    maxBuffer: 128 * 1024 * 1024,
+    encoding: 'buffer',
+  });
+  const buffer = Buffer.isBuffer(stdout) ? stdout : Buffer.from(stdout);
+  return new Float32Array(buffer.buffer, buffer.byteOffset, Math.floor(buffer.byteLength / 4));
+};
+
+const measureLoudness = async (audioPath) => {
+  try {
+    const { stderr } = await execFileAsync('ffmpeg', [
+      '-hide_banner',
+      '-nostats',
+      '-i', audioPath,
+      '-af', 'loudnorm=I=-16:LRA=7:TP=-1.5:print_format=json',
+      '-f', 'null',
+      '-',
+    ], { timeout: 10 * 60_000, maxBuffer: 16 * 1024 * 1024 });
+    const match = String(stderr || '').match(/\{\s*"input_i"[\s\S]*?\}/g)?.at(-1);
+    if (!match) return {};
+    const parsed = JSON.parse(match);
+    return {
+      integratedLufs: Number(parsed.input_i),
+      truePeakDb: Number(parsed.input_tp),
+      loudnessRangeLu: Number(parsed.input_lra),
+      thresholdLufs: Number(parsed.input_thresh),
+    };
+  } catch (error) {
+    console.warn('[audio/audit] loudness measurement unavailable:', error.message);
+    return {};
+  }
+};
+
+const auditFilePath = async (sessionId, auditId) =>
+  path.join(await sessionAuditDir(sessionId), `${safeSegment(auditId, 'audit')}.json`);
+
+const writeAudit = async (sessionId, audit) => {
+  await fs.writeFile(await auditFilePath(sessionId, audit.auditId), JSON.stringify(audit, null, 2));
+};
+
+const readAudit = async (sessionId, auditId) => {
+  const raw = await fs.readFile(await auditFilePath(sessionId, auditId), 'utf8');
+  return JSON.parse(raw);
+};
+
+const sessionOwnedAudioPath = async (sessionId, filename) => {
+  const safeName = path.basename(filename || '');
+  if (!safeName || safeName !== filename) throw new Error('Invalid session audio filename');
+  const audioDir = await sessionAudioDir(sessionId);
+  const absolute = path.join(audioDir, safeName);
+  await fs.access(absolute);
+  return absolute;
+};
+
+const analyzeNarrationFile = async ({
+  audioPath,
+  sessionId,
+  auditId,
+  sourceFilename,
+  sourceUrl,
+  originalName,
+  scenes,
+  transcriptWords,
+  parentAuditId = null,
+  version = 'source',
+}) => {
+  const units = normalizeScenes(scenes);
+  const words = transcriptWords || await transcribeWithWhisper(audioPath);
+  if (!words.length) throw new Error('Whisper found no speech in the uploaded audio');
+
+  const alignments = alignScenesToTranscript(units, words);
+  const totalDuration = await probeDuration(audioPath) ?? words.at(-1)?.endTime;
+  if (!totalDuration) throw new Error('Could not determine the uploaded audio duration');
+  const silenceIntervals = await detectSilenceIntervals(audioPath).catch(error => {
+    console.warn('[audio/audit] waveform silence detection failed:', error.message);
+    return [];
+  });
+  const boundaryAudit = analyzeNarrationBoundaries({ units, alignments, silenceIntervals });
+  const pcm = await decodeMonoPcm(audioPath);
+  const signalAudit = analyzePcmSignal(pcm, 16000, {
+    boundaryTimes: boundaryAudit.boundaries.map(boundary => boundary.timeSeconds),
+    wordTimes: words,
+  });
+  const loudness = await measureLoudness(audioPath);
+  const issues = [...boundaryAudit.issues, ...signalAudit.issues];
+  const audit = {
+    schemaVersion: 1,
+    auditId,
+    parentAuditId,
+    version,
+    status: issues.length ? 'review-required' : 'clean',
+    analyzedAt: new Date().toISOString(),
+    sourceFilename,
+    sourceUrl,
+    originalName,
+    durationSeconds: Math.round(totalDuration * 1000) / 1000,
+    waveform: signalAudit.waveform,
+    boundaries: boundaryAudit.boundaries,
+    gapProfile: boundaryAudit.profile,
+    issues,
+    stats: signalAudit.stats,
+    loudness,
+    summary: summarizeAudit(issues, loudness),
+    cache: {
+      scenes,
+      words,
+      alignments,
+      silenceIntervals,
+    },
+  };
+  await writeAudit(sessionId, audit);
+  return audit;
+};
+
+const shiftTranscriptWords = (words, insertions) => {
+  const shiftAt = (time) => insertions.reduce(
+    (sum, insertion) => sum + (insertion.atSeconds <= time ? insertion.durationSeconds : 0),
+    0,
+  );
+  return words.map(word => ({
+    ...word,
+    startTime: word.startTime + shiftAt(word.startTime),
+    endTime: word.endTime + shiftAt(word.endTime),
+  }));
+};
+
+const probeAudioFormat = async (audioPath) => {
+  const { stdout } = await execFileAsync('ffprobe', [
+    '-v', 'error',
+    '-select_streams', 'a:0',
+    '-show_entries', 'stream=sample_rate,channels,channel_layout',
+    '-of', 'json',
+    audioPath,
+  ], { timeout: 60_000 });
+  const stream = JSON.parse(stdout).streams?.[0] || {};
+  const channels = Number(stream.channels) || 1;
+  return {
+    sampleRate: Number(stream.sample_rate) || 44100,
+    channelLayout: stream.channel_layout || (channels === 1 ? 'mono' : 'stereo'),
+  };
+};
+
+const createRepairedMaster = async ({ inputPath, outputPath, durationSeconds, issues }) => {
+  const insertions = issues
+    .filter(issue => issue.autoFix && issue.operation?.type === 'insert_silence')
+    .map(issue => ({
+      issueId: issue.id,
+      atSeconds: Math.max(0, Math.min(durationSeconds, Number(issue.operation.atSeconds) || 0)),
+      durationSeconds: Math.max(0, Number(issue.operation.durationSeconds) || 0),
+    }))
+    .filter(insertion => insertion.durationSeconds >= 0.03)
+    .sort((a, b) => a.atSeconds - b.atSeconds);
+  const wantsDeclick = issues.some(issue => issue.autoFix && issue.operation?.type === 'declick');
+  const wantsDeclip = issues.some(issue => issue.autoFix && issue.operation?.type === 'declip');
+  const wantsDcRemoval = issues.some(issue => issue.autoFix && issue.operation?.type === 'remove_dc');
+  if (!insertions.length && !wantsDeclick && !wantsDeclip && !wantsDcRemoval) {
+    throw new Error('None of the selected findings has a safe automatic repair');
+  }
+
+  const { sampleRate, channelLayout } = await probeAudioFormat(inputPath);
+  const filters = [];
+  const concatInputs = [];
+  let cursor = 0;
+  let partIndex = 0;
+  for (const insertion of insertions) {
+    if (insertion.atSeconds > cursor + 0.001) {
+      filters.push(
+        `[0:a]atrim=start=${cursor}:end=${insertion.atSeconds},asetpts=PTS-STARTPTS,`
+        + `aformat=sample_rates=${sampleRate}:channel_layouts=${channelLayout}[part${partIndex}]`,
+      );
+      concatInputs.push(`[part${partIndex}]`);
+      partIndex++;
+    }
+    filters.push(
+      `anullsrc=r=${sampleRate}:cl=${channelLayout}:d=${insertion.durationSeconds}[part${partIndex}]`,
+    );
+    concatInputs.push(`[part${partIndex}]`);
+    partIndex++;
+    cursor = insertion.atSeconds;
+  }
+  if (cursor < durationSeconds) {
+    filters.push(
+      `[0:a]atrim=start=${cursor}:end=${durationSeconds},asetpts=PTS-STARTPTS,`
+      + `aformat=sample_rates=${sampleRate}:channel_layouts=${channelLayout}[part${partIndex}]`,
+    );
+    concatInputs.push(`[part${partIndex}]`);
+  }
+  if (concatInputs.length > 1) {
+    filters.push(`${concatInputs.join('')}concat=n=${concatInputs.length}:v=0:a=1[assembled]`);
+  } else if (concatInputs.length === 1) {
+    filters.push(`${concatInputs[0]}anull[assembled]`);
+  } else {
+    filters.push('[0:a]anull[assembled]');
+  }
+
+  const polish = [];
+  if (wantsDcRemoval) polish.push('highpass=f=20')
+  if (wantsDeclick) polish.push('adeclick=t=2:w=55:o=75:a=2')
+  if (wantsDeclip) polish.push('adeclip=w=55:o=75:a=8:t=10')
+  polish.push('alimiter=limit=0.891251:level=false')
+  filters.push(`[assembled]${polish.join(',')}[out]`);
+
+  await execFileAsync('ffmpeg', [
+    '-y',
+    '-hide_banner',
+    '-i', inputPath,
+    '-filter_complex', filters.join(';'),
+    '-map', '[out]',
+    '-c:a', 'flac',
+    outputPath,
+  ], { timeout: 15 * 60_000, maxBuffer: 32 * 1024 * 1024 });
+  return insertions;
+};
+
+const splitAudioFile = async ({ inputPath, scenes, sessionId }) => {
+  const units = normalizeScenes(scenes);
+  const words = await transcribeWithWhisper(inputPath);
+  if (!words.length) throw new Error('Whisper found no speech in the approved audio');
+  const alignments = alignScenesToTranscript(units, words);
+  const totalDuration = await probeDuration(inputPath) ?? words.at(-1)?.endTime;
+  const silenceIntervals = await detectSilenceIntervals(inputPath).catch(() => []);
+  const segments = computeSceneCutSegments(units, alignments, totalDuration, silenceIntervals);
+  const audioDir = await sessionAudioDir(sessionId);
+  const sliceStamp = Date.now().toString(36);
+  const out = [];
+  for (const seg of segments) {
+    const sliceName = `${safeSegment(seg.sceneId, 'scene')}_${sliceStamp}.mp3`;
+    await sliceAudio(inputPath, seg.startSeconds, seg.endSeconds, path.join(audioDir, sliceName));
+    out.push({
+      scene_id: seg.sceneId,
+      url: sessionAudioUrl(sessionId, sliceName),
+      durationSeconds: Math.round((seg.endSeconds - seg.startSeconds) * 100) / 100,
+      startSeconds: seg.startSeconds,
+      endSeconds: seg.endSeconds,
+      speechStartSeconds: seg.speechStartSeconds,
+      speechEndSeconds: seg.speechEndSeconds,
+      matchRatio: seg.matchRatio,
+      lowConfidence: seg.matchRatio < 0.5,
+      wordTimings: (alignments[seg.index]?.words || []).map(word => ({
+        wordIndex: word.wordIndex,
+        startSeconds: Math.max(0, Math.round((word.start - seg.startSeconds) * 1000) / 1000),
+        endSeconds: Math.max(0, Math.round((word.end - seg.startSeconds) * 1000) / 1000),
+      })),
+    });
+  }
+  return { scenes: out, totalDuration };
+};
+
 // POST /api/audio/store
 // { sessionId, sceneId (or name), audio: dataUri }
 // Writes the audio to the session's output folder and returns a small URL —
@@ -360,6 +646,261 @@ router.post('/store', async (req, res) => {
   } catch (error) {
     console.error('Audio store error:', error);
     res.status(500).json({ error: true, message: error.message, code: 'AUDIO_STORE_ERROR' });
+  }
+});
+
+// POST /api/audio/audit
+// Persists the immutable source and performs transcription + signal analysis.
+// It intentionally creates no scene slices: the user reviews/repairs the
+// master first, then explicitly approves a version through /audit/approve.
+router.post('/audit', async (req, res) => {
+  try {
+    const { audio, scenes, sessionId, name } = req.body;
+    if (!audio) {
+      return res.status(400).json({ error: true, message: 'audio (data URI) is required', code: 'MISSING_AUDIO' });
+    }
+    if (!sessionId) {
+      return res.status(400).json({ error: true, message: 'sessionId is required', code: 'MISSING_SESSION' });
+    }
+    if (!Array.isArray(scenes) || !scenes.length) {
+      return res.status(400).json({ error: true, message: 'scenes array is required', code: 'MISSING_SCENES' });
+    }
+
+    const { buffer, ext } = parseAudioDataUri(audio);
+    const auditId = `audit_${Date.now().toString(36)}_${randomUUID().slice(0, 8)}`;
+    const sourceFilename = `full_source_${auditId}.${ext}`;
+    const audioDir = await sessionAudioDir(sessionId);
+    const sourcePath = path.join(audioDir, sourceFilename);
+    await fs.writeFile(sourcePath, buffer);
+    const sourceUrl = sessionAudioUrl(sessionId, sourceFilename);
+
+    const audit = await analyzeNarrationFile({
+      audioPath: sourcePath,
+      sessionId,
+      auditId,
+      sourceFilename,
+      sourceUrl,
+      originalName: safeSegment(name, `full-audio.${ext}`),
+      scenes,
+      version: 'source',
+    });
+    res.json({ audit: publicAudit(audit) });
+  } catch (error) {
+    console.error('Audio audit error:', error);
+    res.status(500).json({ error: true, message: error.message, code: 'AUDIO_AUDIT_ERROR' });
+  }
+});
+
+// POST /api/audio/audit/validate-marker
+// A waveform click becomes a measured finding, not an unverified annotation.
+router.post('/audit/validate-marker', async (req, res) => {
+  try {
+    const { sessionId, auditId, timeSeconds, type = 'other', note = '' } = req.body;
+    if (!sessionId || !auditId || !Number.isFinite(Number(timeSeconds))) {
+      return res.status(400).json({ error: true, message: 'sessionId, auditId, and timeSeconds are required' });
+    }
+    const audit = await readAudit(sessionId, auditId);
+    const time = Math.max(0, Math.min(audit.durationSeconds, Number(timeSeconds)));
+    const existing = audit.issues
+      .filter(issue => type === 'short_gap' ? issue.type === 'short_gap' : issue.type !== 'short_gap')
+      .sort((a, b) => Math.abs(a.timeSeconds - time) - Math.abs(b.timeSeconds - time))[0];
+    if (existing && Math.abs(existing.timeSeconds - time) <= 1.25) {
+      existing.userConfirmed = true;
+      existing.note = String(note || '').slice(0, 500);
+      await writeAudit(sessionId, audit);
+      return res.json({
+        issue: existing,
+        validation: { confirmed: true, message: 'The measured waveform confirms a nearby finding.' },
+        audit: publicAudit(audit),
+      });
+    }
+
+    let issue;
+    if (type === 'short_gap') {
+      const boundary = (audit.boundaries || [])
+        .slice()
+        .sort((a, b) => Math.abs(a.timeSeconds - time) - Math.abs(b.timeSeconds - time))[0];
+      if (boundary && Math.abs(boundary.timeSeconds - time) <= 3) {
+        const target = boundary.targetGapSeconds || audit.gapProfile?.medianPauseSeconds || 0.8;
+        const measured = boundary.pauseSeconds || 0;
+        const insert = Math.max(0, target - measured);
+        issue = {
+          id: `manual-gap-${Date.now().toString(36)}`,
+          type: 'short_gap',
+          severity: measured < 0.25 ? 'high' : 'medium',
+          confidence: measured < target ? 0.9 : 0.56,
+          timeSeconds: (boundary.pauseStartSeconds + boundary.pauseEndSeconds) / 2,
+          startSeconds: boundary.pauseStartSeconds,
+          endSeconds: boundary.pauseEndSeconds,
+          fromUnitId: boundary.fromUnitId,
+          toUnitId: boundary.toUnitId,
+          title: `Reviewed transition · ${boundary.fromUnitId} → ${boundary.toUnitId}`,
+          description: `Measured breathing room is ${measured.toFixed(2)}s; the project baseline is ${target.toFixed(2)}s.`,
+          suggestion: insert > 0.04
+            ? `Insert ${insert.toFixed(2)}s at this semantic boundary.`
+            : 'The measured pause is already within the project’s natural range.',
+          operation: { type: 'insert_silence', atSeconds: boundary.timeSeconds, durationSeconds: insert },
+          autoFix: insert > 0.04,
+          defaultSelected: insert > 0.04,
+          status: 'open',
+          userConfirmed: true,
+          note: String(note || '').slice(0, 500),
+        };
+      } else {
+        issue = {
+          id: `manual-gap-${Date.now().toString(36)}`,
+          type: 'short_gap',
+          severity: 'medium',
+          confidence: 0.45,
+          timeSeconds: time,
+          title: 'User-marked pause issue',
+          description: 'No script boundary was close enough to verify this automatically.',
+          suggestion: 'Preview the marked point before applying a conservative 0.65s pause.',
+          operation: { type: 'insert_silence', atSeconds: time, durationSeconds: 0.65 },
+          autoFix: true,
+          defaultSelected: false,
+          status: 'open',
+          userConfirmed: true,
+          note: String(note || '').slice(0, 500),
+        };
+      }
+    } else {
+      const isClick = type === 'click';
+      issue = {
+        id: `manual-${safeSegment(type, 'issue')}-${Date.now().toString(36)}`,
+        type,
+        severity: 'medium',
+        confidence: 0.5,
+        timeSeconds: time,
+        startSeconds: Math.max(0, time - 0.08),
+        endSeconds: Math.min(audit.durationSeconds, time + 0.08),
+        title: type === 'level_jump' ? 'User-marked level or voice jump'
+          : isClick ? 'User-marked click or pop'
+            : 'User-marked audio concern',
+        description: 'The marker is saved for A/B review. The automatic scan did not independently reproduce it with high confidence.',
+        suggestion: isClick
+          ? 'A conservative de-click pass is available; compare it carefully before approval.'
+          : 'Review or regenerate this phrase rather than applying a destructive automatic pitch correction.',
+        operation: { type: isClick ? 'declick' : 'review_only' },
+        autoFix: isClick,
+        defaultSelected: false,
+        status: 'open',
+        userConfirmed: true,
+        note: String(note || '').slice(0, 500),
+      };
+    }
+    audit.issues.push(issue);
+    audit.status = 'review-required';
+    audit.summary = summarizeAudit(audit.issues, audit.loudness);
+    await writeAudit(sessionId, audit);
+    res.json({
+      issue,
+      validation: {
+        confirmed: issue.confidence >= 0.7,
+        message: issue.confidence >= 0.7
+          ? 'The marker aligns with measured evidence.'
+          : 'Marker saved for review; the automatic scan could not confirm it confidently.',
+      },
+      audit: publicAudit(audit),
+    });
+  } catch (error) {
+    console.error('Audio marker validation error:', error);
+    res.status(500).json({ error: true, message: error.message, code: 'AUDIO_MARKER_ERROR' });
+  }
+});
+
+// POST /api/audio/audit/repair
+// Builds a new lossless master. The source file is never overwritten.
+router.post('/audit/repair', async (req, res) => {
+  try {
+    const { sessionId, auditId, issueIds } = req.body;
+    if (!sessionId || !auditId) {
+      return res.status(400).json({ error: true, message: 'sessionId and auditId are required' });
+    }
+    const audit = await readAudit(sessionId, auditId);
+    const requested = new Set(Array.isArray(issueIds) ? issueIds : []);
+    const selected = audit.issues.filter(issue => (
+      requested.size ? requested.has(issue.id) : issue.autoFix && issue.defaultSelected
+    ));
+    if (!selected.length) {
+      return res.status(400).json({ error: true, message: 'Select at least one safely repairable finding' });
+    }
+
+    const sourcePath = await sessionOwnedAudioPath(sessionId, audit.sourceFilename);
+    const repairId = `${audit.auditId}_repair_${Date.now().toString(36)}`;
+    const repairedFilename = `full_repaired_${repairId}.flac`;
+    const repairedPath = path.join(await sessionAudioDir(sessionId), repairedFilename);
+    const insertions = await createRepairedMaster({
+      inputPath: sourcePath,
+      outputPath: repairedPath,
+      durationSeconds: audit.durationSeconds,
+      issues: selected,
+    });
+    const shiftedWords = shiftTranscriptWords(audit.cache.words || [], insertions);
+    const repairedUrl = sessionAudioUrl(sessionId, repairedFilename);
+    const verificationAudit = await analyzeNarrationFile({
+      audioPath: repairedPath,
+      sessionId,
+      auditId: repairId,
+      sourceFilename: repairedFilename,
+      sourceUrl: repairedUrl,
+      originalName: audit.originalName,
+      scenes: audit.cache.scenes,
+      transcriptWords: shiftedWords,
+      parentAuditId: audit.auditId,
+      version: 'repaired',
+    });
+    audit.versions = [
+      ...(audit.versions || []),
+      {
+        auditId: repairId,
+        url: repairedUrl,
+        filename: repairedFilename,
+        createdAt: new Date().toISOString(),
+        issueIds: selected.map(issue => issue.id),
+        insertions,
+      },
+    ];
+    await writeAudit(sessionId, audit);
+    res.json({
+      repairedUrl,
+      repairAuditId: repairId,
+      appliedFixes: selected.map(issue => issue.id),
+      audit: publicAudit(verificationAudit),
+    });
+  } catch (error) {
+    console.error('Audio repair error:', error);
+    res.status(500).json({ error: true, message: error.message, code: 'AUDIO_REPAIR_ERROR' });
+  }
+});
+
+// POST /api/audio/audit/approve
+// Re-transcribes the approved version, then atomically returns all scene slices.
+router.post('/audit/approve', async (req, res) => {
+  try {
+    const { sessionId, auditId } = req.body;
+    if (!sessionId || !auditId) {
+      return res.status(400).json({ error: true, message: 'sessionId and auditId are required' });
+    }
+    const audit = await readAudit(sessionId, auditId);
+    const inputPath = await sessionOwnedAudioPath(sessionId, audit.sourceFilename);
+    const result = await splitAudioFile({
+      inputPath,
+      scenes: audit.cache.scenes,
+      sessionId,
+    });
+    audit.status = 'approved';
+    audit.approvedAt = new Date().toISOString();
+    await writeAudit(sessionId, audit);
+    res.json({
+      ...result,
+      approvedUrl: audit.sourceUrl,
+      approvedAuditId: audit.auditId,
+      audit: publicAudit(audit),
+    });
+  } catch (error) {
+    console.error('Audio approval error:', error);
+    res.status(500).json({ error: true, message: error.message, code: 'AUDIO_APPROVAL_ERROR' });
   }
 });
 

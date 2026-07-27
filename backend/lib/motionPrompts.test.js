@@ -52,9 +52,12 @@ test('15-second shot grid uses seven beats and absorbs the remainder', () => {
 
 test('runtime system prompt inlines the project skill and mannequin contract', () => {
   assert.match(loadSeedanceMotionSkill(), /immutable frame zero/i);
+  assert.match(loadSeedanceMotionSkill(), /Human Biomechanics Contract/i);
   const prompt = buildMotionPromptSystem('Keep the pace tense.');
   assert.match(prompt, /SEEDANCE 2\.0 SKILL/);
   assert.match(prompt, /must never become a realistic human/i);
+  assert.match(prompt, /PORCELAIN IS VISUAL ONLY/i);
+  assert.match(prompt, /natural human biomechanics/i);
   assert.match(prompt, /Keep the pace tense/);
 });
 
@@ -133,6 +136,24 @@ test('validator rejects facialization and entities entering the frame', () => {
   }
 });
 
+test('validator rejects mannequin-like or weightless subject movement', () => {
+  const cases = [
+    'The subject walks with robotic movement toward the engine.',
+    'The figure uses puppet-like motion while reaching for the wrench.',
+    'The mannequin slides across the ground without stepping.',
+    'The subject floats above the ground before settling.',
+  ];
+  for (const subjectAction of cases) {
+    const broken = structuredClone(authored);
+    broken.video_prompt.storyboard[0].subject_action = subjectAction;
+    assert.match(
+      validateMotionPromptBatch([broken], [scene]).join(' '),
+      /non-human mannequin biomechanics/i,
+      `Expected biomechanics rejection for: ${subjectAction}`
+    );
+  }
+});
+
 test('composer protects mannequin, count, wardrobe, props and stable ending', () => {
   const [result] = composeMotionPromptBatch([authored], [scene]);
   assert.equal(result.motion_prompt_version, 'seedance-2-0-v1');
@@ -142,6 +163,10 @@ test('composer protects mannequin, count, wardrobe, props and stable ending', ()
   assert.match(result.full_prompt_string, /Scene-plan reference count: 1/i);
   assert.match(result.full_prompt_string, /authoritative in both directions/i);
   assert.match(result.full_prompt_string, /never become a realistic human/i);
+  assert.match(result.full_prompt_string, /Porcelain is visual appearance only/i);
+  assert.match(result.full_prompt_string, /moves exactly like a real human/i);
+  assert.match(result.full_prompt_string, /grounded weight transfer/i);
+  assert.match(result.full_prompt_string, /never foot-skate/i);
   assert.match(result.full_prompt_string, /orange canvas coveralls/i);
   assert.match(result.full_prompt_string, /steel wrench; diesel engine/i);
   assert.match(result.full_prompt_string, /Narration covered by this clip/i);

@@ -7,11 +7,13 @@
 import {
   S3Client,
   PutObjectCommand,
-  HeadObjectCommand,
   ListObjectsV2Command,
   DeleteObjectsCommand,
 } from '@aws-sdk/client-s3';
 import { randomUUID } from 'crypto';
+
+const R2_REQUEST_TIMEOUT_MS = 30_000;
+const R2_PUBLIC_CHECK_TIMEOUT_MS = 10_000;
 
 let clientState = null;
 const getClient = () => {
@@ -23,7 +25,12 @@ const getClient = () => {
     const publicUrl = process.env.R2_PUBLIC_URL;
 
     if (!accountId || !accessKeyId || !secretAccessKey || !bucketName || !publicUrl) {
-      clientState = { client: null };
+      clientState = {
+        client: null,
+        publicUrl: publicUrl
+          ? (publicUrl.endsWith('/') ? publicUrl.slice(0, -1) : publicUrl)
+          : null,
+      };
     } else {
       clientState = {
         client: new S3Client({
@@ -73,6 +80,27 @@ export const projectR2Prefix = (sessionId) =>
 export const projectR2AssetKey = (sessionId, relativePath, mimeType = 'image/jpeg') =>
   `${projectR2Prefix(sessionId)}assets/${normalizeRelativePath(relativePath, mimeType)}`;
 
+export const projectR2AssetUrl = (sessionId, relativePath, mimeType = 'image/jpeg') => {
+  const { publicUrl } = getClient();
+  if (!publicUrl) throw new Error('R2 storage is not configured in backend/.env');
+  return `${publicUrl}/${projectR2AssetKey(sessionId, relativePath, mimeType)}`;
+};
+
+const sendR2Command = async (client, command, label) => {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), R2_REQUEST_TIMEOUT_MS);
+  try {
+    return await client.send(command, { abortSignal: controller.signal });
+  } catch (error) {
+    if (controller.signal.aborted || error?.name === 'AbortError') {
+      throw new Error(`${label} timed out after ${R2_REQUEST_TIMEOUT_MS / 1000} seconds`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
+};
+
 // Upload a buffer under a deterministic project prefix and return its public URL.
 // Project scoping makes every remote object discoverable and deletable when the
 // corresponding local project is deleted.
@@ -80,12 +108,12 @@ export const uploadToR2 = async (buffer, mimeType, { sessionId, relativePath } =
   const { client, bucketName, publicUrl } = getClient();
   if (!client) throw new Error('R2 storage is not configured in backend/.env');
   const key = projectR2AssetKey(sessionId, relativePath, mimeType);
-  await client.send(new PutObjectCommand({
+  await sendR2Command(client, new PutObjectCommand({
     Bucket: bucketName,
     Key: key,
     Body: buffer,
     ContentType: mimeType,
-  }));
+  }), 'R2 upload');
   return `${publicUrl}/${key}`;
 };
 
@@ -96,21 +124,36 @@ export const ensureProjectAssetInR2 = async (buffer, mimeType, { sessionId, rela
   const { client, bucketName, publicUrl } = getClient();
   if (!client) throw new Error('R2 storage is not configured in backend/.env');
   const key = projectR2AssetKey(sessionId, relativePath, mimeType);
+  const assetUrl = `${publicUrl}/${key}`;
+
+  // The video provider only cares whether the public object is reachable.
+  // Prefer that inexpensive, bounded check over a signed S3 HeadObject call:
+  // Cloudflare can occasionally leave a signed HEAD socket open even while the
+  // same object is healthy on the public domain, blocking an entire video batch.
+  let response;
   try {
-    await client.send(new HeadObjectCommand({ Bucket: bucketName, Key: key }));
+    response = await fetch(assetUrl, {
+      method: 'HEAD',
+      signal: AbortSignal.timeout(R2_PUBLIC_CHECK_TIMEOUT_MS),
+    });
   } catch (error) {
-    const notFound = error?.name === 'NotFound'
-      || error?.name === 'NoSuchKey'
-      || error?.$metadata?.httpStatusCode === 404;
-    if (!notFound) throw error;
-    await client.send(new PutObjectCommand({
-      Bucket: bucketName,
-      Key: key,
-      Body: buffer,
-      ContentType: mimeType,
-    }));
+    const timedOut = error?.name === 'TimeoutError' || error?.name === 'AbortError';
+    throw new Error(timedOut
+      ? `R2 public asset check timed out after ${R2_PUBLIC_CHECK_TIMEOUT_MS / 1000} seconds`
+      : `R2 public asset check failed: ${error.message}`);
   }
-  return `${publicUrl}/${key}`;
+  if (response.ok) return assetUrl;
+  if (response.status !== 404) {
+    throw new Error(`R2 public asset check returned HTTP ${response.status}`);
+  }
+
+  await sendR2Command(client, new PutObjectCommand({
+    Bucket: bucketName,
+    Key: key,
+    Body: buffer,
+    ContentType: mimeType,
+  }), 'R2 upload');
+  return assetUrl;
 };
 
 // Delete every object owned by a ContentMachine project. R2 returns at most

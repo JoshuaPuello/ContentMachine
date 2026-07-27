@@ -46,11 +46,57 @@ export const validateVideoSubmission = (scene) => {
   const storyboard = prompt.match(/STORYBOARD \/ SHOT LIST[^\n]*:\s*\n([\s\S]*?)(?=\nENDING STATE:|$)/i)?.[1] || '';
   const firstShot = storyboard.match(/SHOT\s+1\s+[—-][^\n]*\n([\s\S]*?)(?=\nSHOT\s+\d+\s+[—-]|$)/i)?.[1]?.trim() || '';
   if (!firstShot) issues.push('video_prompt must contain a nonempty SHOT 1 storyboard beat');
-  const creativeMotion = prompt.match(/SCENE INTENT:\s*([\s\S]*?)(?=\nSTABILITY \/ NEGATIVE CONSTRAINTS:|$)/i)?.[1] || '';
+  // Validate directions that can actually change the generated frame. Narration
+  // and prior-frame references are documentary context, not motion commands.
+  // Treating those lines as creative directions caused valid clips to be
+  // rejected when (for example) a prior still-image prompt mentioned a smile.
+  const sceneIntent = prompt.match(/SCENE INTENT:\s*([^\n]*)/i)?.[1] || '';
+  const endingState = prompt.match(/ENDING STATE:\s*\n?([\s\S]*?)(?=\nCONTINUITY HANDOFF:|\nSTABILITY \/ NEGATIVE CONSTRAINTS:|$)/i)?.[1] || '';
+  const creativeMotion = [sceneIntent, storyboard, endingState].filter(Boolean).join('\n');
   const unsafeCreative = creativeMotion.match(/\b(?:becomes?|turns? into|morphs? into)\s+(?:a\s+)?(?:realistic\s+)?human\b|\beyes?\s+(?:open|blink)|\bblinks?\b|\bsmiles?\b|\blips?\s+(?:move|part)|\b(?:skin|flesh)\s+(?:appears?|forms?)\b|\b(?:second|another|additional|extra)\s+(?:person|figure|character|subject|worker|soldier|vehicle|animal)\b.{0,32}\b(?:enters?|appears?|emerges?|joins?)\b/i);
   if (unsafeCreative) issues.push(`video_prompt contains unsafe identity/entity drift: ${unsafeCreative[0]}`);
   return issues;
 };
+
+const validSessionId = (value) => /^[a-zA-Z0-9_-]+$/.test(String(value || ''));
+
+export const selectedImageReferenceFromProject = (project, unitId, sessionId) => {
+  const selected = project?.selected_images?.[String(unitId)];
+  const promptIndex = Number(selected?.promptIndex ?? selected?.prompt_index ?? 0);
+  const variant = Number.isInteger(promptIndex) && promptIndex >= 0 ? promptIndex : 0;
+  const stored = selected?.url || project?.images?.[`${unitId}_${variant}`]?.url || null;
+  if (!stored || typeof stored !== 'string') return null;
+  if (!stored.startsWith('__session_file__/')) return stored;
+  const relativePath = stored.slice('__session_file__/'.length);
+  if (!validSessionId(sessionId) || !relativePath || relativePath.includes('..')) return null;
+  return `/api/session/${encodeURIComponent(sessionId)}/files/${relativePath}`;
+};
+
+const recoverSelectedImageReference = async (imageUrl, sessionId, unitId) => {
+  if (typeof imageUrl === 'string' && imageUrl.trim()) return imageUrl;
+  if (!validSessionId(sessionId) || !unitId) return null;
+  try {
+    const project = JSON.parse(
+      await fs.readFile(path.join(OUTPUT_ROOT, String(sessionId), 'session.json'), 'utf8')
+    );
+    return selectedImageReferenceFromProject(project, unitId, sessionId);
+  } catch (error) {
+    if (error.code !== 'ENOENT') {
+      console.warn(`Could not restore selected image for ${unitId}: ${error.message}`);
+    }
+    return null;
+  }
+};
+
+const hydrateSceneImageReferences = async (scenes, sessionId) =>
+  Promise.all((scenes || []).map(async (scene) => ({
+    ...scene,
+    image_url: await recoverSelectedImageReference(
+      scene?.image_url,
+      sessionId,
+      scene?.scene_number
+    ),
+  })));
 
 export const requireHttpsImageUrl = (value, label = 'Selected source image') => {
   let parsed;
@@ -282,6 +328,22 @@ const GEMINIGEN_RESOLUTION = '720p';
 const GEMINIGEN_MODE_IMAGE = 'frame';
 // Models served through the GeminiGen provider and their fixed/allowed durations
 const GEMINIGEN_MODELS = new Set(['veo-3.1-fast', 'grok-3']);
+const submissionLedgerLoads = new Map();
+const submissionLedgerWrites = new Map();
+const activeBulkSubmissions = new Map();
+
+export const applySubmissionLedgerEntry = (entries, entry) => {
+  if (!entry?.fingerprint) return entries;
+  if (entry.status === 'failed' || entry.invalidated === true) {
+    const current = entries.get(entry.fingerprint);
+    if (!entry.jobId || current?.jobId === entry.jobId) {
+      entries.delete(entry.fingerprint);
+    }
+    return entries;
+  }
+  if (entry.jobId) entries.set(entry.fingerprint, entry);
+  return entries;
+};
 
 // Grok uses named aspect ratios instead of W:H strings
 const grokAspectRatio = (aspectRatio) => {
@@ -367,6 +429,176 @@ const createGeminigenJob = async (apiKey, prompt, imageUrl, aspectRatio, videoMo
     throw new Error('GeminiGen did not return a generation uuid');
   }
   return payload.uuid;
+};
+
+const submissionLedgerPath = (sessionId) =>
+  path.join(OUTPUT_ROOT, sessionId, 'video-submissions.jsonl');
+
+const loadSubmissionLedger = async (sessionId) => {
+  if (!submissionLedgerLoads.has(sessionId)) {
+    submissionLedgerLoads.set(sessionId, (async () => {
+      const entries = new Map();
+      try {
+        const raw = await fs.readFile(submissionLedgerPath(sessionId), 'utf8');
+        for (const line of raw.split('\n')) {
+          if (!line.trim()) continue;
+          try {
+            const entry = JSON.parse(line);
+            applySubmissionLedgerEntry(entries, entry);
+          } catch {
+            // Preserve later valid records even if one diagnostic line is damaged.
+          }
+        }
+      } catch (error) {
+        if (error.code !== 'ENOENT') throw error;
+      }
+      return entries;
+    })());
+  }
+  return submissionLedgerLoads.get(sessionId);
+};
+
+const appendSubmissionLedger = async (sessionId, entry) => {
+  const previous = submissionLedgerWrites.get(sessionId) || Promise.resolve();
+  const next = previous.then(async () => {
+    const filePath = submissionLedgerPath(sessionId);
+    await fs.mkdir(path.dirname(filePath), { recursive: true });
+    await fs.appendFile(filePath, `${JSON.stringify(entry)}\n`, 'utf8');
+    const ledger = await loadSubmissionLedger(sessionId);
+    applySubmissionLedgerEntry(ledger, entry);
+  });
+  submissionLedgerWrites.set(sessionId, next.catch(() => {}));
+  await next;
+};
+
+const bulkSubmissionFingerprint = ({
+  sessionId,
+  scene,
+  publicUrl,
+  aspectRatio,
+  videoModel,
+  duration,
+}) => createHash('sha256').update(JSON.stringify({
+  sessionId,
+  unitId: scene.scene_number,
+  prompt: scene.video_prompt,
+  publicUrl,
+  aspectRatio,
+  videoModel,
+  duration,
+})).digest('hex');
+
+const markGeminigenSubmissionFailed = async (sessionId, jobId, error) => {
+  if (!validSessionId(sessionId) || !jobId) return false;
+  const ledger = await loadSubmissionLedger(String(sessionId));
+  const match = [...ledger.entries()].find(([, entry]) => entry?.jobId === jobId);
+  if (!match) return false;
+  const [fingerprint, entry] = match;
+  await appendSubmissionLedger(String(sessionId), {
+    createdAt: new Date().toISOString(),
+    fingerprint,
+    unitId: entry.unitId,
+    jobId,
+    provider: 'geminigen',
+    model: entry.model,
+    duration: entry.duration,
+    status: 'failed',
+    invalidated: true,
+    error: String(error || 'GeminiGen generation failed').slice(0, 1000),
+  });
+  return true;
+};
+
+const createFreshGeminigenAttempt = async ({
+  apiKey,
+  scene,
+  publicUrl,
+  aspectRatio,
+  videoModel,
+  duration,
+  sessionId,
+}) => {
+  const fingerprint = bulkSubmissionFingerprint({
+    sessionId,
+    scene,
+    publicUrl,
+    aspectRatio,
+    videoModel,
+    duration,
+  });
+  // An explicit user Retry is intentional. It must never reuse a terminal
+  // provider job, even when the prompt and source image are byte-identical.
+  const uuid = await createGeminigenJob(
+    apiKey,
+    scene.video_prompt,
+    publicUrl,
+    aspectRatio,
+    videoModel,
+    duration
+  );
+  await appendSubmissionLedger(String(sessionId), {
+    createdAt: new Date().toISOString(),
+    fingerprint,
+    unitId: scene.scene_number,
+    jobId: uuid,
+    provider: 'geminigen',
+    model: videoModel,
+    duration,
+    status: 'submitted',
+    explicitRetry: true,
+  });
+  return uuid;
+};
+
+const createGeminigenBulkJobOnce = async ({
+  apiKey,
+  scene,
+  publicUrl,
+  aspectRatio,
+  videoModel,
+  duration,
+  sessionId,
+}) => {
+  const fingerprint = bulkSubmissionFingerprint({
+    sessionId,
+    scene,
+    publicUrl,
+    aspectRatio,
+    videoModel,
+    duration,
+  });
+  const ledger = await loadSubmissionLedger(sessionId);
+  const durable = ledger.get(fingerprint);
+  if (durable?.jobId) return { uuid: durable.jobId, reused: true };
+
+  if (activeBulkSubmissions.has(fingerprint)) {
+    return { uuid: await activeBulkSubmissions.get(fingerprint), reused: true };
+  }
+
+  const submission = createGeminigenJob(
+    apiKey,
+    scene.video_prompt,
+    publicUrl,
+    aspectRatio,
+    videoModel,
+    duration
+  );
+  activeBulkSubmissions.set(fingerprint, submission);
+  try {
+    const uuid = await submission;
+    await appendSubmissionLedger(sessionId, {
+      createdAt: new Date().toISOString(),
+      fingerprint,
+      unitId: scene.scene_number,
+      jobId: uuid,
+      provider: 'geminigen',
+      model: videoModel,
+      duration,
+    });
+    return { uuid, reused: false };
+  } finally {
+    activeBulkSubmissions.delete(fingerprint);
+  }
 };
 
 const looksLikeVideoUrl = (value) => {
@@ -472,7 +704,8 @@ router.post('/generate', async (req, res) => {
         code: 'VIDEO_CONCURRENCY_LIMIT',
       });
     }
-    const invalidScenes = scenes
+    const hydratedScenes = await hydrateSceneImageReferences(scenes, sessionId);
+    const invalidScenes = hydratedScenes
       .map(scene => ({ scene_number: scene?.scene_number, issues: validateVideoSubmission(scene) }))
       .filter(result => result.issues.length > 0);
     if (invalidScenes.length > 0) {
@@ -486,20 +719,36 @@ router.post('/generate', async (req, res) => {
 
     if (provider === 'geminigen') {
       const apiKey = getGeminigenKey(req);
+      if (!sessionId || !/^[a-zA-Z0-9_-]+$/.test(String(sessionId))) {
+        return res.status(400).json({
+          error: true,
+          message: 'A valid project session id is required for durable video submission.',
+          code: 'MISSING_VIDEO_SESSION',
+        });
+      }
 
       const geminigenModel = GEMINIGEN_MODELS.has(videoModel) ? videoModel : 'veo-3.1-fast';
       const processScene = async (scene) => {
         const duration = clampDuration(scene.duration_seconds, geminigenModel);
         const publicUrl = await resolvePublicImageUrl(req, scene.image_url, sessionId);
-        const uuid = await createGeminigenJob(apiKey, scene.video_prompt, publicUrl, aspectRatio, geminigenModel, duration);
+        const { uuid, reused } = await createGeminigenBulkJobOnce({
+          apiKey,
+          scene,
+          publicUrl,
+          aspectRatio,
+          videoModel: geminigenModel,
+          duration,
+          sessionId: String(sessionId),
+        });
         return {
           scene_number: scene.scene_number,
           job_id: uuid,
-          status: 'pending'
+          status: 'pending',
+          reused,
         };
       };
 
-      const jobs = await processInBatches(scenes, MAX_CONCURRENT_VIDEO_REQUESTS, processScene);
+      const jobs = await processInBatches(hydratedScenes, MAX_CONCURRENT_VIDEO_REQUESTS, processScene);
       return res.json(jobs);
     }
 
@@ -525,7 +774,7 @@ router.post('/generate', async (req, res) => {
         };
       };
       
-      const jobs = await processInBatches(scenes, MAX_CONCURRENT_VIDEO_REQUESTS, processScene);
+      const jobs = await processInBatches(hydratedScenes, MAX_CONCURRENT_VIDEO_REQUESTS, processScene);
       res.json(jobs);
       
     } else {
@@ -548,7 +797,7 @@ router.post('/generate', async (req, res) => {
         };
       };
       
-      const jobs = await processInBatches(scenes, MAX_CONCURRENT_VIDEO_REQUESTS, processScene);
+      const jobs = await processInBatches(hydratedScenes, MAX_CONCURRENT_VIDEO_REQUESTS, processScene);
       res.json(jobs);
     }
   } catch (error) {
@@ -560,11 +809,14 @@ router.post('/generate', async (req, res) => {
 router.get('/status/:jobId', async (req, res) => {
   try {
     const { jobId } = req.params;
-    const { provider = 'fal', falEndpoint } = req.query;
+    const { provider = 'fal', falEndpoint, sessionId } = req.query;
 
     if (provider === 'geminigen') {
       const apiKey = getGeminigenKey(req);
       const result = await getGeminigenStatus(apiKey, jobId);
+      if (result.status === 'failed') {
+        await markGeminigenSubmissionFailed(sessionId, jobId, result.error);
+      }
       return res.json(result);
     }
 
@@ -636,10 +888,11 @@ router.post('/regenerate', async (req, res) => {
       videoModel = 'lightricks/ltx-2-pro',
       sessionId,
     } = req.body;
+    const restoredImageUrl = await recoverSelectedImageReference(image_url, sessionId, scene_number);
     const submittedScene = {
       scene_number,
       video_prompt,
-      image_url,
+      image_url: restoredImageUrl,
       negative_prompt,
       motion_prompt_version,
       source_frame_locked,
@@ -659,19 +912,30 @@ router.post('/regenerate', async (req, res) => {
     if (provider === 'geminigen') {
       const apiKey = getGeminigenKey(req);
       const geminigenModel = GEMINIGEN_MODELS.has(videoModel) ? videoModel : 'veo-3.1-fast';
-      const publicUrl = await resolvePublicImageUrl(req, image_url, sessionId);
-      const uuid = await createGeminigenJob(apiKey, video_prompt, publicUrl, aspectRatio, geminigenModel, clampDuration(duration_seconds, geminigenModel));
+      const publicUrl = await resolvePublicImageUrl(req, restoredImageUrl, sessionId);
+      const geminigenDuration = clampDuration(duration_seconds, geminigenModel);
+      const uuid = await createFreshGeminigenAttempt({
+        apiKey,
+        scene: submittedScene,
+        publicUrl,
+        aspectRatio,
+        videoModel: geminigenModel,
+        duration: geminigenDuration,
+        sessionId: String(sessionId),
+      });
       return res.json({
         scene_number,
         job_id: uuid,
-        status: 'pending'
+        status: 'pending',
+        reused: false,
+        fresh_attempt: true,
       });
     }
 
     if (provider === 'replicate') {
       const replicate = getReplicateClient(req);
       // Upload base64 image to Replicate file store so the model gets an HTTPS URL
-      const resolvedImageUrl = await resolveImageUrl(image_url, 'replicate', replicate);
+      const resolvedImageUrl = await resolveImageUrl(restoredImageUrl, 'replicate', replicate);
       const sceneForBuilder = { ...submittedScene, image_url: resolvedImageUrl };
       const input = buildReplicateInput(videoModel, sceneForBuilder, duration, resolution, aspectRatio);
       
@@ -689,7 +953,7 @@ router.post('/regenerate', async (req, res) => {
       const fal = getFalClient(req);
       const falEndpoint = getFalEndpoint(videoModel);
       // Upload base64 image to fal storage so the model gets an HTTPS URL
-      const resolvedImageUrl = await resolveImageUrl(image_url, 'fal', fal);
+      const resolvedImageUrl = await resolveImageUrl(restoredImageUrl, 'fal', fal);
       const sceneForBuilder = { ...submittedScene, image_url: resolvedImageUrl };
       const falInput = buildFalInput(videoModel, sceneForBuilder, duration, resolution, aspectRatio);
       const { request_id } = await fal.queue.submit(falEndpoint, { input: falInput });

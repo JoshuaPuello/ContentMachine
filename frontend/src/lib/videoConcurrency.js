@@ -1,7 +1,10 @@
 export const MAX_CONCURRENT_VIDEO_REQUESTS = 10
 
 export const activeVideoRequestCount = (videoJobs = {}) =>
-  Object.values(videoJobs).filter(job => job?.jobId && job.status === 'pending').length
+  Object.values(videoJobs).filter(job => (
+    job?.status === 'submitting'
+    || (job?.jobId && job.status === 'pending')
+  )).length
 
 export const availableVideoRequestSlots = (
   videoJobs = {},
@@ -11,7 +14,8 @@ export const availableVideoRequestSlots = (
 export const queuedVideoUnitIds = (videoProgress = {}, videoJobs = {}) =>
   (videoProgress.pending || []).filter(unitId => {
     const job = videoJobs[unitId]
-    return !(job?.jobId && job.status === 'pending')
+    return job?.status !== 'submitting'
+      && !(job?.jobId && job.status === 'pending')
   })
 
 export const takeVideoSubmissionSlots = (

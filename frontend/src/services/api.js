@@ -47,11 +47,11 @@ const exportedApi = {
       context: intake.context || undefined,
     }).then(r => r.data),
 
-  extractCharacters: (story, scenePlan) =>
-    api.post('/claude/characters/extract', { story, scenePlan }, { timeout: 1000000 }).then(r => r.data),
+  extractCharacters: (story, scenePlan, narration) =>
+    api.post('/claude/characters/extract', { story, scenePlan, narration }, { timeout: 1000000 }).then(r => r.data),
 
-  linkCharacters: (characters, scenePlan) =>
-    api.post('/claude/characters/link', { characters, scenePlan }, { timeout: 1000000 }).then(r => r.data),
+  linkCharacters: (characters, scenePlan, narration) =>
+    api.post('/claude/characters/link', { characters, scenePlan, narration }, { timeout: 1000000 }).then(r => r.data),
   
   generateScenePlan: (story, maxMinutes, provider = 'fal', model, systemPrompt, videoModel) =>
     api.post('/claude/scene-planning', { story, maxMinutes, provider, model, systemPrompt: systemPrompt || undefined, videoModel }).then(r => r.data),
@@ -89,6 +89,34 @@ const exportedApi = {
   splitFullAudio: (audio, sceneScripts, sessionId) =>
     api.post('/audio/split', { audio, scenes: sceneScripts, sessionId }, { timeout: 1800000 }).then(r => r.data),
 
+  auditFullAudio: (audio, sceneScripts, sessionId, name) =>
+    api.post('/audio/audit', {
+      audio,
+      scenes: sceneScripts,
+      sessionId,
+      name,
+    }, { timeout: 1800000 }).then(r => r.data),
+
+  validateAudioMarker: (sessionId, auditId, marker) =>
+    api.post('/audio/audit/validate-marker', {
+      sessionId,
+      auditId,
+      ...marker,
+    }, { timeout: 300000 }).then(r => r.data),
+
+  repairFullAudio: (sessionId, auditId, issueIds) =>
+    api.post('/audio/audit/repair', {
+      sessionId,
+      auditId,
+      issueIds,
+    }, { timeout: 1800000 }).then(r => r.data),
+
+  approveFullAudio: (sessionId, auditId) =>
+    api.post('/audio/audit/approve', {
+      sessionId,
+      auditId,
+    }, { timeout: 1800000 }).then(r => r.data),
+
   // Store one audio blob server-side, get back a small URL. Audio must never
   // live as base64 in app state — it breaks persistence.
   storeAudio: (sessionId, sceneId, audio) =>
@@ -100,7 +128,7 @@ const exportedApi = {
   generateThumbnailPrompts: (story, selectedTitle, thumbnailConcept, provider = 'fal', model, systemPrompt) =>
     api.post('/claude/thumbnail-prompts', { story, selectedTitle, thumbnailConcept, provider, model, systemPrompt: systemPrompt || undefined }).then(r => r.data),
   
-  generateImages: (prompts, provider, model, aspectRatio, characterImages, characterDescription) => {
+  generateImages: (prompts, provider, model, aspectRatio, characterImages, characterDescription, characterReference) => {
     const charImgs = characterImages?.filter(Boolean) ?? []
     console.log('API generateImages request:', { promptCount: prompts?.length, provider, model, aspectRatio, charImgCount: charImgs.length, characterDescription: characterDescription || '(none)' })
     return api.post('/images/generate', {
@@ -110,6 +138,14 @@ const exportedApi = {
       aspectRatio,
       ...(charImgs.length ? { characterImages: charImgs } : {}),
       ...(characterDescription ? { characterDescription } : {}),
+      ...(characterReference?.name ? {
+        characterReference: {
+          name: characterReference.name,
+          role: characterReference.role,
+          description: characterReference.description,
+          character_type: characterReference.character_type,
+        },
+      } : {}),
     }).then(r => {
       console.log('API generateImages response:', r.data)
       return r.data
@@ -135,9 +171,10 @@ const exportedApi = {
   generateVideos: (scenes, provider = 'fal', resolution = '1080p', aspectRatio = '16:9', videoModel, sessionId) =>
     api.post('/videos/generate', { scenes, provider, resolution, aspectRatio, videoModel, sessionId }).then(r => r.data),
   
-  getVideoStatus: (jobId, provider = 'fal', falEndpoint) => {
+  getVideoStatus: (jobId, provider = 'fal', falEndpoint, sessionId) => {
     const params = new URLSearchParams({ provider });
     if (falEndpoint) params.set('falEndpoint', falEndpoint);
+    if (sessionId) params.set('sessionId', sessionId);
     return api.get(`/videos/status/${jobId}?${params}`).then(r => r.data);
   },
   

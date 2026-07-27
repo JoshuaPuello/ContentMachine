@@ -37,3 +37,20 @@ test('completed and failed jobs free slots while queued units remain discoverabl
   assert.equal(availableVideoRequestSlots(jobs), 9)
   assert.deepEqual(queuedVideoUnitIds(progress, jobs), ['4_0', '5_0'])
 })
+
+test('submission reservations occupy slots and cannot be queued twice', () => {
+  const jobs = Object.fromEntries(
+    Array.from({ length: 10 }, (_, index) => [
+      `${index + 1}_0`,
+      { status: 'submitting', submissionToken: `submission-${index + 1}` },
+    ])
+  )
+  const progress = {
+    pending: [...Object.keys(jobs), '11_0'],
+  }
+
+  assert.equal(activeVideoRequestCount(jobs), 10)
+  assert.equal(availableVideoRequestSlots(jobs), 0)
+  assert.deepEqual(queuedVideoUnitIds(progress, jobs), ['11_0'])
+  assert.deepEqual(takeVideoSubmissionSlots([{ scene_number: '11_0' }], jobs), [])
+})

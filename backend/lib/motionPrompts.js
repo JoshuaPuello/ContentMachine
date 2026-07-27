@@ -9,7 +9,7 @@ const SKILL_PATH = path.join(PROJECT_ROOT, '.claude', 'skills', 'seedance-2-0', 
 export const MOTION_PROMPT_MAX_CHARS = 5000;
 
 const SKILL_FALLBACK = `# Seedance 2.0 Motion Discipline
-The selected image is immutable frame zero. Preserve its composition, character count, identities, mannequin material, wardrobe, props, setting, lighting, and style. Direct motion only. Use one restrained camera move, one continuous take, physically plausible secondary motion, no invented entities, and a stable ending.`;
+The selected image is immutable frame zero. Preserve its composition, character count, identities, mannequin material, wardrobe, props, setting, lighting, and style. Porcelain is a visual surface treatment only: every represented person moves with natural human biomechanics, weight, balance, joint arcs, and object interaction—never like a toy, robot, puppet, statue, or rigid display mannequin. Direct motion only. Use one restrained camera move, one continuous take, physically plausible secondary motion, no invented entities, and a stable ending.`;
 
 const BASE_NEGATIVE_CONSTRAINTS = [
   'extra or missing figures',
@@ -27,6 +27,18 @@ const BASE_NEGATIVE_CONSTRAINTS = [
   'porcelain cracks',
   'seams',
   'doll joints',
+  'robotic stiffness',
+  'puppet motion',
+  'doll motion',
+  'statue motion',
+  'hinge-only articulation',
+  'foot skating',
+  'ground sliding',
+  'floating figures',
+  'weightless movement',
+  'impossible balance',
+  'rubber limbs',
+  'mechanically repeated gestures',
   'cuts',
   'montage',
   'teleportation',
@@ -96,6 +108,7 @@ ${loadSeedanceMotionSkill()}
 ## CONTENTMACHINE HARD CONTRACT
 - The actual selected image supplied to the video provider is frame zero and always overrides prose when they conflict.
 - Every visible person remains a seamless, featureless glossy porcelain mannequin for the entire clip. A mannequin must never become a realistic human or gain skin, eyes, a nose, a mouth, facial detail, cracks, seams, or joints.
+- PORCELAIN IS VISUAL ONLY: every mannequin represents a living human and must move with natural human biomechanics. Use believable center of gravity, weight transfer, balance, planted feet, joint arcs, reach, grip, inertia, anticipation, follow-through, and recovery. Respect age, build, injury, terrain, clothing, and carried weight. Never choreograph toy-like, robotic, puppet-like, statue-like, stiff display-mannequin, sliding, floating, weightless, or mechanically repeated motion.
 - Preserve the source-frame figure count, silhouettes, porcelain tones, sculpted/painted hair, complete clothing, footwear, accessories, props, composition, lighting, and environment.
 - Choose exactly ONE restrained primary camera move. Never combine moves into a showcase.
 - Write exactly one continuous take on the supplied two-second shot grid. No internal cuts, angle swaps, montages, teleports, transformations, or new entities.
@@ -122,6 +135,9 @@ export function buildMotionPromptUserContent(sceneData, { useSegments = true, re
 
 ${segmentInstruction}
 
+HUMAN-MOTION REQUIREMENT:
+Porcelain describes appearance only. Choreograph every represented person exactly like a real human body. Each subject_action must include physically credible weight, balance, foot contact, joint coordination, reach, grip, effort, and timing appropriate to the action. Never describe movement as mannequin-like, robotic, puppet-like, doll-like, statue-like, sliding, floating, weightless, or mechanically stiff.
+
 SCENES:
 ${JSON.stringify(prepared, null, 2)}${repairBlock}
 
@@ -139,7 +155,7 @@ Return ONLY this JSON array:
         {
           "shot": 1,
           "time": "00:00–00:02",
-          "subject_action": "Concrete physical action beginning exactly from the selected frame",
+          "subject_action": "Concrete physical action beginning exactly from the selected frame, with natural human biomechanics, weight transfer, balance, joint coordination, and object resistance",
           "camera_progression": "How the single primary move advances during this beat",
           "environment_motion": "One subtle physically plausible secondary motion, or none"
         }
@@ -231,6 +247,8 @@ export function validateMotionPromptBatch(items, sceneData) {
       if (appearingEntity) issues.push(`Unit ${key} invents a source-frame entity: ${appearingEntity[0]}.`);
       const gainedAnatomy = authoredMotion.match(/\b(?:gain(?:s|ed|ing)?|grow(?:s|ing)?|develop(?:s|ed|ing)?|sprout(?:s|ed|ing)?)\b.{0,48}\b(?:skin|eyes?|nose|mouth|face|facial features?|limbs?|arms?|legs?|hands?|fingers?)\b/);
       if (gainedAnatomy) issues.push(`Unit ${key} changes locked mannequin anatomy: ${gainedAnatomy[0]}.`);
+      const unnaturalBiomechanics = lockedSubjectMotion.match(/\b(?:moves?|walks?|runs?|turns?|reaches?|gestures?|rises?|sits?|stands?)\s+(?:with\s+)?(?:a\s+)?(?:robotic|mechanical|puppet[- ]like|doll[- ]like|toy[- ]like|statue[- ]like|mannequin[- ]like|rigid display-mannequin)\b|\b(?:robotic|puppet[- ]like|doll[- ]like|toy[- ]like|statue[- ]like|mannequin[- ]like)\s+(?:motion|movement|gait|gesture|steps?)\b|\b(?:foot skating|slides? across (?:the )?ground without stepping|floats? above (?:the )?ground|weightless movement|hinge-only articulation|rubber limbs?)\b/i);
+      if (unnaturalBiomechanics) issues.push(`Unit ${key} uses non-human mannequin biomechanics: ${unnaturalBiomechanics[0]}.`);
       const facialization = authoredMotion.match(/\b(?:eyes?\s+(?:open(?:s|ed|ing)?|blink(?:s|ed|ing)?)|blink(?:s|ed|ing)?|smil(?:e|es|ed|ing)|lips?\s+(?:move(?:s|d|ing)?|part(?:s|ed|ing)?)|skin|flesh)\b.{0,40}\b(?:appear(?:s|ed|ing)?|form(?:s|ed|ing)?|become(?:s|ing)?|lifelike|realistic|human)?|\bface\b.{0,32}\b(?:lifelike|realistic|human|animate(?:s|d|ing)?)\b/);
       if (facialization) issues.push(`Unit ${key} facializes a locked featureless mannequin: ${facialization[0]}.`);
       const wardrobeRecolor = authoredMotion.match(/\b(?:clothing|wardrobe|garments?|clothes|coveralls?|overalls?|shirt|jacket|coat|dress|uniform|trousers|pants|boots?|shoes?|hat|helmet)\b.{0,48}\b(?:turn(?:s|ed|ing)?|chang(?:e|es|ed|ing)|recolor(?:s|ed|ing)?|become(?:s|ing)?)\b.{0,24}\b(?:red|orange|yellow|green|blue|purple|pink|brown|black|white|grey|gray|silver|gold|beige|tan)\b/);
@@ -298,10 +316,10 @@ export function createFallbackMotionPromptBatch(sceneData, reason = '') {
         shot,
         time: `${secondsLabel(start)}–${secondsLabel(end)}`,
         subject_action: isFirst
-          ? 'Every visible subject begins in the exact source-frame pose; only the smallest physically plausible motion already implied by frame zero begins.'
+          ? 'Every visible subject begins in the exact source-frame pose; natural human weight, balance, and joint coordination initiate only the smallest physically plausible motion already implied by frame zero.'
           : isLast
-            ? 'The restrained action settles while every visible subject and prop finishes in a composed stable hold.'
-            : 'The same visible subjects continue one minimal physically plausible action without changing identity, count, wardrobe, or props.',
+            ? 'The restrained action settles through natural human deceleration, weight transfer, and balance recovery while every visible subject and prop finishes in a composed stable hold.'
+            : 'The same visible subjects continue one minimal action with natural human biomechanics, grounded weight, coordinated joints, and believable object resistance without changing identity, count, wardrobe, or props.',
         camera_progression: isLast
           ? 'The same near-locked documentary drift eases to a complete stop.'
           : 'The same near-locked documentary drift advances almost imperceptibly.',
@@ -317,7 +335,7 @@ export function createFallbackMotionPromptBatch(sceneData, reason = '') {
       authoring_source: 'protected-local-fallback',
       authoring_warning: compact(reason, 500) || undefined,
       video_prompt: {
-        scene_intent: 'Preserve the selected frame while the documented beat advances through restrained, physically plausible motion.',
+        scene_intent: 'Preserve the selected frame while the documented beat advances through restrained motion performed with natural human biomechanics; porcelain remains a visual surface treatment only.',
         primary_camera_move: 'near-locked documentary drift at 10% intensity',
         storyboard,
         ending_state: 'Every source-frame subject, garment, prop, and environmental feature remains intact as motion settles into a clean stable hold.',
@@ -395,7 +413,7 @@ function composeProtectedPrompt(scene, item, handoff = {}) {
     '',
     'CHARACTER / STYLE LOCK:',
     expectedCount,
-    `Every visible figure remains a seamless, featureless glossy porcelain mannequin in ${porcelainTone} for every frame. Preserve silhouette, proportions, sculpted or painted hair, accessories, and pristine surface. Never become a realistic human; never gain skin, eyes, nose, mouth, facial detail, cracks, seams, or doll joints.`,
+    `Every visible figure remains a seamless, featureless glossy porcelain mannequin in ${porcelainTone} for every frame. Porcelain is visual appearance only: each represented person moves exactly like a real human, with natural center of gravity, grounded weight transfer, balance, planted feet, coordinated joint arcs, reach, grip, inertia, effort, anticipation, follow-through, and recovery appropriate to age, build, injury, terrain, clothing, and carried weight. Never move like a toy, robot, puppet, doll, statue, or rigid display mannequin; never foot-skate, ground-slide, float, move weightlessly, use hinge-only articulation, rubber limbs, impossible balance, synchronized mechanical limbs, or repeated mechanical gestures. Preserve silhouette, proportions, sculpted or painted hair, accessories, and pristine surface. Never become a realistic human; never gain skin, eyes, nose, mouth, facial detail, cracks, seams, or doll joints.`,
     '',
     'WARDROBE LOCK:',
     clothing
@@ -423,7 +441,7 @@ function composeProtectedPrompt(scene, item, handoff = {}) {
       return [
         expected?.label || `SHOT ${index + 1}`,
         [
-          safeMotionText(beat.subject_action, 'The source-frame subject holds its pose with only subtle physically plausible settling.', 130),
+          safeMotionText(beat.subject_action, 'The source-frame subject holds its pose with subtle natural human breathing, grounded weight, and postural settling.', 130),
           safeMotionText(beat.camera_progression, 'The single camera move advances subtly and continuously.', 65),
           safeMotionText(beat.environment_motion, 'Environmental motion remains minimal and physically consistent.', 65),
         ].join(' '),
@@ -442,7 +460,7 @@ function composeProtectedPrompt(scene, item, handoff = {}) {
       'Advance from that completed beat without replaying it, but treat the current selected image as immutable frame zero whenever any prior state conflicts with it.',
     ].filter(Boolean) : []),
     'STABILITY / NEGATIVE CONSTRAINTS:',
-    'One continuous unbroken take. Begin exactly at the selected frame and finish in a stable hold with consistent lighting, geometry, edges, figure count, mannequin material, wardrobe, footwear, props, and setting. No dialogue or lip-sync; narration is supplied separately.',
+    'One continuous unbroken take. Begin exactly at the selected frame. Porcelain remains purely visual while every represented person obeys natural human biomechanics, grounded weight, balance, joint coordination, grip, inertia, and physically credible timing. Finish in a stable human hold with consistent lighting, geometry, edges, figure count, mannequin material, wardrobe, footwear, props, and setting. No dialogue or lip-sync; narration is supplied separately.',
     `Avoid: ${BASE_NEGATIVE_CONSTRAINTS.join(', ')}.`,
   ].join('\n');
 

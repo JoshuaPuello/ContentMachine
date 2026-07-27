@@ -5,6 +5,10 @@ import { usePipelineStore } from '../store/pipelineStore'
 import ImageCard from '../components/ImageCard'
 import ImageModal from '../components/ImageModal'
 import ExportModal from '../components/ExportModal'
+import {
+  areAllSelectableImageUnitsSelected,
+  selectableImageUnitCount,
+} from '../lib/imageSelection'
 import toast from 'react-hot-toast'
 
 // Derive human-readable duration range from the selected video model
@@ -203,6 +207,7 @@ function SceneImages() {
     settings,
     characters,
     characterSceneLinks,
+    characterAudit,
     characterStatus,
     characterError,
     prepareCharacters,
@@ -211,6 +216,8 @@ function SceneImages() {
     approveCharacters,
     setSceneCharacters,
     selectImage,
+    selectAllImages,
+    deselectAllImages,
     regenerateImage,
     editSceneImageWithAi,
     applySceneImageEdit,
@@ -224,9 +231,13 @@ function SceneImages() {
   } = usePipelineStore()
 
   // scenes = one entry per (scene, segment) unit; selection is per unit
-  const completedCount = Object.keys(selectedImages).length
+  const completedCount = scenes.filter(scene => (
+    selectedImages[`${scene.scene_number}_${scene.segment_index ?? 0}`]?.url
+  )).length
   const totalUnitCount = scenes.length
   const allSelected = completedCount === totalUnitCount && totalUnitCount > 0
+  const selectableUnitCount = selectableImageUnitCount(scenes, images)
+  const allAvailableSelected = areAllSelectableImageUnitsSelected(scenes, images, selectedImages)
 
   const imagesCompleteCount = Object.values(images).filter(img => img?.url && !img?.error).length
   const imagesTotalCount = scenes.reduce((sum, s) => sum + (s.prompts?.length ?? 0), 0)
@@ -349,6 +360,36 @@ function SceneImages() {
             </div>
           )}
 
+          {characterAudit && (
+            <div className="mb-5 rounded-xl border border-border bg-surface/60 px-4 py-3">
+              <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+                <p className="text-xs font-medium text-text-primary">
+                  Cast audit: {characterAudit.included_count ?? characters.length} recurring identit{(characterAudit.included_count ?? characters.length) === 1 ? 'y' : 'ies'}
+                </p>
+                {(characterAudit.excluded || []).length > 0 && (
+                  <span className="text-[10px] uppercase tracking-wider text-text-disabled">
+                    {characterAudit.excluded.length} scene-local candidate{characterAudit.excluded.length === 1 ? '' : 's'} excluded
+                  </span>
+                )}
+              </div>
+              {characterAudit.coverage_notes && (
+                <p className="text-[11px] text-text-secondary mt-1 leading-relaxed">{characterAudit.coverage_notes}</p>
+              )}
+              {(characterAudit.excluded || []).length > 0 && (
+                <details className="mt-2">
+                  <summary className="text-[10px] text-accent cursor-pointer select-none">Review excluded scene-local roles</summary>
+                  <div className="mt-2 space-y-1.5">
+                    {characterAudit.excluded.map((candidate, index) => (
+                      <p key={`${candidate.name}-${index}`} className="text-[10px] text-text-disabled">
+                        <span className="text-text-secondary">{candidate.name}</span> — {candidate.reason}
+                      </p>
+                    ))}
+                  </div>
+                </details>
+              )}
+            </div>
+          )}
+
           {characters.length > 0 && (
             <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
               {characters.map(character => (
@@ -378,12 +419,24 @@ function SceneImages() {
                         ))}
                       </div>
                     )}
-                    <button
-                      onClick={() => setCharacterEditor({ character, prompt: '', count: 1 })}
-                      className="btn-secondary w-full mt-4 py-2 text-xs"
-                    >
-                      Edit with AI
-                    </button>
+                    <div className="grid grid-cols-2 gap-2 mt-4">
+                      <button
+                        onClick={() => regenerateCharacter(character.id, character.visual_prompt, 1, false)
+                          .catch(error => toast.error(error.message))}
+                        disabled={character.generating}
+                        className="btn-secondary py-2 text-xs disabled:opacity-40"
+                        title="Create a fresh reference from the canonical mannequin identity prompt"
+                      >
+                        {character.generating ? 'Generating…' : 'Regenerate'}
+                      </button>
+                      <button
+                        onClick={() => setCharacterEditor({ character, prompt: '', count: 1 })}
+                        disabled={character.generating || !character.image}
+                        className="btn-secondary py-2 text-xs disabled:opacity-40"
+                      >
+                        Edit with AI
+                      </button>
+                    </div>
                   </div>
                 </div>
               ))}
@@ -414,7 +467,7 @@ function SceneImages() {
                     <button onClick={() => setCharacterEditor(null)} className="btn-ghost px-3 py-2 text-xs">Cancel</button>
                     <button onClick={async () => {
                       try {
-                        await regenerateCharacter(characterEditor.character.id, characterEditor.prompt, characterEditor.count)
+                        await regenerateCharacter(characterEditor.character.id, characterEditor.prompt, characterEditor.count, true)
                         setCharacterEditor(null)
                       } catch (error) { toast.error(error.message) }
                     }} disabled={!characterEditor.prompt.trim()} className="btn-primary px-4 py-2 text-xs disabled:opacity-40">Generate</button>
@@ -893,6 +946,14 @@ function SceneImages() {
               <span className="text-sm font-semibold text-text-primary">{completedCount}</span>
               <span className="text-sm text-text-secondary">/ {totalUnitCount} shots selected</span>
             </div>
+            {selectableUnitCount > 0 && (
+              <button
+                onClick={allAvailableSelected ? deselectAllImages : selectAllImages}
+                className="btn-ghost py-1 px-3 text-xs"
+              >
+                {allAvailableSelected ? 'Deselect All' : 'Select All'}
+              </button>
+            )}
             {!allSelected && completedCount > 0 && (
               <span className="text-xs text-text-disabled">
                 {totalUnitCount - completedCount} remaining

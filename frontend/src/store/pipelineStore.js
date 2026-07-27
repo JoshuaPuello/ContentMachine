@@ -33,6 +33,7 @@ import {
   clampFilmAmount,
   effectiveFilmTreatment,
 } from '../lib/filmTreatment'
+import { buildBulkImageSelection } from '../lib/imageSelection'
 
 // One session ID per browser tab — survives refresh but not tab close.
 // Format: session_YYYY-MM-DD_<random> so output folders are human-readable.
@@ -271,7 +272,7 @@ export const usePipelineStore = create(
         videoModel: 'lightricks/ltx-2-pro',
         videoResolution: '1080p',
         aspectRatio: '16:9',
-        audioMode: 'elevenlabs',   // 'elevenlabs' | 'manual'
+        audioMode: 'manual',
         // ── Segmentation knobs ──
         // Max clip length to request from the video model (null = model default/max)
         videoClipDuration: null,
@@ -436,6 +437,7 @@ export const usePipelineStore = create(
       // image model creates references, and generation waits for human approval.
       characters: [],
       characterSceneLinks: {},
+      characterAudit: null,
       characterStatus: 'idle', // idle | extracting | generating | review | linking | ready | error
       characterError: null,
 
@@ -882,6 +884,7 @@ export const usePipelineStore = create(
           renderJob: null,
           characters: [],
           characterSceneLinks: {},
+          characterAudit: null,
           characterStatus: 'idle',
           characterError: null,
         }))
@@ -889,20 +892,25 @@ export const usePipelineStore = create(
       },
 
       prepareCharacters: async () => {
-        const { selectedStory, scenePlan, settings } = get()
+        const { selectedStory, scenePlan, settings, ttsScript } = get()
         if (!selectedStory || !scenePlan?.scenes?.length) return []
         if (['extracting', 'generating', 'linking'].includes(get().characterStatus)) return get().characters
         const scope = captureProjectScope(get)
         set({ characterStatus: 'extracting', characterError: null })
         try {
-          const extracted = await api.extractCharacters(selectedStory, scenePlan)
+          const extracted = await api.extractCharacters(selectedStory, scenePlan, ttsScript)
           if (!isProjectScopeCurrent(get, scope)) return []
           const characters = extracted.characters || []
           if (characters.length === 0) {
-            set({ characters: [], characterSceneLinks: {}, characterStatus: 'ready' })
+            set({
+              characters: [],
+              characterSceneLinks: {},
+              characterAudit: extracted.audit || null,
+              characterStatus: 'ready',
+            })
             return []
           }
-          set({ characters, characterStatus: 'generating' })
+          set({ characters, characterAudit: extracted.audit || null, characterStatus: 'generating' })
           const generated = []
           for (const character of characters) {
             const result = await api.generateImages(
@@ -911,7 +919,8 @@ export const usePipelineStore = create(
               settings.imageModel,
               '9:16',
               [],
-              character.description
+              character.description,
+              character
             )
             if (!isProjectScopeCurrent(get, scope)) return []
             const option = result?.[0]
@@ -935,7 +944,7 @@ export const usePipelineStore = create(
         }
       },
 
-      regenerateCharacter: async (characterId, prompt, optionCount = 1) => {
+      regenerateCharacter: async (characterId, prompt, optionCount = 1, useCurrentReference = false) => {
         const state = get()
         const character = state.characters.find(item => item.id === characterId)
         if (!character) return []
@@ -943,7 +952,7 @@ export const usePipelineStore = create(
         set({ characters: state.characters.map(item => item.id === characterId ? { ...item, generating: true, error: null } : item) })
         try {
           const prompts = Array.from({ length: count }, () => prompt || character.visual_prompt)
-          const useVertexEdit = !!(character.image && state.settings.keysConfigured?.vertex)
+          const useVertexEdit = !!(useCurrentReference && character.image && state.settings.keysConfigured?.vertex)
           const editProvider = useVertexEdit ? 'vertex' : state.settings.imageProvider
           const editModel = useVertexEdit && state.settings.imageProvider !== 'vertex'
             ? 'gemini-2.5-flash-image'
@@ -953,8 +962,9 @@ export const usePipelineStore = create(
             editProvider,
             editModel,
             '9:16',
-            character.image ? [character.image] : [],
-            character.description
+            useCurrentReference && character.image ? [character.image] : [],
+            character.description,
+            character
           )
           const options = await Promise.all(result.filter(item => item?.url).map(async item => ({
             url: await toBase64DataUri(item.url),
@@ -964,7 +974,21 @@ export const usePipelineStore = create(
             characters: current.characters.map(item => item.id === characterId ? {
               ...item,
               generating: false,
-              image_options: options,
+              image: options[0]?.url || item.image,
+              image_options: (() => {
+                const candidates = [
+                  ...(item.image ? [{ url: item.image, prompt: item.visual_prompt }] : []),
+                  ...(item.image_options || []),
+                  ...options,
+                ]
+                const seen = new Set()
+                return candidates.filter(option => {
+                  if (!option?.url || seen.has(option.url)) return false
+                  seen.add(option.url)
+                  return true
+                })
+              })(),
+              approved: false,
               error: options.length ? null : 'No image returned',
             } : item),
           }))
@@ -981,7 +1005,7 @@ export const usePipelineStore = create(
       selectCharacterOption: (characterId, option) => {
         set(state => ({
           characters: state.characters.map(character => character.id === characterId
-            ? { ...character, image: option.url, visual_prompt: option.prompt || character.visual_prompt, approved: false }
+            ? { ...character, image: option.url, approved: false }
             : character),
         }))
         get().autoSaveSession()
@@ -991,7 +1015,7 @@ export const usePipelineStore = create(
         const approved = get().characters.map(character => ({ ...character, approved: !!character.image }))
         set({ characters: approved, characterStatus: 'linking', characterError: null })
         try {
-          const result = await api.linkCharacters(approved, get().scenePlan)
+          const result = await api.linkCharacters(approved, get().scenePlan, get().ttsScript)
           set({ characterSceneLinks: result.links || {}, characterStatus: 'ready' })
           get().autoSaveSession()
           return result.links || {}
@@ -1889,6 +1913,18 @@ export const usePipelineStore = create(
         }
       },
 
+      selectAllImages: () => {
+        const { scenes, images, selectedImages } = get()
+        const nextSelections = buildBulkImageSelection(scenes, images, selectedImages)
+        set({ selectedImages: nextSelections })
+        void get().autoSaveSession()
+      },
+
+      deselectAllImages: () => {
+        set({ selectedImages: {} })
+        void get().autoSaveSession()
+      },
+
       // ─── Video Prompts ────────────────────────────────────────────────────
       fetchVideoPrompts: async () => {
         const { scenePlan, selectedImages, settings, scenes } = get()
@@ -2345,6 +2381,7 @@ export const usePipelineStore = create(
             videoProgress.pending.includes(String(s.scene_number)) &&
             // Don't resubmit units whose job is already in flight — resuming
             // should only restart polling for those, not create duplicate jobs
+            currentJobs[s.scene_number]?.status !== 'submitting' &&
             !(currentJobs[s.scene_number]?.jobId && currentJobs[s.scene_number]?.status === 'pending')
           )
         }
@@ -2374,21 +2411,81 @@ export const usePipelineStore = create(
           return []
         }
 
+        const submissionToken = crypto.randomUUID()
+        const submittedUnitIds = scenesToProcess.map(scene => String(scene.scene_number))
+        const batchLabel = submittedUnitIds.length <= 3
+          ? submittedUnitIds.join(', ')
+          : `${submittedUnitIds[0]}–${submittedUnitIds[submittedUnitIds.length - 1]}`
+        const reservationEntries = Object.fromEntries(scenesToProcess.map(scene => [
+          scene.scene_number,
+          {
+            jobId: null,
+            status: 'submitting',
+            url: null,
+            error: null,
+            provider: settings.videoProvider,
+            submissionToken,
+          },
+        ]))
+
+        // Reserve every slot synchronously before the HTTP request starts.
+        // Polling and React effects can otherwise observe an empty videoJobs
+        // object and submit this exact batch a second time while R2 preparation
+        // is still running.
+        set(state => {
+          const allUnitKeys = videoPrompts.map(vp => unitKey(vp.scene_number, vp.segment_index ?? 0))
+          const alreadyCompleted = Object.keys(state.videoJobs)
+            .filter(key => state.videoJobs[key]?.status === 'completed')
+          return {
+            videoJobs: { ...state.videoJobs, ...reservationEntries },
+            generationState: 'running',
+            generationPhase: 'videos',
+            ...(!resumeFromPending ? {
+              videoProgress: {
+                total: videoPrompts.length,
+                completed: alreadyCompleted,
+                pending: allUnitKeys.filter(key => !alreadyCompleted.includes(key)),
+              },
+            } : {}),
+          }
+        })
+
         get().logActivity(
-          `Submitting ${scenesToProcess.length} video job${scenesToProcess.length > 1 ? 's' : ''} (${activeRequests + scenesToProcess.length}/${MAX_CONCURRENT_VIDEO_REQUESTS} provider slots)...`,
+          `Submitting ${scenesToProcess.length} video job${scenesToProcess.length > 1 ? 's' : ''} [${batchLabel}] (${activeRequests + scenesToProcess.length}/${MAX_CONCURRENT_VIDEO_REQUESTS} provider slots)...`,
           'running'
         )
-        const jobs = await api.generateVideos(
-          scenesToProcess, settings.videoProvider, settings.videoResolution, settings.aspectRatio, settings.videoModel, scope.sessionId
-        )
+        let jobs
+        try {
+          jobs = await api.generateVideos(
+            scenesToProcess, settings.videoProvider, settings.videoResolution, settings.aspectRatio, settings.videoModel, scope.sessionId
+          )
+        } catch (error) {
+          set(state => {
+            const videoJobs = { ...state.videoJobs }
+            for (const scene of scenesToProcess) {
+              if (videoJobs[scene.scene_number]?.submissionToken === submissionToken) {
+                delete videoJobs[scene.scene_number]
+              }
+            }
+            return { videoJobs, generationState: 'stopped' }
+          })
+          get().logActivity(
+            `Video batch [${batchLabel}] failed before provider acceptance: ${error.message}`,
+            'error'
+          )
+          throw error
+        }
         if (!isProjectScopeCurrent(get, scope)) return []
         {
           const submitted = jobs.filter(j => j.job_id).length
           const failed = jobs.length - submitted
+          const reused = jobs.filter(j => j.job_id && j.reused).length
           get().logActivity(
             failed > 0
-              ? `${submitted} video jobs submitted, ${failed} failed to submit`
-              : `${submitted} video jobs submitted — generating...`,
+              ? `Batch [${batchLabel}]: ${submitted} accepted, ${failed} rejected`
+              : reused > 0
+                ? `Batch [${batchLabel}]: ${submitted} provider jobs active (${reused} safely recovered)`
+                : `Batch [${batchLabel}]: ${submitted} provider jobs accepted — generating...`,
             failed > 0 ? 'error' : 'success'
           )
           jobs.filter(j => !j.job_id).forEach(j =>
@@ -2400,40 +2497,40 @@ export const usePipelineStore = create(
         // stale snapshot captured before the async API call
         const newEntries = {}
         jobs.forEach(job => {
-          if (job.job_id) {  // skip failed sentinels (no job_id)
-            newEntries[job.scene_number] = {
+          newEntries[job.scene_number] = job.job_id
+            ? {
               jobId: job.job_id,
               status: job.status,
               url: null,
               error: job.error || null,
               provider: settings.videoProvider,
               falEndpoint: job.fal_endpoint || null,
+              submissionToken: null,
             }
-          }
+            : {
+              jobId: null,
+              status: 'failed',
+              url: null,
+              error: job.error || 'Video provider rejected the submission',
+              provider: settings.videoProvider,
+              submissionToken: null,
+            }
         })
 
-        if (!resumeFromPending) {
-          set(state => {
-            const allUnitKeys = videoPrompts.map(vp => unitKey(vp.scene_number, vp.segment_index ?? 0))
-            const alreadyCompleted = Object.keys(state.videoJobs).filter(k => state.videoJobs[k]?.status === 'completed')
-            return {
-              videoJobs: { ...state.videoJobs, ...newEntries },
-              generationState: 'running',
-              generationPhase: 'videos',
-              videoProgress: {
-                total: videoPrompts.length,
-                completed: alreadyCompleted,
-                pending: allUnitKeys.filter(n => !alreadyCompleted.includes(n))
-              }
+        set(state => {
+          const videoJobs = { ...state.videoJobs }
+          for (const [unitId, entry] of Object.entries(newEntries)) {
+            if (videoJobs[unitId]?.submissionToken === submissionToken) {
+              videoJobs[unitId] = entry
             }
-          })
-        } else {
-          set(state => ({
-            videoJobs: { ...state.videoJobs, ...newEntries },
+          }
+          return {
+            videoJobs,
             generationState: 'running',
-            generationPhase: 'videos'
-          }))
-        }
+            generationPhase: 'videos',
+          }
+        })
+        void get().autoSaveSession()
 
         return jobs
       },
@@ -2444,9 +2541,30 @@ export const usePipelineStore = create(
       },
 
       resumeVideoGeneration: async () => {
-        const { videoProgress, videoPrompts } = get()
-        if (videoProgress.pending.length > 0 && videoPrompts.length > 0) {
-          set({ generationState: 'running', generationPhase: 'videos' })
+        const { videoPrompts, videoJobs } = get()
+        if (videoPrompts.length > 0) {
+          // Rebuild progress from the source-of-truth jobs. Older runs could
+          // display jobless cards as "generating" even though their progress
+          // metadata had drifted; those units must return to the real queue.
+          const allUnitIds = videoPrompts.map(prompt =>
+            unitKey(prompt.scene_number, prompt.segment_index ?? 0)
+          )
+          const completed = allUnitIds.filter(unitId =>
+            ['completed', 'failed'].includes(videoJobs[unitId]?.status)
+          )
+          const pending = allUnitIds.filter(unitId =>
+            !['completed', 'failed'].includes(videoJobs[unitId]?.status)
+          )
+          if (pending.length === 0) return
+          set({
+            videoProgress: {
+              total: allUnitIds.length,
+              completed,
+              pending,
+            },
+            generationState: 'running',
+            generationPhase: 'videos',
+          })
           await get().startVideoGeneration(videoPrompts, true)
         }
       },
@@ -2467,7 +2585,12 @@ export const usePipelineStore = create(
           : `Scene ${sceneNum}`
 
         try {
-          const result = await api.getVideoStatus(job.jobId, job.provider || 'fal', job.falEndpoint)
+          const result = await api.getVideoStatus(
+            job.jobId,
+            job.provider || 'fal',
+            job.falEndpoint,
+            scope.sessionId
+          )
           if (!isProjectScopeCurrent(get, scope)) return null
 
           set((state) => ({
@@ -2615,7 +2738,7 @@ export const usePipelineStore = create(
               ...state.videoJobs,
               [unitId]: {
                 jobId: null,
-                status: 'pending',
+                status: 'submitting',
                 url: null,
                 error: null,
                 provider: settings.videoProvider
@@ -2666,20 +2789,34 @@ export const usePipelineStore = create(
               generationPhase: 'videos'
             }
           })
+          get().logActivity(`Scene ${sceneNum}${segIdx ? ` · shot ${segIdx + 1}` : ''} submitted as a fresh provider attempt`, 'info')
+          get().autoSaveSession()
 
           return result
         } catch (error) {
+          const response = error?.response?.data
+          const backendDetails = Array.isArray(response?.issues)
+            ? response.issues.join('; ')
+            : Array.isArray(response?.scenes)
+              ? response.scenes
+                .flatMap(scene => (scene.issues || []).map(issue => `${scene.scene_number}: ${issue}`))
+                .join('; ')
+              : ''
+          const failureMessage = [
+            response?.message,
+            backendDetails,
+          ].filter(Boolean).join(' ') || error.message
           set((state) => ({
             videoJobs: {
               ...state.videoJobs,
               [unitId]: {
                 ...state.videoJobs[unitId],
                 status: 'failed',
-                error: error.message
+                error: failureMessage
               }
             }
           }))
-          throw error
+          throw new Error(failureMessage)
         }
       },
 
@@ -3025,6 +3162,258 @@ export const usePipelineStore = create(
         } catch (error) {
           set({ whisperStatus: 'error', whisperError: error.message })
           get().logActivity(`Whisper split failed: ${error.message}`, 'error')
+          throw error
+        }
+      },
+
+      // Stage 1 of the professional full-audio workflow. The immutable source
+      // is stored and audited, but existing scene slices remain untouched until
+      // the user explicitly approves a source or repaired version.
+      analyzeFullAudio: async (audioDataUri, meta = {}) => {
+        const scope = captureProjectScope(get)
+        const { ttsScript } = get()
+        if (!ttsScript?.scene_breakdown) throw new Error('No narration script — generate the script first')
+        const narrationUnits = ttsScript.narration_sequence || ttsScript.scene_breakdown
+        const sceneScripts = narrationUnits.map(unit => ({
+          scene_id: unit.unit_id || unit.scene_id,
+          kind: unit.cinema_type || 'scene',
+          text: (unit.lines || []).filter(line => !line.startsWith('[')).join(' '),
+        }))
+        set((state) => ({
+          whisperStatus: 'auditing',
+          whisperError: null,
+          audio: {
+            ...state.audio,
+            fullAudio: {
+              name: meta.name || 'full-audio',
+              durationSeconds: meta.durationSeconds || null,
+              status: 'auditing',
+              previousSceneAudioCount: Object.keys(state.audio.sceneAudio || {}).length,
+            },
+          },
+        }))
+        get().logActivity('Auditing full narration before scene splitting...', 'running')
+        try {
+          const result = await api.auditFullAudio(
+            audioDataUri,
+            sceneScripts,
+            getSessionId(),
+            meta.name || 'full-audio',
+          )
+          if (!isProjectScopeCurrent(get, scope)) return null
+          const audit = result.audit
+          const status = audit.summary?.overallStatus === 'clean' ? 'ready' : 'review-required'
+          set((state) => ({
+            whisperStatus: 'review',
+            audio: {
+              ...state.audio,
+              fullAudio: {
+                url: audit.sourceUrl,
+                sourceUrl: audit.sourceUrl,
+                name: meta.name || audit.originalName || 'full-audio',
+                durationSeconds: audit.durationSeconds,
+                auditId: audit.auditId,
+                status,
+                audit,
+                previousSceneAudioCount: Object.keys(state.audio.sceneAudio || {}).length,
+              },
+            },
+          }))
+          get().logActivity(
+            audit.summary?.issueCount
+              ? `Audio audit found ${audit.summary.issueCount} item${audit.summary.issueCount === 1 ? '' : 's'} to review`
+              : 'Audio passed the quality audit ✓',
+            audit.summary?.issueCount ? 'warning' : 'success',
+          )
+          get().autoSaveSession()
+          return audit
+        } catch (error) {
+          if (!isProjectScopeCurrent(get, scope)) return null
+          set((state) => ({
+            whisperStatus: 'error',
+            whisperError: error.message,
+            audio: {
+              ...state.audio,
+              fullAudio: { ...state.audio.fullAudio, status: 'error', error: error.message },
+            },
+          }))
+          get().logActivity(`Audio audit failed: ${error.message}`, 'error')
+          throw error
+        }
+      },
+
+      validateFullAudioMarker: async (marker) => {
+        const scope = captureProjectScope(get)
+        const fullAudio = get().audio.fullAudio
+        const activeAuditId = fullAudio?.previewVariant === 'repaired'
+          ? fullAudio.repair?.auditId
+          : fullAudio?.auditId
+        if (!activeAuditId) throw new Error('No audited full audio is available')
+        const result = await api.validateAudioMarker(
+          getSessionId(),
+          activeAuditId,
+          marker,
+        )
+        if (!isProjectScopeCurrent(get, scope)) return null
+        set((state) => {
+          const current = state.audio.fullAudio
+          const repaired = current?.previewVariant === 'repaired'
+          return {
+            audio: {
+              ...state.audio,
+              fullAudio: repaired
+                ? { ...current, repair: { ...current.repair, audit: result.audit }, status: 'review-required' }
+                : { ...current, audit: result.audit, status: 'review-required' },
+            },
+          }
+        })
+        get().autoSaveSession()
+        return result
+      },
+
+      repairAuditedFullAudio: async (issueIds) => {
+        const scope = captureProjectScope(get)
+        const fullAudio = get().audio.fullAudio
+        if (!fullAudio?.auditId) throw new Error('No audited full audio is available')
+        set((state) => ({
+          whisperStatus: 'repairing',
+          whisperError: null,
+          audio: {
+            ...state.audio,
+            fullAudio: { ...state.audio.fullAudio, status: 'repairing' },
+          },
+        }))
+        get().logActivity('Creating a non-destructive improved narration master...', 'running')
+        try {
+          const result = await api.repairFullAudio(
+            getSessionId(),
+            fullAudio.auditId,
+            issueIds,
+          )
+          if (!isProjectScopeCurrent(get, scope)) return null
+          set((state) => ({
+            whisperStatus: 'review',
+            audio: {
+              ...state.audio,
+              fullAudio: {
+                ...state.audio.fullAudio,
+                repairedUrl: result.repairedUrl,
+                repair: {
+                  url: result.repairedUrl,
+                  auditId: result.repairAuditId,
+                  audit: result.audit,
+                  appliedFixes: result.appliedFixes,
+                },
+                previewVariant: 'repaired',
+                status: 'repaired',
+              },
+            },
+          }))
+          get().logActivity(`Improved master ready — ${result.appliedFixes.length} repair${result.appliedFixes.length === 1 ? '' : 's'} applied`, 'success')
+          get().autoSaveSession()
+          return result
+        } catch (error) {
+          if (!isProjectScopeCurrent(get, scope)) return null
+          set((state) => ({
+            whisperStatus: 'error',
+            whisperError: error.message,
+            audio: {
+              ...state.audio,
+              fullAudio: { ...state.audio.fullAudio, status: 'review-required', error: error.message },
+            },
+          }))
+          get().logActivity(`Audio repair failed: ${error.message}`, 'error')
+          throw error
+        }
+      },
+
+      setFullAudioPreviewVariant: (previewVariant) => set((state) => ({
+        audio: {
+          ...state.audio,
+          fullAudio: { ...state.audio.fullAudio, previewVariant },
+        },
+      })),
+
+      approveAuditedFullAudio: async (variant = 'source') => {
+        const scope = captureProjectScope(get)
+        const { ttsScript, audio } = get()
+        const fullAudio = audio.fullAudio
+        const approvedAuditId = variant === 'repaired'
+          ? fullAudio?.repair?.auditId
+          : fullAudio?.auditId
+        if (!approvedAuditId) throw new Error(`The ${variant} audio version is not available`)
+        const narrationUnits = ttsScript?.narration_sequence || ttsScript?.scene_breakdown || []
+        set((state) => ({
+          whisperStatus: 'splitting',
+          whisperError: null,
+          audio: {
+            ...state.audio,
+            fullAudio: { ...state.audio.fullAudio, status: 'splitting' },
+          },
+        }))
+        get().logActivity(`Approving ${variant} master and creating scene narration slices...`, 'running')
+        try {
+          const result = await api.approveFullAudio(getSessionId(), approvedAuditId)
+          if (!isProjectScopeCurrent(get, scope)) return null
+          const nextSceneAudio = {}
+          for (const slice of result.scenes || []) {
+            const breakdown = narrationUnits.find(unit => (unit.unit_id || unit.scene_id) === slice.scene_id)
+            nextSceneAudio[slice.scene_id] = {
+              parts: [
+                ...((breakdown?.lines || []).filter(line => line.startsWith('[')).map(line => ({ type: 'cue', content: line }))),
+                {
+                  type: 'audio',
+                  content: slice.url,
+                  text: (breakdown?.lines || []).filter(line => !line.startsWith('[')).join(' '),
+                  manual: true,
+                  whisper: true,
+                  cinemaType: breakdown?.cinema_type || 'scene',
+                },
+              ],
+              loading: false,
+              durationSeconds: slice.durationSeconds,
+              startSeconds: slice.startSeconds,
+              endSeconds: slice.endSeconds,
+              speechStartSeconds: slice.speechStartSeconds,
+              speechEndSeconds: slice.speechEndSeconds,
+              matchRatio: slice.matchRatio,
+              lowConfidence: slice.lowConfidence,
+              wordTimings: slice.wordTimings || [],
+            }
+          }
+          set((state) => ({
+            whisperStatus: 'done',
+            audio: {
+              ...state.audio,
+              sceneAudio: nextSceneAudio,
+              fullAudio: {
+                ...state.audio.fullAudio,
+                url: result.approvedUrl,
+                approvedUrl: result.approvedUrl,
+                approvedAuditId: result.approvedAuditId,
+                approvedVariant: variant,
+                status: 'split',
+                audit: variant === 'source' ? result.audit : state.audio.fullAudio.audit,
+                repair: variant === 'repaired'
+                  ? { ...state.audio.fullAudio.repair, audit: result.audit }
+                  : state.audio.fullAudio.repair,
+              },
+            },
+          }))
+          get().logActivity(`Approved audio split into ${result.scenes.length} narration units ✓`, 'success')
+          get().autoSaveSession()
+          return result.scenes
+        } catch (error) {
+          if (!isProjectScopeCurrent(get, scope)) return null
+          set((state) => ({
+            whisperStatus: 'error',
+            whisperError: error.message,
+            audio: {
+              ...state.audio,
+              fullAudio: { ...state.audio.fullAudio, status: 'review-required', error: error.message },
+            },
+          }))
+          get().logActivity(`Audio approval failed: ${error.message}`, 'error')
           throw error
         }
       },
@@ -4089,6 +4478,7 @@ export const usePipelineStore = create(
           selectedImages: project.selected_images || {},
           characters: project.characters || [],
           characterSceneLinks: project.character_scene_links || {},
+          characterAudit: project.character_audit || null,
           characterStatus: project.character_status
             || ((project.characters || []).length ? 'ready' : 'idle'),
           characterError: null,
@@ -4232,6 +4622,7 @@ export const usePipelineStore = create(
           selected_images: state.selectedImages,
           characters: state.characters,
           character_scene_links: state.characterSceneLinks,
+          character_audit: state.characterAudit,
           character_status: state.characterStatus,
           video_prompts: state.videoPrompts,
           video_jobs: state.videoJobs,
@@ -4618,6 +5009,7 @@ export const usePipelineStore = create(
           characterDescription: '',
           characters: [],
           characterSceneLinks: {},
+          characterAudit: null,
           characterStatus: 'idle',
           characterError: null,
           storyInputMode: 'discover',
@@ -4656,6 +5048,7 @@ export const usePipelineStore = create(
           })),
         })),
         characterSceneLinks: state.characterSceneLinks,
+        characterAudit: state.characterAudit,
         characterStatus: state.characterStatus,
         expressiveScript: state.expressiveScript,
         // images/thumbnails/selectedImages are NOT persisted — base64 blobs blow out localStorage

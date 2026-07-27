@@ -5,6 +5,8 @@ import { usePipelineStore } from '../store/pipelineStore'
 import { planSceneSegments, getClipOptions } from '../lib/segmentation'
 import api from '../services/api'
 import toast from 'react-hot-toast'
+import AudioReviewPanel from '../components/audio/AudioReviewPanel'
+import { useExclusiveAudioPlayer } from '../hooks/useExclusiveAudioPlayer'
 
 // Read an uploaded audio file as a base64 data URI so it flows through the
 // existing store/export pipeline exactly like ElevenLabs-generated audio.
@@ -57,16 +59,13 @@ const sfxPromptText = (cue, unit) => {
 
 function AudioGeneration() {
   const navigate = useNavigate()
-  const [voices, setVoices] = useState([])
-  const [selectedVoice, setSelectedVoice] = useState(null)
-  const [voicesLoading, setVoicesLoading] = useState(false)
   // Track per-item loading instead of a global boolean to avoid blocking
   const [itemLoading, setItemLoading] = useState({})
-  const audioRefs = useRef({})
   const sceneUploadRefs = useRef({})
   const sfxUploadRefs = useRef({})
   const fullAudioUploadRef = useRef(null)
   const ttsFetchStartedRef = useRef(false)
+  const player = useExclusiveAudioPlayer()
 
   const {
     selectedStory,
@@ -81,28 +80,28 @@ function AudioGeneration() {
     expressiveScript,
     expressiveLoading,
     expressiveError,
-    whisperStatus,
     setSceneAudio,
     setSfxAudio,
-    setFullAudio,
     storeAudioAsset,
     autoSaveSession,
-    setAudioMode,
     setAudioScriptFormat,
     fetchTtsScript,
     retryTtsScript,
     retryScenePlan,
     fetchExpressiveScript,
-    splitFullAudio,
+    analyzeFullAudio,
+    validateFullAudioMarker,
+    repairAuditedFullAudio,
+    approveAuditedFullAudio,
+    setFullAudioPreviewVariant,
   } = usePipelineStore()
 
   const hasElevenLabs = settings.keysConfigured?.elevenlabs
-  const audioMode = settings.audioMode || 'elevenlabs'
-  const isManual = audioMode === 'manual'
   const scriptFormat = settings.audioScriptFormat || 'plain'
   const sceneAudio = audio.sceneAudio || {}
   const sfxAudio   = audio.sfxAudio   || {}
   const fullAudio  = audio.fullAudio  || null
+  const audioReviewPending = Boolean(fullAudio?.status && fullAudio.status !== 'split')
 
   // Redirect home when no story; fetch the narration script if it isn't
   // already being written (fetchScenePlan kicks it off automatically)
@@ -114,72 +113,7 @@ function AudioGeneration() {
     }
   }, [selectedStory, scenePlan, ttsScript, ttsLoading])
 
-  useEffect(() => {
-    if (hasElevenLabs && !isManual) loadVoices()
-  }, [hasElevenLabs, isManual])
-
-  const loadVoices = async () => {
-    setVoicesLoading(true)
-    try {
-      const voiceList = await api.getElevenLabsVoices()
-      setVoices(voiceList)
-      if (voiceList.length > 0) setSelectedVoice(voiceList[0].id)
-    } catch (error) {
-      toast.error('Failed to load voices')
-      console.error('Voices error:', error)
-    }
-    setVoicesLoading(false)
-  }
-
   const setLoading = (id, value) => setItemLoading(prev => ({ ...prev, [id]: value }))
-
-  // Sum the duration of all audio parts of a scene (ElevenLabs generates
-  // one part per line)
-  const measurePartsDuration = async (parts) => {
-    const audioParts = (parts || []).filter(p => p.type === 'audio' && p.content)
-    let total = 0
-    const durations = []
-    for (const p of audioParts) {
-      const d = await measureAudioDuration(p.content)
-      durations.push(d)
-      if (d) total += d
-    }
-    return { durationSeconds: total > 0 ? total : null, durations }
-  }
-
-  const handleGenerateSceneAudio = async (sceneId, lines) => {
-    if (!selectedVoice) { toast.error('Select a voice first'); return }
-    if (itemLoading[sceneId]) return
-
-    setLoading(sceneId, true)
-    setSceneAudio(sceneId, { loading: true })
-
-    try {
-      const result = await api.generateSceneTts(lines, selectedVoice)
-      const measured = await measurePartsDuration(result.parts)
-      const durationSeconds = measured.durationSeconds
-      // Persist base64 parts as server files immediately — state only ever
-      // holds small URLs, so nothing is lost on refresh
-      const parts = []
-      let audioIndex = 0
-      for (const [pi, part] of (result.parts || []).entries()) {
-        const partDuration = part.type === 'audio' ? measured.durations[audioIndex++] : null
-        if (part.type === 'audio' && part.content?.startsWith('data:')) {
-          const url = await storeAudioAsset(`${sceneId}_p${pi + 1}`, part.content)
-          parts.push({ ...part, content: url, durationSeconds: partDuration })
-        } else {
-          parts.push(part.type === 'audio' ? { ...part, durationSeconds: partDuration } : part)
-        }
-      }
-      setSceneAudio(sceneId, { parts, loading: false, durationSeconds })
-      autoSaveSession()
-      toast.success(`Audio ready for ${sceneId}`, { id: `audio-${sceneId}` })
-    } catch (error) {
-      setSceneAudio(sceneId, { error: error.message, loading: false })
-      toast.error(`Audio failed for ${sceneId}: ${error.message}`)
-    }
-    setLoading(sceneId, false)
-  }
 
   const handleGenerateSfx = async (cue) => {
     if (itemLoading[cue]) return
@@ -256,32 +190,24 @@ function AudioGeneration() {
     }
   }
 
-  // Full narration in one file → Whisper aligns it to the script and splits
-  // it into per-scene slices automatically
+  // Full narration is persisted and audited first. Scene slices are created
+  // only after the user approves the source or repaired master.
   const handleFullAudioUpload = async (file) => {
     if (!file) return
     try {
       const dataUri = await fileToDataUri(file)
       const durationSeconds = await measureAudioDuration(dataUri)
-      toast.loading('Splitting audio with Whisper — this can take a minute...', { id: 'whisper' })
-      // The backend stores the recording + slices as files and returns URLs;
-      // splitFullAudio() sets fullAudio and per-scene audio in the store
-      const slices = await splitFullAudio(dataUri, { name: file.name, durationSeconds })
-      toast.success(`Audio split into ${slices.length} scenes`, { id: 'whisper' })
+      toast.loading('Auditing narration pacing and signal quality…', { id: 'whisper' })
+      const audit = await analyzeFullAudio(dataUri, { name: file.name, durationSeconds })
+      toast.success(
+        audit.summary?.issueCount
+          ? `${audit.summary.issueCount} audio finding${audit.summary.issueCount === 1 ? '' : 's'} ready to review`
+          : 'Audio passed quality review',
+        { id: 'whisper' },
+      )
     } catch (err) {
-      toast.error(`Audio split failed: ${err.message}`, { id: 'whisper' })
+      toast.error(`Audio audit failed: ${err.message}`, { id: 'whisper' })
     }
-  }
-
-  const handlePlayAudio = (audioData, id) => {
-    // Stop any currently playing audio for this id
-    if (audioRefs.current[id]) {
-      audioRefs.current[id].pause()
-      audioRefs.current[id].currentTime = 0
-    }
-    const audio = new Audio(audioData)
-    audioRefs.current[id] = audio
-    audio.play().catch(err => toast.error(`Playback failed: ${err.message}`))
   }
 
   const pageVariants = {
@@ -324,8 +250,6 @@ function AudioGeneration() {
   const totalShots = (ttsScript?.scene_breakdown || [])
     .reduce((sum, s) => sum + segmentsFor(s).length, 0)
 
-  const showElevenLabsGate = !isManual && !hasElevenLabs
-
   return (
     <motion.div
       variants={pageVariants} initial="initial" animate="animate" exit="exit"
@@ -351,22 +275,9 @@ function AudioGeneration() {
                 )}
               </div>
             )}
-            {/* Mode toggle */}
-            <div className="grid grid-cols-2 gap-1 bg-surface-raised rounded-lg p-1">
-              {[
-                { id: 'elevenlabs', label: 'ElevenLabs' },
-                { id: 'manual', label: 'Manual' }
-              ].map(m => (
-                <button key={m.id}
-                  onClick={() => setAudioMode(m.id)}
-                  className={`px-3 py-1 rounded-md text-xs font-medium transition-all ${
-                    audioMode === m.id
-                      ? 'bg-surface text-text-primary shadow-sm'
-                      : 'text-text-secondary hover:text-text-primary'
-                  }`}
-                >{m.label}</button>
-              ))}
-            </div>
+            <span className="px-3 py-1.5 rounded-lg border border-border bg-surface-raised text-[10px] uppercase tracking-[0.15em] text-text-secondary">
+              Manual narration workflow
+            </span>
           </div>
         </div>
       </div>
@@ -513,135 +424,85 @@ function AudioGeneration() {
               )}
             </div>
 
-            {/* ── Full audio upload + Whisper split ── */}
-            <div className="bg-surface border border-border rounded-xl p-5">
-              <div className="flex items-center justify-between mb-2">
+            {/* ── Full audio quality gate ── */}
+            <input
+              ref={fullAudioUploadRef}
+              type="file"
+              accept="audio/*"
+              className="hidden"
+              onChange={event => {
+                handleFullAudioUpload(event.target.files?.[0])
+                event.target.value = ''
+              }}
+            />
+            {!fullAudio ? (
+              <div className="bg-surface border border-border rounded-xl p-5 flex items-center justify-between gap-5">
                 <div>
-                  <h3 className="text-sm font-semibold text-text-primary">Full Audio → Auto-Split</h3>
+                  <h3 className="text-sm font-semibold text-text-primary">Full narration · Quality review</h3>
                   <p className="text-[11px] text-text-secondary mt-0.5">
                     {settings.keysConfigured?.whisper
-                      ? 'Upload one recording of the whole script — Whisper (local) aligns it to each scene\'s text and cuts it automatically'
-                      : 'Requires local Whisper + ffmpeg (pip install openai-whisper) — restart the backend after installing'}
+                      ? 'Upload one recording. The source is preserved, transcribed, checked for pacing and signal defects, then reviewed before scene splitting.'
+                      : 'Requires local Whisper + ffmpeg (pip install openai-whisper) — restart the backend after installing.'}
                   </p>
                 </div>
-                <div className="flex items-center gap-2">
-                  {fullAudio && (
-                    <button
-                      onClick={() => handlePlayAudio(fullAudio.url || fullAudio.dataUri, 'full-audio')}
-                      className="flex items-center gap-1 text-xs text-accent hover:text-accent-hover font-medium"
-                    >
-                      <svg className="w-3.5 h-3.5" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
-                      Play Full Audio
-                    </button>
-                  )}
-                  <input
-                    ref={fullAudioUploadRef}
-                    type="file"
-                    accept="audio/*"
-                    className="hidden"
-                    onChange={e => {
-                      handleFullAudioUpload(e.target.files?.[0])
-                      e.target.value = ''
-                    }}
-                  />
-                  <button
-                    onClick={() => fullAudioUploadRef.current?.click()}
-                    disabled={whisperStatus === 'transcribing' || !settings.keysConfigured?.whisper}
-                    className="btn-primary py-1.5 px-3 text-xs disabled:opacity-40"
-                  >
-                    {whisperStatus === 'transcribing' ? (
-                      <span className="flex items-center gap-1.5">
-                        <div className="w-2.5 h-2.5 border border-white border-t-transparent rounded-full animate-spin" />
-                        Splitting...
-                      </span>
-                    ) : fullAudio ? 'Replace Full Audio' : 'Upload Full Audio'}
-                  </button>
-                </div>
+                <button
+                  onClick={() => fullAudioUploadRef.current?.click()}
+                  disabled={!settings.keysConfigured?.whisper}
+                  className="btn-primary py-2 px-4 text-xs disabled:opacity-40 shrink-0"
+                >
+                  Upload & audit audio
+                </button>
               </div>
-              {fullAudio && (
-                <p className="text-[10px] text-text-disabled">
-                  {fullAudio.name}{fullAudio.durationSeconds ? ` · ${Math.round(fullAudio.durationSeconds)}s` : ''}
-                  {whisperStatus === 'done' && <span className="text-success ml-2">✓ split into scenes</span>}
-                </p>
-              )}
-            </div>
+            ) : (
+              <AudioReviewPanel
+                fullAudio={fullAudio}
+                player={player}
+                onReplace={() => fullAudioUploadRef.current?.click()}
+                onRepair={async (issueIds) => {
+                  try {
+                    toast.loading('Creating and verifying an improved master…', { id: 'audio-repair' })
+                    await repairAuditedFullAudio(issueIds)
+                    toast.success('Improved master ready for A/B review', { id: 'audio-repair' })
+                  } catch (error) {
+                    toast.error(error.message, { id: 'audio-repair' })
+                  }
+                }}
+                onApprove={async (variant) => {
+                  try {
+                    toast.loading('Approving audio and creating scene slices…', { id: 'audio-approve' })
+                    const slices = await approveAuditedFullAudio(variant)
+                    toast.success(`${slices.length} narration units are ready`, { id: 'audio-approve' })
+                  } catch (error) {
+                    toast.error(error.message, { id: 'audio-approve' })
+                  }
+                }}
+                onValidateMarker={async (marker) => {
+                  const result = await validateFullAudioMarker(marker)
+                  toast[result.validation?.confirmed ? 'success' : 'error'](
+                    result.validation?.message || 'Marker saved for review',
+                  )
+                }}
+                onVariantChange={setFullAudioPreviewVariant}
+              />
+            )}
           </>
         )}
 
-        {showElevenLabsGate && ttsScript?.scene_breakdown ? (
-          /* No ElevenLabs key */
-          <div className="bg-surface border border-border rounded-xl p-10 text-center">
-            <div className="w-14 h-14 mx-auto mb-4 rounded-full bg-surface-raised flex items-center justify-center">
-              <svg className="w-7 h-7 text-text-disabled" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5}
-                  d="M15.536 8.464a5 5 0 010 7.072m2.828-9.9a9 9 0 010 12.728M5.586 15H4a1 1 0 01-1-1v-4a1 1 0 011-1h1.586l4.707-4.707C10.923 3.663 12 4.109 12 5v14c0 .891-1.077 1.337-1.707.707L5.586 15z" />
-              </svg>
-            </div>
-            <h3 className="text-base font-semibold text-text-primary mb-2">ElevenLabs Not Configured</h3>
-            <p className="text-sm text-text-secondary mb-5">
-              Add your ElevenLabs API key in Settings — or switch to Manual mode to copy the prompts and provide the audio files yourself.
-            </p>
-            <button onClick={() => setAudioMode('manual')} className="btn-primary px-6 py-2 text-sm">
-              Use Manual Mode
-            </button>
-          </div>
-        ) : ttsScript?.scene_breakdown ? (
+        {ttsScript?.scene_breakdown ? (
           <>
-            {/* Voice selection — ElevenLabs mode only */}
-            {!isManual && (
-              <div className="bg-surface border border-border rounded-xl p-5">
-                <h3 className="text-sm font-semibold text-text-primary mb-3">Voice</h3>
-                {voicesLoading ? (
-                  <div className="h-9 skeleton rounded-lg w-full" />
-                ) : voices.length === 0 ? (
-                  <div className="flex items-center gap-3">
-                    <p className="text-sm text-text-secondary">No voices loaded.</p>
-                    <button onClick={loadVoices} className="btn-secondary py-1.5 px-3 text-xs">Reload</button>
-                  </div>
-                ) : (
-                  <select
-                    value={selectedVoice || ''}
-                    onChange={e => setSelectedVoice(e.target.value)}
-                    className="w-full text-sm"
-                  >
-                    {voices.map(voice => (
-                      <option key={voice.id} value={voice.id}>
-                        {voice.name}{voice.labels?.accent ? ` (${voice.labels.accent})` : ''}
-                      </option>
-                    ))}
-                  </select>
-                )}
-              </div>
-            )}
-
             {/* Scene narration */}
             <div className="bg-surface border border-border rounded-xl p-5">
               <div className="flex items-center justify-between mb-4">
                 <h3 className="text-sm font-semibold text-text-primary">Scene Narration</h3>
-                {!isManual && (
-                  <button
-                    onClick={async () => {
-                      for (const unit of narrationUnits) {
-                        const unitId = unit.unit_id || unit.scene_id
-                        if (!sceneAudio[unitId]?.parts) {
-                          await handleGenerateSceneAudio(unitId, unit.lines)
-                        }
-                      }
-                    }}
-                    disabled={!selectedVoice || voicesLoading}
-                    className="btn-secondary py-1.5 px-3 text-xs disabled:opacity-40"
-                  >
-                    Generate All
-                  </button>
-                )}
+                <span className="text-[10px] text-text-disabled">Upload per item, or approve the reviewed full master above</span>
               </div>
 
               <div className="space-y-3">
                 {narrationUnits.map((scene, idx) => {
                   const id = scene.unit_id || scene.scene_id || `scene-${idx}`
                   const audioState = sceneAudio[id]
-                  const spokenLines = (scene.lines || []).filter(l => !l.startsWith('['))
-                  const isItemLoading = itemLoading[id] || audioState?.loading
+                  const playbackSource = audioState?.parts?.find(part => part.type === 'audio' && part.content)?.content
+                  const isPlaying = player.activeId === id && player.playing
                   const isCinemaUnit = scene.cinema_type && scene.cinema_type !== 'scene'
                   const segments = isCinemaUnit ? [] : segmentsFor(scene)
                   const measured = audioState?.durationSeconds
@@ -672,63 +533,46 @@ function AudioGeneration() {
                           </span>
                         </div>
 
-                        <p className={`text-[10px] text-text-disabled font-mono mb-2 leading-relaxed ${isManual ? 'whitespace-pre-wrap' : 'line-clamp-2'}`}>
-                          {isManual ? sceneSpokenText(scene.lines) : spokenLines.join(' ')}
+                        <p className="text-[10px] text-text-disabled font-mono mb-2 leading-relaxed whitespace-pre-wrap">
+                          {sceneSpokenText(scene.lines)}
                         </p>
 
                         <div className="flex items-center gap-2">
-                          {isManual ? (
-                            <>
-                              <button
-                              onClick={() => copyToClipboard(sceneSpokenText(scene.lines), id)}
-                                className="btn-secondary py-1 px-2.5 text-[10px]"
-                              >
-                                Copy Text
-                              </button>
-                              <input
-                                ref={el => { sceneUploadRefs.current[id] = el }}
-                                type="file"
-                                accept="audio/*"
-                                className="hidden"
-                                onChange={e => {
-                                  handleManualSceneUpload(scene, e.target.files?.[0])
-                                  e.target.value = ''
-                                }}
-                              />
-                              <button
-                                onClick={() => sceneUploadRefs.current[id]?.click()}
-                                className="btn-secondary py-1 px-2.5 text-[10px]"
-                              >
-                                {audioState?.parts ? 'Replace Audio' : 'Upload Audio'}
-                              </button>
-                            </>
-                          ) : (
-                            <button
-                              onClick={() => handleGenerateSceneAudio(id, scene.lines)}
-                              disabled={isItemLoading || !selectedVoice}
-                              className="btn-secondary py-1 px-2.5 text-[10px] disabled:opacity-40"
-                            >
-                              {isItemLoading ? (
-                                <span className="flex items-center gap-1">
-                                  <div className="w-2.5 h-2.5 border border-accent border-t-transparent rounded-full animate-spin" />
-                                  Generating...
-                                </span>
-                              ) : audioState?.parts ? 'Regenerate' : 'Generate'}
-                            </button>
-                          )}
+                          <button
+                            onClick={() => copyToClipboard(sceneSpokenText(scene.lines), id)}
+                            className="btn-secondary py-1 px-2.5 text-[10px]"
+                          >
+                            Copy Text
+                          </button>
+                          <input
+                            ref={element => { sceneUploadRefs.current[id] = element }}
+                            type="file"
+                            accept="audio/*"
+                            className="hidden"
+                            onChange={event => {
+                              handleManualSceneUpload(scene, event.target.files?.[0])
+                              event.target.value = ''
+                            }}
+                          />
+                          <button
+                            onClick={() => sceneUploadRefs.current[id]?.click()}
+                            className="btn-secondary py-1 px-2.5 text-[10px]"
+                          >
+                            {audioState?.parts ? 'Replace Audio' : 'Upload Audio'}
+                          </button>
 
-                          {audioState?.parts && (
+                          {playbackSource && (
                             <button
-                              onClick={() => {
-                                const audioParts = audioState.parts.filter(p => p.type === 'audio')
-                                if (audioParts.length > 0) handlePlayAudio(audioParts[0].content, id)
-                              }}
+                              onClick={() => player.toggle({ id, source: playbackSource })
+                                .catch(error => toast.error(`Playback failed: ${error.message}`))}
                               className="flex items-center gap-1 text-[10px] text-accent hover:text-accent-hover font-medium"
                             >
-                              <svg className="w-3.5 h-3.5" fill="currentColor" viewBox="0 0 24 24">
-                                <path d="M8 5v14l11-7z"/>
-                              </svg>
-                              Play
+                              {isPlaying ? (
+                                <svg className="w-3.5 h-3.5" fill="currentColor" viewBox="0 0 24 24"><path d="M6 5h4v14H6zm8 0h4v14h-4z" /></svg>
+                              ) : (
+                                <svg className="w-3.5 h-3.5" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z" /></svg>
+                              )}
+                              {isPlaying ? 'Pause' : 'Play'}
                             </button>
                           )}
 
@@ -756,66 +600,60 @@ function AudioGeneration() {
                      const sfxState = sfxAudio[cue]
                      const cueName = cue.replace('[SFX:', '').replace(']', '').replace(/_/g, ' ')
                      const isItemLoading = itemLoading[cue] || sfxState?.loading
+                     const playerId = `sfx-${idx}`
+                     const isPlaying = player.activeId === playerId && player.playing
 
                      return (
                        <div key={idx} className="border border-border rounded-lg p-3 bg-surface-raised/50">
                          <p className="text-[10px] font-semibold text-text-primary mb-2 leading-tight">{cueName}</p>
-                         <div className="flex gap-1.5">
-                           {isManual ? (
-                             <>
-                               <button
-                                 onClick={() => {
-                                   const unit = narrationUnits.find(candidate => (candidate.lines || []).includes(cue))
-                                   copyToClipboard(sfxPromptText(cue, unit), 'SFX prompt')
-                                 }}
-                                 className="flex-1 btn-secondary py-1 text-[10px] flex items-center justify-center"
-                               >
-                                 Copy
-                               </button>
-                               <input
-                                 ref={el => { sfxUploadRefs.current[cue] = el }}
-                                 type="file"
-                                 accept="audio/*"
-                                 className="hidden"
-                                 onChange={e => {
-                                   handleManualSfxUpload(cue, e.target.files?.[0])
-                                   e.target.value = ''
-                                 }}
-                               />
-                               <button
-                                 onClick={() => sfxUploadRefs.current[cue]?.click()}
-                                 className="flex-1 btn-secondary py-1 text-[10px] flex items-center justify-center"
-                               >
-                                 {sfxState?.audio ? 'Replace' : 'Upload'}
-                               </button>
-                             </>
-                           ) : (
-                             <button
-                               onClick={() => handleGenerateSfx(cue)}
-                               disabled={isItemLoading}
-                               className="flex-1 btn-secondary py-1 text-[10px] disabled:opacity-40 flex items-center justify-center gap-1"
-                             >
-                               {isItemLoading ? (
-                                 <div className="w-3 h-3 border border-accent border-t-transparent rounded-full animate-spin" />
-                               ) : sfxState?.audio ? (
-                                 <>
-                                   <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                                     <path strokeLinecap="round" strokeLinejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
-                                   </svg>
-                                   Redo
-                                 </>
-                               ) : 'Generate'}
-                             </button>
-                           )}
+                         <div className="grid grid-cols-2 gap-1.5">
+                           <button
+                             onClick={() => {
+                               const unit = narrationUnits.find(candidate => (candidate.lines || []).includes(cue))
+                               copyToClipboard(sfxPromptText(cue, unit), 'SFX prompt')
+                             }}
+                             className="btn-secondary py-1 text-[10px] flex items-center justify-center"
+                           >
+                             Copy prompt
+                           </button>
+                           <button
+                             onClick={() => handleGenerateSfx(cue)}
+                             disabled={isItemLoading || !hasElevenLabs}
+                             title={hasElevenLabs ? 'Generate with ElevenLabs' : 'Add an ElevenLabs key in Settings to generate'}
+                             className="btn-secondary py-1 text-[10px] disabled:opacity-40 flex items-center justify-center gap-1"
+                           >
+                             {isItemLoading ? (
+                               <div className="w-3 h-3 border border-accent border-t-transparent rounded-full animate-spin" />
+                             ) : sfxState?.audio ? 'Regenerate' : 'Generate'}
+                           </button>
+                           <input
+                             ref={element => { sfxUploadRefs.current[cue] = element }}
+                             type="file"
+                             accept="audio/*"
+                             className="hidden"
+                             onChange={event => {
+                               handleManualSfxUpload(cue, event.target.files?.[0])
+                               event.target.value = ''
+                             }}
+                           />
+                           <button
+                             onClick={() => sfxUploadRefs.current[cue]?.click()}
+                             className="btn-secondary py-1 text-[10px] flex items-center justify-center"
+                           >
+                             {sfxState?.audio ? 'Replace file' : 'Upload file'}
+                           </button>
                            {sfxState?.audio && (
                              <button
-                               onClick={() => handlePlayAudio(sfxState.audio, `sfx-${idx}`)}
+                               onClick={() => player.toggle({ id: playerId, source: sfxState.audio })
+                                 .catch(error => toast.error(`Playback failed: ${error.message}`))}
                                className="btn-secondary py-1 px-2 text-[10px] flex items-center justify-center"
-                               title="Play"
+                               title={isPlaying ? 'Pause' : 'Play'}
                              >
-                               <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 24 24">
-                                 <path d="M8 5v14l11-7z"/>
-                               </svg>
+                               {isPlaying ? (
+                                 <><svg className="w-3 h-3 mr-1" fill="currentColor" viewBox="0 0 24 24"><path d="M6 5h4v14H6zm8 0h4v14h-4z" /></svg>Pause</>
+                               ) : (
+                                 <><svg className="w-3 h-3 mr-1" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z" /></svg>Play</>
+                               )}
                              </button>
                            )}
                          </div>
@@ -836,7 +674,9 @@ function AudioGeneration() {
       <div className="fixed bottom-0 left-0 right-0 bg-surface/95 backdrop-blur-sm border-t border-border py-4 px-8 z-20">
         <div className="max-w-6xl mx-auto flex items-center justify-between gap-3">
           <p className="text-xs text-text-disabled">
-            {generatedSceneCount === 0
+            {audioReviewPending
+              ? 'Approve the source or improved narration master before continuing'
+              : generatedSceneCount === 0
               ? 'Provide audio to size the shots precisely — or continue and scenes will use their planned durations'
               : generatedSceneCount < totalScenes
                 ? `${totalScenes - generatedSceneCount} scene${totalScenes - generatedSceneCount > 1 ? 's' : ''} without audio will use planned durations`
@@ -844,7 +684,7 @@ function AudioGeneration() {
           </p>
           <button
             onClick={() => navigate('/images')}
-            disabled={!scenePlan || !ttsScript}
+            disabled={!scenePlan || !ttsScript || audioReviewPending}
             className="btn-primary px-6 py-2 text-sm disabled:opacity-40"
           >
             Continue to Images →
