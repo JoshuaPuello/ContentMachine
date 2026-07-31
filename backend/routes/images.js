@@ -6,6 +6,11 @@ import { generateVertexImage } from '../lib/vertex.js';
 import { buildCharacterReferencePrompt } from '../lib/characterContinuity.js';
 import { hardenDocumentaryImagePrompt } from '../lib/imagePromptQuality.js';
 import {
+  readSessionSnapshot,
+  withSessionMutationLock,
+  writeSessionSnapshot,
+} from '../lib/sessionStore.js';
+import {
   buildNeutralImageReference,
   buildOrderedReferenceBoard,
   beginWindowsImageRun,
@@ -368,10 +373,36 @@ router.post('/windows/begin', async (req, res) => {
 
 router.post('/windows/cancel', async (req, res) => {
   try {
+    const sessionId = req.body?.sessionId;
     const result = await cancelWindowsImageProject(
-      req.body?.sessionId,
+      sessionId,
       req.body?.reason || 'Canceled by user',
     );
+    await withSessionMutationLock(sessionId, async () => {
+      const snapshot = await readSessionSnapshot(sessionId);
+      const groups = snapshot.scene_sheet_workflow?.groups || [];
+      let changed = false;
+      for (const group of groups) {
+        const job = result.state.jobs?.[`scene-sheet-${group.id}`];
+        if (!job) continue;
+        group.windowsGeneration = {
+          ...(group.windowsGeneration || {}),
+          taskId: job.taskId,
+          status: job.status,
+          attempts: job.attempts,
+          outputCount: job.outputCount,
+          progress: job.progress || null,
+          error: job.error || null,
+          canceledAt: job.canceledAt,
+          updatedAt: job.updatedAt,
+        };
+        changed = true;
+      }
+      if (changed) {
+        snapshot.scene_sheet_workflow.updatedAt = result.canceledAt;
+        await writeSessionSnapshot(sessionId, snapshot);
+      }
+    });
     return res.json({
       success: true,
       canceledAt: result.canceledAt,
