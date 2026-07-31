@@ -22,7 +22,7 @@ export const WINDOWS_IMAGE_MAX_CONCURRENCY = 5;
 export const WINDOWS_IMAGE_MAX_REFERENCES = 2;
 export const WINDOWS_IMAGE_OUTPUT_COUNTS = new Set([1, 2, 3]);
 
-const TERMINAL = new Set(['complete', 'failed']);
+const TERMINAL = new Set(['complete', 'failed', 'canceled']);
 const activeProjects = new Set();
 const stateMutationChains = new Map();
 const taskQueueChains = new Map();
@@ -35,13 +35,24 @@ const stateFile = (sessionId) =>
 const emptyState = () => ({
   version: 1,
   jobs: {},
+  control: {
+    activeRunId: null,
+    canceledAt: null,
+    reason: null,
+  },
   updatedAt: new Date().toISOString(),
 });
 
 const readState = async (sessionId) => {
   try {
     const parsed = JSON.parse(await fs.readFile(stateFile(sessionId), 'utf8'));
-    return parsed?.version === 1 && parsed.jobs ? parsed : emptyState();
+    if (parsed?.version !== 1 || !parsed.jobs) return emptyState();
+    parsed.control ||= {
+      activeRunId: null,
+      canceledAt: null,
+      reason: null,
+    };
+    return parsed;
   } catch (error) {
     if (error.code === 'ENOENT') return emptyState();
     throw error;
@@ -195,6 +206,67 @@ const generationFingerprint = ({ prompt, references, outputCount, model, revisio
     revision,
   })).digest('hex');
 
+const assertActiveRun = async (sessionId, runId) => {
+  if (!runId) return;
+  const state = await readState(sessionId);
+  if (state.control?.activeRunId !== runId || state.control?.canceledAt) {
+    const error = new Error('Windows image generation was canceled');
+    error.code = 'IMAGE_GENERATION_CANCELED';
+    error.retryable = false;
+    throw error;
+  }
+};
+
+export const beginWindowsImageRun = async (sessionId) => {
+  if (!validSessionId(sessionId)) throw new Error('A valid sessionId is required');
+  await readSessionSnapshot(sessionId);
+  const runId = randomUUID();
+  await withStateMutation(sessionId, async (state) => {
+    state.control = {
+      activeRunId: runId,
+      canceledAt: null,
+      reason: null,
+      startedAt: new Date().toISOString(),
+    };
+  });
+  activeProjects.add(sessionId);
+  return runId;
+};
+
+export const cancelWindowsImageProject = async (
+  sessionId,
+  reason = 'Canceled by user',
+) => {
+  if (!validSessionId(sessionId)) throw new Error('A valid sessionId is required');
+  const canceledAt = new Date().toISOString();
+  await withStateMutation(sessionId, async (state) => {
+    state.control = {
+      activeRunId: null,
+      canceledAt,
+      reason,
+    };
+    for (const job of Object.values(state.jobs)) {
+      if (TERMINAL.has(job.status)) continue;
+      job.status = 'canceled';
+      job.progress = null;
+      job.error = {
+        code: 'TASK_CANCELED',
+        message: reason,
+        retryable: false,
+      };
+      job.canceledAt = canceledAt;
+      job.updatedAt = canceledAt;
+    }
+  });
+  activeProjects.delete(sessionId);
+  const broker = await mediaBroker.cancelImageProject(sessionId, reason);
+  return {
+    canceledAt,
+    broker,
+    state: await readState(sessionId),
+  };
+};
+
 const queueWindowsImageTaskUnlocked = async ({
   sessionId,
   itemId,
@@ -204,6 +276,7 @@ const queueWindowsImageTaskUnlocked = async ({
   priority = 50,
   metadata = {},
   revision = 1,
+  runId = null,
 }) => {
   if (!validSessionId(sessionId)) throw new Error('A valid sessionId is required');
   if (!/^[a-zA-Z0-9._-]{1,160}$/.test(String(itemId || ''))) {
@@ -220,6 +293,7 @@ const queueWindowsImageTaskUnlocked = async ({
     throw new Error('Windows image tasks require one or two ordered references');
   }
   if (!isMediaBrokerConfigured()) throw new Error('Windows image broker is not configured');
+  await assertActiveRun(sessionId, runId);
   await readSessionSnapshot(sessionId);
   const staged = [];
   for (const [index, reference] of references.entries()) {
@@ -237,6 +311,7 @@ const queueWindowsImageTaskUnlocked = async ({
     model: WINDOWS_IMAGE_MODEL,
     revision,
   });
+  await assertActiveRun(sessionId, runId);
   const taskId = randomUUID();
   const uploadTargets = [];
   const outputAssets = [];
@@ -290,7 +365,7 @@ const queueWindowsImageTaskUnlocked = async ({
     const existing = state.jobs[itemId];
     if (
       existing?.generationFingerprint === fingerprint &&
-      existing.status !== 'failed'
+      !['failed', 'canceled'].includes(existing.status)
     ) {
       return { job: existing, reused: true };
     }
@@ -302,6 +377,7 @@ const queueWindowsImageTaskUnlocked = async ({
     return stored.job;
   }
   try {
+    await assertActiveRun(sessionId, runId);
     const submitted = await mediaBroker.submitImageTask({
       protocolVersion: 1,
       taskId,

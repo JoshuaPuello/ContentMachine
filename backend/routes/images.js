@@ -8,6 +8,8 @@ import { hardenDocumentaryImagePrompt } from '../lib/imagePromptQuality.js';
 import {
   buildNeutralImageReference,
   buildOrderedReferenceBoard,
+  beginWindowsImageRun,
+  cancelWindowsImageProject,
   getWindowsImageJob,
   queueWindowsImageTask,
   retryWindowsImageTask,
@@ -314,6 +316,7 @@ router.post('/windows/generate', async (req, res) => {
     const safeCharacters = characterImages.filter(
       item => typeof item === 'string' && /^data:image\/[a-zA-Z+]+;base64,/.test(item),
     );
+    const runId = await beginWindowsImageRun(sessionId);
     const referenceSet = await windowsReferences(
       aspectRatio,
       safeCharacters,
@@ -332,9 +335,10 @@ router.post('/windows/generate', async (req, res) => {
           imageKey: String(item.itemId),
           aspectRatio: String(aspectRatio),
         },
+        runId,
       };
       const prior = await getWindowsImageJob(sessionId, taskInput.itemId, { reconcile: true });
-      return retry || prior?.status === 'failed'
+      return retry || ['failed', 'canceled'].includes(prior?.status)
         ? retryWindowsImageTask(sessionId, taskInput.itemId, taskInput)
         : queueWindowsImageTask(taskInput);
     }));
@@ -346,6 +350,42 @@ router.post('/windows/generate', async (req, res) => {
   } catch (error) {
     console.error('Windows image generation error:', error);
     return res.status(500).json({ error: true, message: error.message, code: error.code || 'WINDOWS_IMAGE_ERROR' });
+  }
+});
+
+router.post('/windows/begin', async (req, res) => {
+  try {
+    const runId = await beginWindowsImageRun(req.body?.sessionId);
+    return res.json({ runId });
+  } catch (error) {
+    return res.status(400).json({
+      error: true,
+      message: error.message,
+      code: error.code || 'WINDOWS_IMAGE_BEGIN_FAILED',
+    });
+  }
+});
+
+router.post('/windows/cancel', async (req, res) => {
+  try {
+    const result = await cancelWindowsImageProject(
+      req.body?.sessionId,
+      req.body?.reason || 'Canceled by user',
+    );
+    return res.json({
+      success: true,
+      canceledAt: result.canceledAt,
+      jobs: result.state.jobs,
+      broker: {
+        canceled: result.broker?.canceled || 0,
+      },
+    });
+  } catch (error) {
+    return res.status(500).json({
+      error: true,
+      message: error.message,
+      code: error.code || 'WINDOWS_IMAGE_CANCEL_FAILED',
+    });
   }
 });
 

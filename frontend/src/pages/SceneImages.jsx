@@ -243,6 +243,8 @@ function SceneImages() {
     refreshSceneSheets,
     uploadSceneSheet,
     generateWindowsSceneSheet,
+    beginWindowsImageGeneration,
+    cancelWindowsImageGeneration,
     refreshWindowsSceneSheet,
     selectWindowsSceneSheetOption,
     expandSceneSheet,
@@ -747,7 +749,17 @@ function SceneImages() {
             {/* Stop mid-run — progress is kept and can be resumed */}
             {generationState === 'running' && generationPhase === 'images' && (
               <button
-                onClick={stopGeneration}
+                onClick={async () => {
+                  stopGeneration()
+                  if (settings.imageProvider === 'windows-image') {
+                    try {
+                      await cancelWindowsImageGeneration()
+                      toast.success('All Windows image tasks canceled')
+                    } catch (error) {
+                      toast.error(`Windows cancellation failed: ${error.response?.data?.message || error.message}`)
+                    }
+                  }
+                }}
                 title="Stop image generation (keeps progress, resume anytime)"
                 className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-error/10 text-error border border-error/20 text-xs font-medium hover:bg-error/20 transition-colors"
               >
@@ -856,11 +868,14 @@ function SceneImages() {
             onRefresh={refreshSceneSheets}
             onUpload={uploadSceneSheet}
             onGenerateWindows={generateWindowsSceneSheet}
+            onBeginWindows={beginWindowsImageGeneration}
+            onCancelWindows={cancelWindowsImageGeneration}
             onRefreshWindows={refreshWindowsSceneSheet}
             onSelectWindowsOption={selectWindowsSceneSheetOption}
             onExpand={expandSceneSheet}
             onSelect={selectSceneSheetPanel}
             onSelectAllExpanded={selectAllExpandedSceneSheetPanels}
+            defaultWindowsOutputCount={settings.windowsImageOutputs || 1}
           />
         )}
 

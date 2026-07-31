@@ -126,4 +126,14 @@ export const mediaBroker = {
   getImageTask: (taskId) => brokerRequest(
     `/api/media-workers/v1/image-tasks/${encodeURIComponent(taskId)}`,
   ),
+  cancelImageTask: (taskId, reason = 'Canceled by Content Machine') =>
+    brokerRequest(`/api/media-workers/v1/image-tasks/${encodeURIComponent(taskId)}/cancel`, {
+      method: 'POST',
+      body: JSON.stringify({ reason }),
+    }),
+  cancelImageProject: (projectId, reason = 'Canceled by Content Machine') =>
+    brokerRequest('/api/media-workers/v1/image-tasks/cancel', {
+      method: 'POST',
+      body: JSON.stringify({ projectId, reason }),
+    }),
 }

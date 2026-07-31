@@ -95,6 +95,7 @@ function SceneSheetGroup({
   onExpand,
   onSelect,
   onGenerateWindows,
+  defaultWindowsOutputCount = 1,
   onRefreshWindows,
   onSelectWindowsOption,
   planningLocked = false,
@@ -102,10 +103,22 @@ function SceneSheetGroup({
   const inputRef = useRef(null)
   const [busy, setBusy] = useState(null)
   const [windowsOutputCount, setWindowsOutputCount] = useState(
-    group.windowsGeneration?.outputCount || 3,
+    group.windowsGeneration
+      && !['complete', 'failed', 'canceled'].includes(group.windowsGeneration.status)
+      ? group.windowsGeneration.outputCount
+      : defaultWindowsOutputCount,
   )
   const windowsJob = group.windowsGeneration
-  const windowsActive = windowsJob && !['complete', 'failed'].includes(windowsJob.status)
+  const windowsActive = windowsJob && !['complete', 'failed', 'canceled'].includes(windowsJob.status)
+  useEffect(() => {
+    if (!windowsActive) {
+      setWindowsOutputCount(defaultWindowsOutputCount)
+    }
+  }, [
+    defaultWindowsOutputCount,
+    group.windowsGeneration?.outputCount,
+    windowsActive,
+  ])
   const templateUrl = useMemo(
     () => sceneSheetTemplateDataUrl(group.layout, group.panels.length),
     [group.layout, group.panels.length],
@@ -335,7 +348,7 @@ function SceneSheetGroup({
                   ? 'Queueing…'
                   : windowsActive
                     ? 'Generating…'
-                    : windowsJob?.status === 'failed'
+                      : ['failed', 'canceled'].includes(windowsJob?.status)
                       ? 'Retry Windows'
                       : windowsJob?.status === 'complete'
                         ? 'Generate new set'
@@ -451,14 +464,18 @@ export default function SceneSheetWorkspace({
   onRefresh,
   onUpload,
   onGenerateWindows,
+  onBeginWindows,
+  onCancelWindows,
   onRefreshWindows,
   onSelectWindowsOption,
   onExpand,
   onSelect,
   onSelectAllExpanded,
+  defaultWindowsOutputCount = 1,
 }) {
   const [planning, setPlanning] = useState(false)
   const [bulkWindowsGeneration, setBulkWindowsGeneration] = useState(false)
+  const [cancelingWindows, setCancelingWindows] = useState(false)
   const serverPlanning = workflow?.status === 'planning'
   const planningMeta = workflow?.planning
   const totals = useMemo(() => {
@@ -517,16 +534,18 @@ export default function SceneSheetWorkspace({
   const generatePendingWindowsSheets = async () => {
     const pending = (workflow?.groups || []).filter(group =>
       !group.windowsGeneration
-      || group.windowsGeneration.status === 'failed'
+      || ['failed', 'canceled'].includes(group.windowsGeneration.status)
     )
     if (!pending.length || !onGenerateWindows) return
     setBulkWindowsGeneration(true)
     try {
+      const runId = await onBeginWindows?.()
       const results = await Promise.allSettled(pending.map(group =>
         onGenerateWindows(
           group.id,
-          group.windowsGeneration?.outputCount || 3,
-          group.windowsGeneration?.status === 'failed',
+          defaultWindowsOutputCount,
+          ['failed', 'canceled'].includes(group.windowsGeneration?.status),
+          runId,
         )
       ))
       const failed = results.filter(result => result.status === 'rejected')
@@ -540,6 +559,25 @@ export default function SceneSheetWorkspace({
     }
   }
 
+  const cancelWindows = async () => {
+    if (!onCancelWindows) return
+    setCancelingWindows(true)
+    try {
+      await onCancelWindows()
+      toast.success('All Windows image generation canceled')
+    } catch (error) {
+      toast.error(error.response?.data?.message || error.message)
+    } finally {
+      setBulkWindowsGeneration(false)
+      setCancelingWindows(false)
+    }
+  }
+
+  const hasActiveWindows = (workflow?.groups || []).some(group => {
+    const status = group.windowsGeneration?.status
+    return status && !['complete', 'failed', 'canceled'].includes(status)
+  })
+
   return (
     <div className="space-y-5">
       <div className="rounded-2xl border border-accent/25 bg-gradient-to-br from-accent/[0.10] via-surface to-surface p-5">
@@ -551,7 +589,7 @@ export default function SceneSheetWorkspace({
           </div>
           <div className="flex items-center gap-2">
             {workflow?.groups?.some(group =>
-              !group.windowsGeneration || group.windowsGeneration.status === 'failed'
+              !group.windowsGeneration || ['failed', 'canceled'].includes(group.windowsGeneration.status)
             ) && (
               <button
                 onClick={generatePendingWindowsSheets}
@@ -559,6 +597,15 @@ export default function SceneSheetWorkspace({
                 className="btn-secondary px-4 py-2 text-xs disabled:opacity-40"
               >
                 {bulkWindowsGeneration ? 'Queueing Windows sheets…' : 'Generate pending with Windows'}
+              </button>
+            )}
+            {(hasActiveWindows || bulkWindowsGeneration) && (
+              <button
+                onClick={cancelWindows}
+                disabled={cancelingWindows}
+                className="px-4 py-2 text-xs rounded-lg border border-error/30 bg-error/10 text-error hover:bg-error/20 disabled:opacity-40"
+              >
+                {cancelingWindows ? 'Canceling…' : 'Cancel all Windows tasks'}
               </button>
             )}
             {totals.expanded > 0 && onSelectAllExpanded && (
@@ -649,6 +696,7 @@ export default function SceneSheetWorkspace({
           selectedImages={selectedImages}
           onUpload={onUpload}
           onGenerateWindows={onGenerateWindows}
+          defaultWindowsOutputCount={defaultWindowsOutputCount}
           onRefreshWindows={onRefreshWindows}
           onSelectWindowsOption={onSelectWindowsOption}
           onExpand={onExpand}

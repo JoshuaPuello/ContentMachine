@@ -8,6 +8,7 @@ import { callClaude, safeParseJSON } from './claude.js';
 import { generateVertexImage, VERTEX_IMAGE_MODELS } from '../lib/vertex.js';
 import { assertPublicImageHost, readBoundedResponse } from '../lib/windowsVideo.js';
 import {
+  beginWindowsImageRun,
   buildOrderedReferenceBoard,
   getWindowsImageJob,
   queueWindowsImageTask,
@@ -861,7 +862,7 @@ const persistGroupWindowsJob = async (sessionId, groupId, job) => {
 
 router.post('/:sessionId/:groupId/windows/generate', async (req, res) => {
   const { sessionId, groupId } = req.params;
-  const { outputCount = 3, retry = false, writeToken } = req.body || {};
+  const { outputCount, retry = false, writeToken, runId: requestedRunId } = req.body || {};
   if (!validSessionId(sessionId) || !safeSceneSheetId(groupId)) {
     return res.status(400).json({ error: true, message: 'Invalid session or scene-sheet group', code: 'INVALID_INPUT' });
   }
@@ -870,21 +871,26 @@ router.post('/:sessionId/:groupId/windows/generate', async (req, res) => {
     assertSessionWriteToken(snapshot, writeToken);
     const group = snapshot.scene_sheet_workflow?.groups?.find(candidate => candidate.id === groupId);
     if (!group) throw new Error('Scene-sheet group not found');
+    const effectiveOutputCount = Number(
+      outputCount ?? snapshot.settings?.windowsImageOutputs ?? 1,
+    );
+    const runId = requestedRunId || await beginWindowsImageRun(sessionId);
     const taskInput = await sceneSheetWindowsInputs(snapshot, sessionId, group);
     const request = {
       sessionId,
       itemId: `scene-sheet-${groupId}`,
       prompt: taskInput.prompt,
       references: taskInput.references,
-      outputCount: Number(outputCount),
+      outputCount: effectiveOutputCount,
       metadata: {
         assetType: 'scene-sheet',
         sceneSheetGroupId: groupId,
         planId: snapshot.scene_sheet_workflow.planId,
       },
+      runId,
     };
     const prior = await getWindowsImageJob(sessionId, request.itemId, { reconcile: true });
-    const job = retry || prior?.status === 'complete' || prior?.status === 'failed'
+    const job = retry || ['complete', 'failed', 'canceled'].includes(prior?.status)
       ? await retryWindowsImageTask(sessionId, request.itemId, request)
       : await queueWindowsImageTask(request);
     const decorated = decorateWindowsJobForGroup(job, group);

@@ -769,8 +769,49 @@ export const usePipelineStore = create(
         return workflow
       },
 
-      generateWindowsSceneSheet: async (groupId, outputCount = 3, retry = false) => {
+      beginWindowsImageGeneration: async () => {
         const sessionId = getSessionId()
+        const result = await api.beginWindowsImageGeneration(sessionId)
+        if (getSessionId() !== sessionId) return null
+        return result.runId
+      },
+
+      cancelWindowsImageGeneration: async () => {
+        const sessionId = getSessionId()
+        const result = await api.cancelWindowsImageGeneration(
+          sessionId,
+          'Canceled by user from Content Machine',
+        )
+        if (getSessionId() !== sessionId) return null
+        set(state => ({
+          generationState: state.settings.imageProvider === 'windows-image'
+            ? 'stopped'
+            : state.generationState,
+          sceneSheetWorkflow: state.sceneSheetWorkflow
+            ? {
+                ...state.sceneSheetWorkflow,
+                groups: (state.sceneSheetWorkflow.groups || []).map(group => {
+                  const job = result.jobs?.[`scene-sheet-${group.id}`]
+                  return job
+                    ? { ...group, windowsGeneration: job }
+                    : group
+                }),
+              }
+            : state.sceneSheetWorkflow,
+        }))
+        get().logActivity(
+          `Canceled ${result.broker?.canceled || 0} Windows image task${result.broker?.canceled === 1 ? '' : 's'}`,
+          'info',
+        )
+        return result
+      },
+
+      generateWindowsSceneSheet: async (groupId, outputCount = null, retry = false, runId = null) => {
+        const sessionId = getSessionId()
+        const effectiveOutputCount = Math.max(
+          1,
+          Math.min(3, Number(outputCount ?? get().settings.windowsImageOutputs) || 1),
+        )
         const result = await executeSceneSheetMutation({
           sessionId,
           get,
@@ -778,9 +819,10 @@ export const usePipelineStore = create(
           operation: writeToken => api.generateWindowsSceneSheet(
             sessionId,
             groupId,
-            outputCount,
+            effectiveOutputCount,
             writeToken,
             retry,
+            runId,
           ),
         })
         if (getSessionId() !== sessionId) return null

@@ -250,12 +250,19 @@ const exportedApi = {
     })
   },
 
-  generateWindowsSceneSheet: (sessionId, groupId, outputCount, writeToken, retry = false) =>
+  generateWindowsSceneSheet: (sessionId, groupId, outputCount, writeToken, retry = false, runId = null) =>
     api.post(`/scene-sheets/${encodeURIComponent(sessionId)}/${encodeURIComponent(groupId)}/windows/generate`, {
       outputCount,
       writeToken,
       retry,
+      ...(runId ? { runId } : {}),
     }).then(r => r.data),
+
+  beginWindowsImageGeneration: (sessionId) =>
+    api.post('/images/windows/begin', { sessionId }).then(r => r.data),
+
+  cancelWindowsImageGeneration: (sessionId, reason = 'Canceled by user') =>
+    api.post('/images/windows/cancel', { sessionId, reason }).then(r => r.data),
 
   getWindowsSceneSheetStatus: (sessionId, groupId) =>
     api.get(`/scene-sheets/${encodeURIComponent(sessionId)}/${encodeURIComponent(groupId)}/windows/status`)
