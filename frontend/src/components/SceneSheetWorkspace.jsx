@@ -323,14 +323,19 @@ function SceneSheetGroup({
             <div>
               <div className="flex items-center gap-2">
                 <p className="text-sm font-medium text-text-primary">Generate through Windows · Extra High</p>
-                <span className="rounded-full border border-accent/30 bg-accent/10 px-2 py-0.5 text-[9px] uppercase tracking-wider text-accent">5 slots</span>
+                <span className="rounded-full border border-accent/30 bg-accent/10 px-2 py-0.5 text-[9px] uppercase tracking-wider text-accent">1 active task</span>
               </div>
               <p className="text-xs text-text-disabled mt-1">
                 Content Machine sends the grid first and one ordered character board second. Windows owns provider retries and uploads every result directly to R2.
               </p>
             </div>
             <div className="flex items-center gap-2">
-              <label className="text-[10px] uppercase tracking-wider text-text-disabled">Options</label>
+              <label
+                className="text-[10px] uppercase tracking-wider text-text-disabled"
+                title="Number of alternatives to request for the next generated set. Existing completed sets keep their original alternatives."
+              >
+                Next set options
+              </label>
               <select
                 value={windowsOutputCount}
                 onChange={event => setWindowsOutputCount(Number(event.target.value))}
@@ -361,7 +366,10 @@ function SceneSheetGroup({
               <div className="flex items-center justify-between gap-3 text-[10px]">
                 <span className="uppercase tracking-wider text-text-secondary">
                   {String(windowsJob.progress?.phase || windowsJob.status).replaceAll('-', ' ')}
-                  {windowsJob.attempts ? ` · attempt ${windowsJob.attempts}/3` : ''}
+                  {windowsJob.attempts ? ` · worker pass ${windowsJob.attempts}/3` : ''}
+                  {windowsJob.status === 'retrying' && windowsJob.nextAttemptAt
+                    ? ` · resumes ${new Date(windowsJob.nextAttemptAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`
+                    : ''}
                 </span>
                 <span className="text-accent">{windowsJob.progress?.percent || (windowsJob.status === 'complete' ? 100 : 0)}%</span>
               </div>
@@ -375,8 +383,13 @@ function SceneSheetGroup({
                 <p className="text-[10px] text-error mt-2">{windowsJob.error.message}</p>
               )}
               {windowsJob.outputs?.length > 0 && (
-                <div className="grid sm:grid-cols-2 xl:grid-cols-3 gap-3 mt-4">
-                  {windowsJob.outputs.map((output, index) => {
+                <>
+                  <p className="mt-3 text-[10px] text-text-disabled">
+                    This completed set contains {windowsJob.outputs.length} generated {windowsJob.outputs.length === 1 ? 'option' : 'options'}.
+                    The “Next set options” selector only applies when generating a new set.
+                  </p>
+                  <div className="grid sm:grid-cols-2 xl:grid-cols-3 gap-3 mt-3">
+                    {windowsJob.outputs.map((output, index) => {
                     const selected = windowsJob.selectedOrdinal === output.ordinal
                     const validLayout = output.layoutValidation?.valid !== false
                     return (
@@ -415,8 +428,9 @@ function SceneSheetGroup({
                         </div>
                       </article>
                     )
-                  })}
-                </div>
+                    })}
+                  </div>
+                </>
               )}
             </div>
           )}

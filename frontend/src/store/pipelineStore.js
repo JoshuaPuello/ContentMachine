@@ -1881,7 +1881,7 @@ export const usePipelineStore = create(
 
           if (settings.imageProvider === 'windows-image') {
             // Queue five independent jobs before waiting for results. The
-            // Windows worker owns its five persistent Chrome slots; serial
+            // Windows worker owns its persistent Chrome execution slot; serial
             // browser-side awaits would starve four of them.
             let nextUnitIndex = 0
             const worker = async () => {

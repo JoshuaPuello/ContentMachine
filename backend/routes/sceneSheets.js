@@ -816,9 +816,8 @@ const sceneSheetWindowsInputs = async (snapshot, sessionId, group) => {
   };
 };
 
-const decorateWindowsJobForGroup = (job, group) => ({
-  ...job,
-  outputs: (job.outputs || []).map(output => {
+const decorateWindowsJobForGroup = (job, group) => {
+  const outputs = (job.outputs || []).map(output => {
     try {
       validateSheetDimensions(
         { width: output.width, height: output.height },
@@ -835,8 +834,18 @@ const decorateWindowsJobForGroup = (job, group) => ({
         layoutValidation: { valid: false, message: error.message },
       };
     }
-  }),
-});
+  });
+  const selectedOrdinal = outputs.some(
+    output => output.ordinal === job.selectedOrdinal && output.layoutValidation?.valid,
+  )
+    ? job.selectedOrdinal
+    : null;
+  return {
+    ...job,
+    outputs,
+    selectedOrdinal,
+  };
+};
 
 const persistGroupWindowsJob = async (sessionId, groupId, job) => {
   await withSessionMutationLock(sessionId, async () => {
@@ -844,14 +853,23 @@ const persistGroupWindowsJob = async (sessionId, groupId, job) => {
     const group = snapshot.scene_sheet_workflow?.groups?.find(candidate => candidate.id === groupId);
     if (!group) return;
     const decorated = decorateWindowsJobForGroup(job, group);
+    const requestedSelection = group.windowsGeneration?.selectedOrdinal
+      || decorated.selectedOrdinal
+      || null;
+    const selectedOrdinal = decorated.outputs.some(
+      output => output.ordinal === requestedSelection && output.layoutValidation?.valid,
+    )
+      ? requestedSelection
+      : null;
     group.windowsGeneration = {
       taskId: decorated.taskId,
       status: decorated.status,
       attempts: decorated.attempts,
       outputCount: decorated.outputCount,
       progress: decorated.progress || null,
+      nextAttemptAt: decorated.nextAttemptAt || null,
       outputs: decorated.outputs,
-      selectedOrdinal: group.windowsGeneration?.selectedOrdinal || decorated.selectedOrdinal || null,
+      selectedOrdinal,
       error: decorated.error || decorated.brokerError || null,
       updatedAt: decorated.updatedAt,
     };

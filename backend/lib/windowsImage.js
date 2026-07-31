@@ -488,6 +488,7 @@ const applyBrokerState = async (sessionId, itemId, brokerTask) => {
     current.attempts = brokerTask.attempts || current.attempts || 0;
     current.progress = brokerTask.progress || null;
     current.error = brokerTask.error || null;
+    current.nextAttemptAt = brokerTask.nextAttemptAt || null;
     current.updatedAt = new Date().toISOString();
     if (completedUpdate) Object.assign(current, completedUpdate);
     return structuredClone(current);
