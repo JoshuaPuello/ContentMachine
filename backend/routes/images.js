@@ -5,6 +5,13 @@ import { GoogleGenAI } from '@google/genai';
 import { generateVertexImage } from '../lib/vertex.js';
 import { buildCharacterReferencePrompt } from '../lib/characterContinuity.js';
 import { hardenDocumentaryImagePrompt } from '../lib/imagePromptQuality.js';
+import {
+  buildNeutralImageReference,
+  buildOrderedReferenceBoard,
+  getWindowsImageJob,
+  queueWindowsImageTask,
+  retryWindowsImageTask,
+} from '../lib/windowsImage.js';
 const router = express.Router();
 const IMAGE_GENERATION_TIMEOUT_MS = Math.max(
   30_000,
@@ -268,6 +275,93 @@ const buildCharacterPromptPrefix = (hasCharImages, characterDescription = '') =>
   return `MAINTAIN CHARACTER CONSISTENCY: replicate the exact appearance of ${charLabel} — ` +
     'body proportions, skin/surface tone, hair style, and overall aesthetic must stay consistent. ';
 };
+
+const windowsReferences = async (aspectRatio, characterImages, characterDescription) => {
+  const structural = await buildNeutralImageReference(aspectRatio);
+  const characterInputs = characterImages.map((dataUri, index) => {
+    const parsed = parseDataUri(dataUri);
+    return {
+      referenceId: `character-${index + 1}`,
+      name: characterDescription || `Character ${index + 1}`,
+      contentType: parsed.mimeType,
+      bytes: parsed.buffer,
+    };
+  });
+  const board = await buildOrderedReferenceBoard(characterInputs);
+  return {
+    references: board ? [structural, board] : [structural],
+    promptSuffix: board
+      ? `\n\nORDERED CHARACTER REFERENCE BOARD
+The SECOND attached image is a packed character reference board. Its left-to-right slots preserve the ordered character inputs. Match those visual identities whenever the scene prompt calls for them. Never reproduce the board layout, labels, black strip, or reference numbers in the final image.`
+      : '',
+  };
+};
+
+router.post('/windows/generate', async (req, res) => {
+  try {
+    const {
+      sessionId,
+      items,
+      aspectRatio = '16:9',
+      characterImages = [],
+      characterDescription = '',
+      outputCount = 1,
+      retry = false,
+    } = req.body || {};
+    if (!sessionId || !Array.isArray(items) || items.length < 1 || items.length > 100) {
+      return res.status(400).json({ error: true, message: 'sessionId and 1-100 image items are required', code: 'INVALID_INPUT' });
+    }
+    const safeCharacters = characterImages.filter(
+      item => typeof item === 'string' && /^data:image\/[a-zA-Z+]+;base64,/.test(item),
+    );
+    const referenceSet = await windowsReferences(
+      aspectRatio,
+      safeCharacters,
+      String(characterDescription || '').slice(0, MAX_CHAR_DESC_LENGTH),
+    );
+    const queued = await Promise.allSettled(items.map(async item => {
+      if (!item?.itemId || !item?.prompt) throw new Error('Every Windows image item needs itemId and prompt');
+      const taskInput = {
+        sessionId,
+        itemId: `image-${item.itemId}`,
+        prompt: `${hardenDocumentaryImagePrompt(item.prompt)}${referenceSet.promptSuffix}`,
+        references: referenceSet.references,
+        outputCount: Number(outputCount),
+        metadata: {
+          assetType: 'scene-image',
+          imageKey: String(item.itemId),
+          aspectRatio: String(aspectRatio),
+        },
+      };
+      const prior = await getWindowsImageJob(sessionId, taskInput.itemId, { reconcile: true });
+      return retry || prior?.status === 'failed'
+        ? retryWindowsImageTask(sessionId, taskInput.itemId, taskInput)
+        : queueWindowsImageTask(taskInput);
+    }));
+    return res.status(202).json(queued.map((result, index) => (
+      result.status === 'fulfilled'
+        ? { itemId: items[index].itemId, job: result.value, error: null }
+        : { itemId: items[index].itemId, job: null, error: result.reason?.message || 'Queue failed' }
+    )));
+  } catch (error) {
+    console.error('Windows image generation error:', error);
+    return res.status(500).json({ error: true, message: error.message, code: error.code || 'WINDOWS_IMAGE_ERROR' });
+  }
+});
+
+router.get('/windows/status/:sessionId/:itemId', async (req, res) => {
+  try {
+    const job = await getWindowsImageJob(
+      req.params.sessionId,
+      `image-${req.params.itemId}`,
+      { reconcile: true },
+    );
+    if (!job) return res.status(404).json({ error: true, message: 'Windows image task not found', code: 'TASK_NOT_FOUND' });
+    return res.json({ job });
+  } catch (error) {
+    return res.status(500).json({ error: true, message: error.message, code: error.code || 'WINDOWS_IMAGE_STATUS_ERROR' });
+  }
+});
 
 // Extract and upload character images for Replicate (returns stable HTTPS URLs)
 const prepareReplicateCharacterImages = async (replicate, characterImages) => {

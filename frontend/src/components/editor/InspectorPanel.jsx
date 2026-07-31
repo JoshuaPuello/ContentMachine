@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { usePipelineStore } from '../../store/pipelineStore'
+import { TRANSITION_LIBRARY, transitionDefinition } from '../../lib/transitionLibrary'
 
 // ─── InspectorPanel ──────────────────────────────────────────────────────────
 // Kind-specific editing for the selected timeline item. Times commit on
@@ -17,6 +18,7 @@ const KIND_LABELS = {
   'lower-third': 'Lower third',
   'date-chip': 'Date chip',
   'motion-graphic': 'Motion graphic',
+  transition: 'Transition',
 }
 
 function Field({ label, children }) {
@@ -131,16 +133,25 @@ function TraceEntry({ entry, defaultOpen = false }) {
   )
 }
 
+const MAP_PRESENTATIONS = [
+  { id: 'split', label: 'Split panel', hint: 'Footage and map side by side' },
+  { id: 'corner', label: 'Corner card', hint: 'Small card, top right' },
+  { id: 'inset', label: 'Inset card', hint: 'Card that expands to full' },
+  { id: 'full', label: 'Full screen', hint: 'Takeover — use sparingly' },
+]
+
 function MapInspectorFields({ item, setPayload }) {
   const {
     regenerateMapItem,
     loadMapHistory,
     selectMapOption,
+    decideMapAttempt,
     generateAllMaps,
     mapQueueRunning,
     mapQueueProgress,
   } = usePipelineStore()
   const [logsOpen, setLogsOpen] = useState(false)
+  const [sourceDuration, setSourceDuration] = useState(null)
   const options = useMemo(() => {
     const retained = item.payload?.mapOptions || []
     if (retained.length) return retained
@@ -155,13 +166,21 @@ function MapInspectorFields({ item, setPayload }) {
     }
     return []
   }, [item.payload?.mapOptions, item.payload?.src, item.payload?.posterUrl])
+  // No fallback to options[0]: with a single retained option and nothing
+  // promoted yet (needs-selection), a fallback made preview === selected and
+  // hid the only path to actually using the map in the film.
   const selectedId = item.payload?.selectedOptionId
     || options.find(option => option.url === item.payload?.src)?.id
-    || options[0]?.id
     || null
   const [previewId, setPreviewId] = useState(selectedId)
   useEffect(() => { setPreviewId(selectedId) }, [item.id, selectedId])
   useEffect(() => { void loadMapHistory(item.id) }, [item.id, loadMapHistory])
+  useEffect(() => { setSourceDuration(null) }, [item.id, item.payload?.src])
+  // A paused interactive run just rendered an attempt: jump the preview to it.
+  const awaitingOptionId = item.payload?.awaitingDecision?.optionId || null
+  useEffect(() => {
+    if (awaitingOptionId) setPreviewId(awaitingOptionId)
+  }, [awaitingOptionId])
 
   const preview = options.find(option => option.id === previewId) || options[0] || null
   const status = item.payload?.status || 'pending'
@@ -173,7 +192,7 @@ function MapInspectorFields({ item, setPayload }) {
     ...(trace?.phases?.review || []),
   ]
   const setModel = (role, value) => setPayload({
-    mapModels: { ...models, [role]: value, reviewer: 'opus' },
+    mapModels: { ...models, [role]: value },
   })
 
   return (
@@ -188,6 +207,11 @@ function MapInspectorFields({ item, setPayload }) {
               controls
               preload="metadata"
               className="w-full h-full object-contain"
+              onLoadedMetadata={(event) => {
+                if (preview.url === item.payload?.src && Number.isFinite(event.currentTarget.duration)) {
+                  setSourceDuration(event.currentTarget.duration)
+                }
+              }}
             />
           ) : (
             <div className="w-full h-full flex items-center justify-center text-[10px] text-text-disabled">
@@ -222,7 +246,7 @@ function MapInspectorFields({ item, setPayload }) {
               </button>
             ))}
           </div>
-          {preview?.id && preview.id !== selectedId && preview.id !== 'current-output' && (
+          {preview?.url && preview.id !== 'current-output' && preview.url !== item.payload?.src && (
             <button
               onClick={() => selectMapOption(item.id, preview.id)}
               className="btn-primary w-full py-1.5 text-xs mt-2"
@@ -230,6 +254,82 @@ function MapInspectorFields({ item, setPayload }) {
               Use this option in the film
             </button>
           )}
+        </Field>
+      )}
+
+      {status === 'awaiting-decision' && item.payload?.awaitingDecision && (
+        <Field label={`Attempt ${item.payload.awaitingDecision.attempt} rendered — your call`}>
+          <p className="text-[10px] text-text-secondary leading-relaxed mb-1.5">
+            Review the newest option above, then decide.
+          </p>
+          <div className="grid grid-cols-2 gap-2">
+            <button
+              onClick={() => decideMapAttempt(item.id, 'accept')}
+              className="btn-primary py-1.5 text-xs"
+            >
+              Use this attempt
+            </button>
+            {item.payload.awaitingDecision.canContinue ? (
+              <button
+                onClick={() => decideMapAttempt(item.id, 'continue')}
+                className="btn-secondary py-1.5 text-xs"
+              >
+                Try another attempt
+              </button>
+            ) : (
+              <button
+                onClick={() => decideMapAttempt(item.id, 'stop')}
+                className="btn-secondary py-1.5 text-xs"
+              >
+                Stop &amp; keep options
+              </button>
+            )}
+          </div>
+        </Field>
+      )}
+
+      <Field label="Presentation">
+        <div className="grid grid-cols-2 gap-1.5">
+          {MAP_PRESENTATIONS.map(mode => {
+            const active = (item.payload?.presentation || 'split') === mode.id
+            return (
+              <button
+                key={mode.id}
+                onClick={() => setPayload({ presentation: mode.id })}
+                className={`text-left px-2 py-1.5 rounded-md border transition-colors ${
+                  active
+                    ? 'border-accent bg-accent/10'
+                    : 'border-border hover:border-text-disabled'
+                }`}
+              >
+                <p className={`text-[10px] font-medium ${active ? 'text-accent' : 'text-text-primary'}`}>{mode.label}</p>
+                <p className="text-[9px] text-text-disabled">{mode.hint}</p>
+              </button>
+            )
+          })}
+        </div>
+        {item.payload?.suggestedPresentation && (
+          <p className="text-[9px] text-text-disabled mt-1">
+            Director suggests: {item.payload.suggestedPresentation}
+          </p>
+        )}
+      </Field>
+
+      {sourceDuration != null && sourceDuration > (item.endTime - item.startTime) + 0.05 && (
+        <Field label="Source window">
+          <input
+            type="range"
+            min={0}
+            max={Math.max(0, sourceDuration - (item.endTime - item.startTime))}
+            step={0.1}
+            value={item.payload?.sourceStart || 0}
+            onChange={(event) => setPayload({ sourceStart: Number(event.target.value) })}
+            className="w-full"
+          />
+          <p className="text-[9px] text-text-disabled mt-1">
+            Using {(item.payload?.sourceStart || 0).toFixed(1)}s–{((item.payload?.sourceStart || 0) + (item.endTime - item.startTime)).toFixed(1)}s
+            of the {sourceDuration.toFixed(1)}s map video
+          </p>
         </Field>
       )}
 
@@ -279,7 +379,7 @@ function MapInspectorFields({ item, setPayload }) {
           </select>
         </Field>
       </div>
-      <p className="text-[9px] text-text-disabled -mt-2">Visual review: Opus · fixed quality gate</p>
+      <p className="text-[9px] text-text-disabled -mt-2">Quality gate: mechanical validation · every attempt stays selectable</p>
 
       <div className="grid grid-cols-2 gap-2">
         <button
@@ -352,6 +452,60 @@ function InspectorPanel({ item, onClose, onDeleted }) {
 
   const renderKindFields = () => {
     switch (item.kind) {
+      case 'transition': {
+        const selected = transitionDefinition(item.payload?.type)
+        return (
+          <>
+            <Field label="Transition library">
+              <div className="space-y-2">
+                {TRANSITION_LIBRARY.map(option => {
+                  const active = selected.id === option.id
+                  return (
+                    <button
+                      key={option.id}
+                      type="button"
+                      onClick={() => updateTimelineItem(item.id, {
+                        label: option.label,
+                        payload: { type: option.id },
+                      })}
+                      className={`group w-full rounded-lg border p-2 text-left transition-colors ${
+                        active ? 'border-accent bg-accent/10' : 'border-border hover:border-accent/50 bg-background/40'
+                      }`}
+                    >
+                      <div className="relative h-9 mb-2 overflow-hidden rounded bg-black">
+                        <div className="absolute inset-0 bg-gradient-to-br from-slate-700 to-slate-950" />
+                        <div className={`absolute inset-0 bg-gradient-to-br from-amber-950 to-zinc-900 transition-all duration-700 ${
+                          option.id === 'soft-blur'
+                            ? 'opacity-80 blur-[3px] group-hover:blur-0 group-hover:opacity-100'
+                            : option.id === 'dip-to-black'
+                              ? 'opacity-0 group-hover:opacity-100'
+                              : option.id === 'film-dissolve'
+                                ? 'opacity-60 mix-blend-screen group-hover:opacity-100'
+                                : 'opacity-55 group-hover:opacity-100'
+                        }`} />
+                        {option.id === 'dip-to-black' && <div className="absolute inset-0 bg-black opacity-70 group-hover:opacity-0 transition-opacity duration-700" />}
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <span className="text-[11px] font-medium text-text-primary">{option.label}</span>
+                        {active && <span className="ml-auto text-[8px] uppercase tracking-wider text-accent">Selected</span>}
+                      </div>
+                      <p className="mt-1 text-[9px] leading-relaxed text-text-disabled">{option.description}</p>
+                    </button>
+                  )
+                })}
+              </div>
+            </Field>
+            {item.payload?.reason && (
+              <Field label="Director rationale">
+                <p className="text-[10px] leading-relaxed text-text-secondary">{item.payload.reason}</p>
+              </Field>
+            )}
+            <p className="text-[9px] leading-relaxed text-text-disabled">
+              Double-clicking opened this transition at its live preview beat. Choosing another option updates both the Editor and final render.
+            </p>
+          </>
+        )
+      }
       case 'title':
         return (
           <>

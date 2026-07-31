@@ -22,6 +22,9 @@ test('runtime prompt inlines the selected documentary and niche guidance', () =>
     summary: 'A prison escape from Alcatraz.',
   }, { trailerEnabled: true });
   assert.match(profile.prompt, /Compose first, partition second/i);
+  assert.match(profile.prompt, /Visual momentum without choppy speech/i);
+  assert.match(profile.prompt, /pictures may change two or three times while the narrator delivers one connected sentence/i);
+  assert.match(profile.prompt, /Provider duration is a production constraint/i);
   assert.match(profile.prompt, /True Crime Faceless Scripts/i);
   assert.match(profile.prompt, /Selected format: true-crime/i);
 });

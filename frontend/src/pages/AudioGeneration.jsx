@@ -2,7 +2,7 @@ import { useState, useEffect, useRef } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { motion } from 'framer-motion'
 import { usePipelineStore } from '../store/pipelineStore'
-import { planSceneSegments, getClipOptions } from '../lib/segmentation'
+import { buildScenePacingContext, planSceneSegments, getClipOptions } from '../lib/segmentation'
 import api from '../services/api'
 import toast from 'react-hot-toast'
 import AudioReviewPanel from '../components/audio/AudioReviewPanel'
@@ -245,7 +245,12 @@ function AudioGeneration() {
   const segmentsFor = (scene) => {
     const measured = sceneAudio[scene.scene_id]?.durationSeconds
     const planScene = scenePlan?.scenes?.find(p => p.scene_id === scene.scene_id)
-    return planSceneSegments(measured || planScene?.duration_seconds || null, clipOptions, speedFactor)
+    return planSceneSegments(
+      measured || planScene?.duration_seconds || null,
+      clipOptions,
+      speedFactor,
+      buildScenePacingContext(planScene, scene)
+    )
   }
   const totalShots = (ttsScript?.scene_breakdown || [])
     .reduce((sum, s) => sum + segmentsFor(s).length, 0)

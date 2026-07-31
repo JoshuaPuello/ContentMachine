@@ -5,6 +5,7 @@
 // Endpoints:
 //   POST /api/session/save          — save/update a session
 //   GET  /api/session/list          — list all saved sessions
+//   POST /api/session/:id/reset-to-images — discard downstream video/editor work
 //   GET  /api/session/:id           — load session.json for a session
 //   GET  /api/session/:id/files/*   — serve individual files (images/videos)
 //   DELETE /api/session/:id         — delete a session
@@ -17,7 +18,11 @@ import { fileURLToPath } from 'url'
 import https from 'https'
 import http from 'http'
 import { randomUUID } from 'crypto'
-import { deleteProjectAssetsFromR2, isR2Configured } from '../lib/r2.js'
+import {
+  deleteProjectAssetsFromR2,
+  deleteProjectVideoAssetsFromR2,
+  isR2Configured,
+} from '../lib/r2.js'
 import { deleteRenderWorkspacesForSession } from './render.js'
 import { startProxyBuild, jobStatus as proxyJobStatus } from '../lib/previewProxy.js'
 import { normalizeProjectImagePrompts } from '../lib/imagePromptQuality.js'
@@ -107,6 +112,62 @@ export const wouldMixDifferentProjects = (incoming, existing) => {
 export const hasStaleWriteToken = (incomingToken, existingToken) => Boolean(
   existingToken && incomingToken !== existingToken
 )
+
+const hasResettableDownstream = (project) => Boolean(
+  (Array.isArray(project?.video_prompts) && project.video_prompts.length)
+  || Object.keys(project?.video_jobs || {}).length
+  || Object.keys(project?.video_history || {}).length
+  || Object.keys(project?.selected_videos || {}).length
+  || project?.timeline?.items?.length
+  || project?.metadata
+  || project?.all_thumbnails?.length
+  || Object.keys(project?.thumbnail_history || {}).length
+  || project?.thumbnail
+)
+
+// A queued browser save captured before reset must not put videos/editor state
+// back after the canonical server snapshot has moved to Images. The reset
+// revision is deliberately separate from the optimistic write token: the
+// latter orders writes, while this marker describes the workflow boundary the
+// browser has actually observed.
+export const wouldRestoreResetDownstream = (incoming, existing) => {
+  const resetRevision = existing?._session?.downstream_reset_revision
+  if (!resetRevision || incoming?.downstream_reset_revision === resetRevision) return false
+  return hasResettableDownstream(incoming)
+}
+
+export const resetProjectToImages = (project, {
+  resetAt = new Date().toISOString(),
+  resetRevision = randomUUID(),
+  writeToken = randomUUID(),
+} = {}) => {
+  const snapshot = structuredClone(project)
+  snapshot.video_prompts = []
+  snapshot.video_jobs = {}
+  snapshot.video_history = {}
+  snapshot.selected_videos = {}
+  delete snapshot.videoGenerationControl
+  delete snapshot.video_generation_control
+  delete snapshot.video_progress
+  snapshot.timeline = null
+  snapshot.metadata = null
+  snapshot.all_thumbnails = []
+  snapshot.thumbnail_history = {}
+  snapshot.thumbnail = null
+  delete snapshot.render_job
+  delete snapshot.render_history
+  snapshot.session_write_token = writeToken
+  snapshot.downstream_reset_revision = resetRevision
+  snapshot._session = {
+    ...(snapshot._session || {}),
+    write_token: writeToken,
+    saved_at: resetAt,
+    downstream_reset_at: resetAt,
+    downstream_reset_revision: resetRevision,
+  }
+  delete snapshot._session.downstream_reset_pending
+  return snapshot
+}
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -207,6 +268,22 @@ const unitFileLabel = (key) => {
   return segment > 0 ? `scene_${pad(scene)}_shot${segment + 1}` : `scene_${pad(scene)}`
 }
 
+const countFiles = async (target) => {
+  let entries
+  try {
+    entries = await fs.readdir(target, { withFileTypes: true })
+  } catch (error) {
+    if (error.code === 'ENOENT') return 0
+    throw error
+  }
+  const nested = await Promise.all(entries.map((entry) => (
+    entry.isDirectory()
+      ? countFiles(path.join(target, entry.name))
+      : entry.isFile() ? 1 : 0
+  )))
+  return nested.reduce((sum, value) => sum + value, 0)
+}
+
 const safeFileLabel = (value, fallback) => {
   const cleaned = String(value || '')
     .toLowerCase()
@@ -274,6 +351,28 @@ export const mergeDurableAssetReferences = (snapshot, durable) => {
   snapshot.video_jobs = mergeRecordUrls(snapshot.video_jobs, durable.video_jobs)
   snapshot.selected_videos = mergeRecordUrls(snapshot.selected_videos, durable.selected_videos)
   snapshot.video_history = { ...(durable.video_history || {}), ...(snapshot.video_history || {}) }
+  const durableVideoPrompts = new Map((durable.video_prompts || []).map(prompt => [
+    `${prompt.scene_number}_${prompt.segment_index ?? 0}`,
+    prompt,
+  ]))
+  snapshot.video_prompts = (snapshot.video_prompts || []).map(prompt => {
+    const saved = durableVideoPrompts.get(`${prompt.scene_number}_${prompt.segment_index ?? 0}`)
+    const incomingRevision = Math.max(0, Number(prompt.generation_revision) || 0)
+    const durableRevision = Math.max(0, Number(saved?.generation_revision) || 0)
+    return durableRevision > incomingRevision
+      ? {
+          ...prompt,
+          full_prompt_string: saved.full_prompt_string || prompt.full_prompt_string,
+          generation_revision: durableRevision,
+        }
+      : prompt
+  })
+  // Scene-sheet source images, exact crops, and expanded panels are written by
+  // backend-owned endpoints. A browser snapshot captured before an upload or a
+  // long Vertex expansion must never erase those durable artifacts.
+  if (durable.scene_sheet_workflow) {
+    snapshot.scene_sheet_workflow = durable.scene_sheet_workflow
+  }
 }
 
 export const restoreImageReferencesFromDisk = async (snapshot, sessionDir) => {
@@ -342,10 +441,23 @@ router.post('/save', async (req, res) => {
     } catch {
       // First save for a new project.
     }
+    if (existingSnapshot?._session?.downstream_reset_pending) {
+      return res.status(409).json({
+        error: 'This project is currently being reset to Images. Wait for the reset to finish, then reopen it.',
+        code: 'RESET_TO_IMAGES_IN_PROGRESS',
+        writeToken: existingWriteToken,
+      })
+    }
     if (hasStaleWriteToken(project.session_write_token, existingWriteToken)) {
       return res.status(409).json({
         error: 'This project was updated by a newer local session. Reopen it before saving.',
         code: 'STALE_SESSION',
+      })
+    }
+    if (wouldRestoreResetDownstream(project, existingSnapshot)) {
+      return res.status(409).json({
+        error: 'This browser snapshot predates the reset to Images. Reopen the project before saving downstream work.',
+        code: 'STALE_DOWNSTREAM_RESET',
       })
     }
     if (wouldErasePopulatedProject(project, existingSnapshot)) {
@@ -519,6 +631,15 @@ router.post('/save', async (req, res) => {
       saved_at: new Date().toISOString(),
       write_token: writeToken,
       title: project.story?.title || 'Untitled',
+      ...(existingSnapshot?._session?.downstream_reset_at
+        ? { downstream_reset_at: existingSnapshot._session.downstream_reset_at }
+        : {}),
+      ...((project.downstream_reset_revision || existingSnapshot?._session?.downstream_reset_revision)
+        ? {
+            downstream_reset_revision:
+              project.downstream_reset_revision || existingSnapshot._session.downstream_reset_revision,
+          }
+        : {}),
       ...(projectName ? { name: projectName } : {}),
     }
 
@@ -637,6 +758,168 @@ router.patch('/:id/name', async (req, res) => {
     }
     console.error('Session rename error:', err)
     res.status(500).json({ error: err.message })
+  }
+})
+
+// ── POST /api/session/:id/reset-to-images ──────────────────────────────────
+// Rewinds only generated video/editor work. Story, narration/audio,
+// characters, image prompts, generated image variants, selected images, and
+// scene-sheet workflow state remain byte-for-byte intact.
+router.post('/:id/reset-to-images', async (req, res) => {
+  let reservation = null
+  try {
+    const { id } = req.params
+    if (!validSessionId(id)) {
+      return res.status(400).json({ error: 'Invalid session id', code: 'INVALID_SESSION' })
+    }
+    const suppliedWriteToken = String(
+      req.body?.writeToken || req.body?.sessionWriteToken || req.body?.session_write_token || ''
+    )
+    const sessionDir = path.join(OUTPUT_ROOT, id)
+    const jsonPath = path.join(sessionDir, 'session.json')
+
+    // Reserve the reset under the same per-session lock used by autosave.
+    // This is the destructive-operation fence: once persisted, browser saves
+    // are rejected until this exact operation either commits or releases it.
+    reservation = await withSessionMutationLock(id, async () => {
+      const canonical = JSON.parse(await fs.readFile(jsonPath, 'utf8'))
+      const currentWriteToken = canonical._session?.write_token || null
+      if (!suppliedWriteToken || !currentWriteToken || hasStaleWriteToken(suppliedWriteToken, currentWriteToken)) {
+        const conflict = new Error('This project was updated by a newer local session. Reopen it before resetting.')
+        conflict.status = 409
+        conflict.code = 'STALE_SESSION'
+        throw conflict
+      }
+      if (canonical._session?.downstream_reset_pending) {
+        const conflict = new Error('This project is already being reset to Images.')
+        conflict.status = 409
+        conflict.code = 'RESET_TO_IMAGES_IN_PROGRESS'
+        conflict.writeToken = currentWriteToken
+        throw conflict
+      }
+      const operationId = randomUUID()
+      const reservedWriteToken = randomUUID()
+      canonical._session = {
+        ...(canonical._session || {}),
+        write_token: reservedWriteToken,
+        downstream_reset_pending: {
+          id: operationId,
+          requested_at: new Date().toISOString(),
+        },
+      }
+      const temporary = `${jsonPath}.tmp.${randomUUID()}`
+      await fs.writeFile(temporary, JSON.stringify(canonical, null, 2), 'utf8')
+      await fs.rename(temporary, jsonPath)
+      return { operationId, reservedWriteToken }
+    })
+
+    await cancelWindowsProject(id, {
+      // Reprocessing is not project deletion. deleteAssets=true creates a
+      // permanent broker tombstone and makes every future generation for this
+      // still-live session fail with "Producer project was deleted".
+      deleteAssets: false,
+      reason: 'Content Machine project reset to Images',
+    })
+    const r2 = await deleteProjectVideoAssetsFromR2(id)
+    const renderWorkspacesDeleted = await deleteRenderWorkspacesForSession(id)
+
+    const result = await withSessionMutationLock(id, async () => {
+      const canonical = JSON.parse(await fs.readFile(jsonPath, 'utf8'))
+      if (canonical._session?.downstream_reset_pending?.id !== reservation.operationId) {
+        const conflict = new Error('The reset reservation changed while cleanup was running. Reopen the project and try again.')
+        conflict.status = 409
+        conflict.code = 'RESET_RESERVATION_LOST'
+        throw conflict
+      }
+
+      const counts = {
+        videoPrompts: canonical.video_prompts?.length || 0,
+        videoJobs: Object.keys(canonical.video_jobs || {}).length,
+        videoHistory: Object.values(canonical.video_history || {})
+          .reduce((sum, entries) => sum + (entries?.length || 0), 0),
+        selectedVideos: Object.keys(canonical.selected_videos || {}).length,
+        timelineItems: canonical.timeline?.items?.length || 0,
+        thumbnails: canonical.all_thumbnails?.length || 0,
+        finalRenders: 0,
+        localFiles: 0,
+      }
+      const localTargets = [
+        'videos',
+        'final',
+        'maps',
+        'chapters',
+        'preview-proxy',
+        'thumbnails',
+      ]
+      for (const relative of localTargets) {
+        const target = path.join(sessionDir, relative)
+        const files = await countFiles(target)
+        counts.localFiles += files
+        if (relative === 'final') counts.finalRenders += files
+        await fs.rm(target, { recursive: true, force: true })
+      }
+      await fs.rm(path.join(sessionDir, 'video-submissions.jsonl'), { force: true })
+      await fs.rm(path.join(sessionDir, 'media-worker-state.json'), { force: true })
+
+      const resetAt = new Date().toISOString()
+      const writeToken = randomUUID()
+      const resetRevision = randomUUID()
+      const snapshot = resetProjectToImages(canonical, {
+        resetAt,
+        resetRevision,
+        writeToken,
+      })
+      const temporary = `${jsonPath}.tmp.${randomUUID()}`
+      await fs.writeFile(temporary, JSON.stringify(snapshot, null, 2), 'utf8')
+      await fs.rename(temporary, jsonPath)
+      forgetWindowsProject(id)
+      return { snapshot, counts, resetAt, resetRevision, writeToken }
+    })
+
+    res.json({
+      ok: true,
+      sessionId: id,
+      writeToken: result.writeToken,
+      resetRevision: result.resetRevision,
+      resetAt: result.resetAt,
+      project: result.snapshot,
+      cleanup: {
+        ...result.counts,
+        r2VideoObjects: r2.deleted,
+        r2Configured: r2.configured,
+        renderWorkspaces: renderWorkspacesDeleted,
+        ...(!r2.configured ? {
+          limitation: 'R2 is not configured; no project video objects could be checked or removed.',
+        } : {}),
+      },
+    })
+  } catch (err) {
+    // Release only our own reservation. Keep the rotated token so a browser
+    // snapshot captured before partial cleanup cannot overwrite the project.
+    if (reservation?.operationId) {
+      const sessionId = req.params.id
+      const jsonPath = path.join(OUTPUT_ROOT, sessionId, 'session.json')
+      await withSessionMutationLock(sessionId, async () => {
+        const canonical = JSON.parse(await fs.readFile(jsonPath, 'utf8'))
+        if (canonical._session?.downstream_reset_pending?.id !== reservation.operationId) return
+        delete canonical._session.downstream_reset_pending
+        const temporary = `${jsonPath}.tmp.${randomUUID()}`
+        await fs.writeFile(temporary, JSON.stringify(canonical, null, 2), 'utf8')
+        await fs.rename(temporary, jsonPath)
+      }).catch(releaseError => {
+        console.error(`Could not release reset reservation for ${sessionId}:`, releaseError)
+      })
+      err.writeToken ||= reservation.reservedWriteToken
+    }
+    if (err.code === 'ENOENT') {
+      return res.status(404).json({ error: 'Session not found', code: 'SESSION_NOT_FOUND' })
+    }
+    console.error(`Session reset-to-images failed for ${req.params.id}:`, err)
+    res.status(err.status || 500).json({
+      error: err.message,
+      code: err.code || 'RESET_TO_IMAGES_FAILED',
+      ...(err.writeToken ? { writeToken: err.writeToken } : {}),
+    })
   }
 })
 

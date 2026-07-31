@@ -26,8 +26,35 @@ test('Windows accepts an existing Gemini/Veo prompt without reauthoring it', () 
   }), false)
 })
 
+test('Gemini Omni Veo accepts a fixed eight-second Windows prompt', () => {
+  const prompt = {
+    video_model: 'windows-default',
+    video_provider: 'windows-worker',
+    duration_seconds: 8,
+  }
+  assert.equal(isPromptCompatibleWithVideoSettings(prompt, {
+    videoGenerationBackend: 'hosted-provider',
+    videoProvider: 'geminigen',
+    videoModel: 'veo-3.1-fast',
+    aspectRatio: '16:9',
+  }), true)
+  assert.equal(isPromptCompatibleWithVideoSettings(prompt, {
+    videoGenerationBackend: 'hosted-provider',
+    videoProvider: 'geminigen',
+    videoModel: 'veo-3.1-fast',
+    aspectRatio: '9:16',
+  }), false)
+  assert.equal(isPromptCompatibleWithVideoSettings({ ...prompt, duration_seconds: 6 }, {
+    videoGenerationBackend: 'hosted-provider',
+    videoProvider: 'geminigen',
+    videoModel: 'veo-3.1-fast',
+    aspectRatio: '16:9',
+  }), false)
+})
+
 test('publishes the ContentMachine backend API contract', () => {
   assert.equal(WINDOWS_VIDEO_API_ROUTES.generate, '/videos/windows/generate')
+  assert.equal(WINDOWS_VIDEO_API_ROUTES.regenerate, '/videos/windows/regenerate')
   assert.equal(
     WINDOWS_VIDEO_API_ROUTES.status('session_2026-07-27_a b'),
     '/videos/windows/status/session_2026-07-27_a%20b'
@@ -75,6 +102,27 @@ test('accepts snake-case broker snapshots without selecting completed videos', (
   assert.equal(jobs['4_0'].url, 'https://cdn.example/4.mp4')
   assert.equal(jobs['9_0'].provider, 'fal')
   assert.deepEqual(selectedVideos, { '2_0': { url: 'https://cdn.example/selected.mp4' } })
+})
+
+test('superseded Windows jobs cannot retain a previous completed MP4 as current', () => {
+  const jobs = mergeWindowsTasksIntoJobs({
+    '4_0': {
+      provider: WINDOWS_VIDEO_PROVIDER,
+      status: 'completed',
+      url: 'https://cdn.example/old-input.mp4',
+    },
+  }, {
+    tasks: [{
+      unitId: '4_0',
+      jobId: 'task-old',
+      status: 'superseded',
+      url: 'https://cdn.example/old-input.mp4',
+      error: { code: 'STALE_INPUT', message: 'Source image changed' },
+    }],
+  })
+
+  assert.equal(jobs['4_0'].status, 'superseded')
+  assert.equal(jobs['4_0'].url, null)
 })
 
 test('unwraps action responses that return the current project status', () => {

@@ -6,6 +6,7 @@ import {
   buildNarrationSfxItems,
   deriveBaseTimeline,
 } from './timeline.js'
+import { clipLocalTime } from './previewEngine.js'
 
 test('measured cinematic audio drives montage and chapter block durations', () => {
   const baseItems = [
@@ -74,6 +75,55 @@ test('multi-line TTS parts are scheduled sequentially without silence', () => {
     ['line-1.mp3', 0, 2],
     ['line-2.mp3', 2, 5],
   ])
+})
+
+test('editorial target trims an eight-second provider source on the timeline', () => {
+  const result = deriveBaseTimeline({
+    sceneOrder: [1],
+    sceneAudioBySceneNumber: {},
+    sceneSegments: {
+      1: [{
+        segmentIndex: 0,
+        targetDuration: 3.2,
+        clipDuration: 8,
+        playbackRate: 0.8,
+      }],
+    },
+    selectedVideos: {
+      '1_0': {
+        url: '/provider-source-8s.mp4',
+        duration: 8,
+        target_duration: 3.2,
+        playback_rate: 0.8,
+      },
+    },
+  })
+
+  const clip = result.items.find(item => item.kind === 'clip')
+  assert.equal(clip.endTime - clip.startTime, 3.2)
+  assert.equal(result.totalDuration, 3.2)
+  assert.equal(clip.payload.playbackRate, 0.8)
+  assert.equal(Number(clipLocalTime(clip, clip.endTime).toFixed(2)), 2.56)
+  assert.equal(clip.payload.transitionIn, 'cut')
+})
+
+test('Director transitions become anchored, editable timeline objects', () => {
+  const baseItems = [
+    { id: 'c1', kind: 'clip', startTime: 0, endTime: 5, payload: { src: 'a.mp4', sceneNumber: 1, segmentIndex: 0 } },
+    { id: 'c2', kind: 'clip', startTime: 5, endTime: 10, payload: { src: 'b.mp4', sceneNumber: 2, segmentIndex: 0 } },
+  ]
+  const result = applyDirectorPlan({
+    baseItems,
+    sceneWindows: { 1: { start: 0, end: 5 }, 2: { start: 5, end: 10 } },
+    plan: { transitions: [{ id: 'tr-1', before_scene: 2, type: 'soft-blur', duration_seconds: 0.65, reason: 'A real time jump.' }] },
+    chapters: [],
+  })
+  const transition = result.items.find(item => item.kind === 'transition')
+  assert.equal(transition.startTime, 5)
+  assert.equal(transition.endTime, 5.65)
+  assert.equal(transition.payload.fromClipId, 'c1')
+  assert.equal(transition.payload.toClipId, 'c2')
+  assert.equal(transition.payload.type, 'soft-blur')
 })
 
 test('narration SFX uses measured line boundaries when individual TTS parts exist', () => {
@@ -208,4 +258,60 @@ test('Director score chains long sections with overlap and no exposed silence', 
     assert.ok(items[index].startTime < items[index - 1].endTime)
     assert.notEqual(items[index].payload.trackId, items[index - 1].payload.trackId)
   }
+})
+
+test('map placement: +2s entry, two-clip span, 7s cap, and <2s tail extension', () => {
+  const mapPlan = { maps: [{ id: 'map-1', after_scene: 2, duration_seconds: 7, request: { subject: 'Antwerp' } }] }
+  const place = (clips, windows) => applyDirectorPlan({
+    baseItems: clips,
+    sceneWindows: { ...windows },
+    plan: mapPlan,
+    chapters: [],
+    cinemaAudio: {},
+  }).items.find(item => item.kind === 'map')
+
+  // Owner clip 2-7, next clip 7-14. Entry = owner start + 2s = 4; the 7s cap
+  // cuts at 11, leaving the next clip 3s of solo footage (>= 2s) — clean cut.
+  const cap = place([
+    { id: 'c1', kind: 'clip', startTime: 0, endTime: 2, payload: { src: 'a.mp4', sceneNumber: 1, segmentIndex: 0 } },
+    { id: 'c2', kind: 'clip', startTime: 2, endTime: 7, payload: { src: 'b.mp4', sceneNumber: 2, segmentIndex: 0 } },
+    { id: 'c3', kind: 'clip', startTime: 7, endTime: 14, payload: { src: 'c.mp4', sceneNumber: 3, segmentIndex: 0 } },
+  ], { 1: { start: 0, end: 2 }, 2: { start: 2, end: 7 }, 3: { start: 7, end: 14 } })
+  assert.equal(cap.startTime, 4)
+  assert.equal(cap.endTime, 11)
+
+  // Same layout but the second clip ends at 12.4: cutting at 11 would leave
+  // only 1.4s of solo footage — the map holds to the clip end instead.
+  const tail = place([
+    { id: 'c1', kind: 'clip', startTime: 0, endTime: 2, payload: { src: 'a.mp4', sceneNumber: 1, segmentIndex: 0 } },
+    { id: 'c2', kind: 'clip', startTime: 2, endTime: 7, payload: { src: 'b.mp4', sceneNumber: 2, segmentIndex: 0 } },
+    { id: 'c3', kind: 'clip', startTime: 7, endTime: 12.4, payload: { src: 'c.mp4', sceneNumber: 3, segmentIndex: 0 } },
+  ], { 1: { start: 0, end: 2 }, 2: { start: 2, end: 7 }, 3: { start: 7, end: 12.4 } })
+  assert.equal(tail.startTime, 4)
+  assert.equal(tail.endTime, 12.4)
+
+  // A map may never span more than two clips: with short clips the reachable
+  // end is the second clip's end even though 7s would ask for more.
+  const span = place([
+    { id: 'c1', kind: 'clip', startTime: 0, endTime: 2, payload: { src: 'a.mp4', sceneNumber: 1, segmentIndex: 0 } },
+    { id: 'c2', kind: 'clip', startTime: 2, endTime: 6, payload: { src: 'b.mp4', sceneNumber: 2, segmentIndex: 0 } },
+    { id: 'c3', kind: 'clip', startTime: 6, endTime: 8.5, payload: { src: 'c.mp4', sceneNumber: 3, segmentIndex: 0 } },
+    { id: 'c4', kind: 'clip', startTime: 8.5, endTime: 16, payload: { src: 'd.mp4', sceneNumber: 4, segmentIndex: 0 } },
+  ], { 1: { start: 0, end: 2 }, 2: { start: 2, end: 6 }, 3: { start: 6, end: 8.5 }, 4: { start: 8.5, end: 16 } })
+  assert.equal(span.startTime, 4)
+  assert.equal(span.endTime, 8.5)
+})
+
+test('map placement honors the director presentation hint', () => {
+  const placed = applyDirectorPlan({
+    baseItems: [
+      { id: 'c1', kind: 'clip', startTime: 0, endTime: 6, payload: { src: 'a.mp4', sceneNumber: 1, segmentIndex: 0 } },
+      { id: 'c2', kind: 'clip', startTime: 6, endTime: 12, payload: { src: 'b.mp4', sceneNumber: 1, segmentIndex: 1 } },
+    ],
+    sceneWindows: { 1: { start: 0, end: 12 } },
+    plan: { maps: [{ id: 'map-1', after_scene: 1, duration_seconds: 7, request: { subject: 'X', presentation_hint: 'corner' } }] },
+    chapters: [],
+    cinemaAudio: {},
+  }).items.find(item => item.kind === 'map')
+  assert.equal(placed.payload.presentation, 'corner')
 })

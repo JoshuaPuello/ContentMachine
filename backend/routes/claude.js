@@ -17,6 +17,7 @@ import {
 } from '../lib/narrationSkills.js';
 import {
   buildCharacterSceneContext,
+  buildCharacterStoryContext,
   normalizeExtractedCharacters,
 } from '../lib/characterContinuity.js';
 import { hardenImagePromptScenes } from '../lib/imagePromptQuality.js';
@@ -691,11 +692,11 @@ export const splitVoiceoverAtSentenceBoundaries = (voiceover, count) => {
   return chunks;
 };
 
-const buildScenePlanningPrompt = (videoModel) => {
+export const buildScenePlanningPrompt = (videoModel) => {
   const isKling      = videoModel === 'kwaivgi/kling-v3-video';
   const isKlingTurbo = videoModel === 'kwaivgi/kling-v2.5-turbo-pro';
   const isFast       = videoModel === 'lightricks/ltx-2-fast';
-  const isVeo        = videoModel === 'veo-3.1-fast';
+  const isVeo        = videoModel === 'veo-3.1-fast' || videoModel === 'windows-default';
   const isGrok       = videoModel === 'grok-3';
 
   const allowedDurations = isVeo
@@ -715,7 +716,9 @@ const buildScenePlanningPrompt = (videoModel) => {
   const atmosphereDur = isKlingTurbo ? '10s' : isKling ? '10-12s' : isFast ? '14-16s' : isGrok ? '10s' : '8s';
 
   const durationGuide = isVeo ? `
-- 8 seconds: EVERY scene is exactly 8 seconds — this model has a fixed duration. Vary pacing through shot type and camera movement, not duration.` : isGrok ? `
+- 8 seconds is the SOURCE CLIP generation length, not a requirement to hold one composition in the final edit for eight seconds.
+- Author the internal editorial rhythm separately: kinetic scenes normally contain 3 genuinely different visual beats, standard scenes 2, and deliberate scenes 1.
+- A later stage may generate one 8-second source clip for each visual beat and trim it to its useful action window. Put the essential action first and do not pad a beat merely to fill the provider output.` : isGrok ? `
 - 6 seconds: Quick cuts, reactions, fast action beats
 - 10 seconds: Standard beats, dialogue, building tension — prefer this as your baseline
 - 15 seconds: Establishing shots, emotional peaks, slow reveals, climax moments` : isKlingTurbo ? `
@@ -775,7 +778,25 @@ Step 4: Camera progression for multi-scene moments
 - Each scene gets unique visual_description and camera_intent
 - Maintain continuity across related scenes
 
-Step 5: Verify totals
+Step 5: Plan the INTERNAL VISUAL BEATS of every scene
+- pacing_profile must be exactly "kinetic", "standard", or "deliberate".
+- kinetic: normally 3 visual beats inside the scene. Use for physical action, urgent discoveries, reversals, confrontations, procedural work, and hooks with several concrete facts.
+- standard: normally 2 visual beats. Use for most documentary exposition: establish the concrete situation, then reveal evidence, consequence, reaction, or a more informative detail.
+- deliberate: normally 1 visual beat. Reserve for an earned emotional hold, geography-establishing view, singular reveal, or moment where cutting would weaken comprehension.
+- visual_beat_count MUST equal visual_beats.length.
+- Every beat must change the viewer's information: a new action phase, evidence, consequence, reaction, spatial relationship, or story-relevant detail. A closer crop of the same unchanged pose is NOT a new beat.
+- Do not manufacture constant cuts. Pace follows information density and emotional intent, with deliberate holds used as contrast.
+- Narration remains fluent continuous documentary speech. Never create fragmentary narration merely to justify more cuts.
+
+Step 6: Assign scenario identity for visual continuity
+- scenario_id is a stable semantic slug for the SAME physical environment and continuity state, such as "rural-roadside-arrest-day".
+- Reuse the exact same scenario_id when the story returns to that same setup, even after unrelated scenes in other places. Scenario groups are semantic, never based only on adjacency.
+- Use a different scenario_id when location, era, time of day, weather, set dressing, or the relevant continuity state materially changes.
+- scenario_continuity must name the fixed environment anchors that should recur: layout, structures, vehicles, vegetation, weather, light direction, surface conditions, and persistent props.
+- environment_family_id is the broader connected continuity world used for scene sheets. Reuse it across related zones that can coexist in one coherent spatial model (for example bank corridor + visible vault interior), including non-adjacent returns. Never use it merely because two places share a mood.
+- environment_family_continuity must explain their stable spatial relationship plus shared time, light, weather, architecture, persistent props, wardrobe state, and story-time state. Change the family when any of those anchors become incompatible.
+
+Step 7: Verify totals
 - Sum of all duration_seconds ≈ maxMinutes × 60
 - Expected scenes = total_seconds / ${avgDuration} (roughly)
 
@@ -791,7 +812,7 @@ router.post('/scene-planning', async (req, res) => {
     const isKlingTurbo     = videoModel === 'kwaivgi/kling-v2.5-turbo-pro';
     const isKling          = videoModel === 'kwaivgi/kling-v3-video';
     const isFast           = videoModel === 'lightricks/ltx-2-fast';
-    const isVeo            = videoModel === 'veo-3.1-fast';
+    const isVeo            = videoModel === 'veo-3.1-fast' || videoModel === 'windows-default';
     const isGrok           = videoModel === 'grok-3';
     const allowedDurations = isVeo ? 'exactly 8 (every scene is 8 seconds)'
       : isGrok ? '6, 10, or 15'
@@ -839,6 +860,11 @@ PACING:
 - Action sequences: 5-6 scenes × ${minActionDur}s (rapid cuts)
 - Dramatic reveals: 2-3 scenes (setup→hold→payoff)
 - Standard beats: 1-2 scenes × ${standardBeatDur}
+- Inside each scene, choose a truthful pacing_profile and plan its distinct visual_beats. Kinetic normally means 3 beats, standard 2, and deliberate 1.
+- A visual beat must reveal new story information or advance the physical action. Do not repeat the same pose or event at a different crop just to fill time.
+- Preserve fluent narration across these picture changes. Faster visual pacing must never produce staccato voiceover.
+- Give every scene a semantic scenario_id. Reuse it for later non-adjacent scenes only when they return to the same physical setup and continuity state.
+- Give every scene an environment_family_id. Reuse it only for exact or physically connected continuity zones that could be authored together without inventing geography. This is the grouping signal for optional 2–6-shot scene sheets.
 
 Return ONLY this JSON. Every field must have a real, specific value — never "N/A", "none", or vague placeholders:
 {
@@ -852,6 +878,29 @@ Return ONLY this JSON. Every field must have a real, specific value — never "N
         "narrative_beat": "hook",
         "importance": "critical",
         "duration_seconds": ${isFast ? 14 : isKling ? 10 : isKlingTurbo ? 10 : isGrok ? 10 : 8},
+        "pacing_profile": "kinetic",
+        "visual_beat_count": 3,
+        "visual_beats": [
+          {
+            "beat": "establish the immediate obstacle",
+            "action": "soldiers brace against the wind while scanning the empty approach",
+            "shot_type": "wide"
+          },
+          {
+            "beat": "reveal the first concrete warning",
+            "action": "the lead guard spots movement and raises the torch as the formation reacts",
+            "shot_type": "medium"
+          },
+          {
+            "beat": "land on the evidence that changes the situation",
+            "action": "a gloved hand tightens around the spear as distant silhouettes appear below",
+            "shot_type": "detail"
+          }
+        ],
+        "scenario_id": "storm-fortress-battlements-dusk",
+        "scenario_continuity": "same western battlement, wet dark stone, iron torch brackets, overcast dusk, cold wind from camera right, warm torchlight from frame left",
+        "environment_family_id": "storm-fortress-western-defenses-dusk",
+        "environment_family_continuity": "western battlement connects directly to its stone stair and guard corridor; same stormy dusk, wet masonry, torch placement, cold camera-right wind, uniforms, and pre-attack story state",
         "shot_type": "wide",
         "camera_intent": "Slow push-in reveals scale of the fortress walls",
         "visual_description": "Torchlit stone ramparts at dusk, soldiers in formation on the battlements",
@@ -904,6 +953,7 @@ VISUAL STYLE MANDATE (NON-NEGOTIABLE):
 - Skin tone: Off-white/cream porcelain OR warm brown porcelain depending on character ethnicity. NEVER realistic human skin colors.
 - Hair: Mannequins CAN have painted or sculpted hair appropriate to the character and era.
 - WARDROBE CONTINUITY RULE: Mannequins wear complete, period-accurate outfits. For wide or full-body shots, explicitly name the upper garment, lower garment, and footwear. For medium shots and close-ups, describe ONLY the garments naturally visible in the requested crop; keep the remaining outfit consistent but off-frame. NEVER force trousers, skirts, legs, or footwear into a close-up that does not naturally show them.
+- SCENARIO CONTINUITY RULE: scenario_id identifies the same physical setup even when matching scenes are not adjacent. For every scene sharing a scenario_id, preserve the supplied scenario_continuity anchors exactly: geography/layout, recurring structures and vehicles, vegetation, weather, time-of-day light direction, surface conditions, and persistent props. A changed camera position may reveal another side of the set but must not redesign it.
 - Pose: Body language and gestures convey emotion despite featureless faces.
 - ANATOMY: Every mannequin uses life-size, age-appropriate realistic human proportions and physically plausible joints, hands, fingers, posture, balance, and limb lengths. Never render toy-like, chibi, doll, bobblehead, miniature, compressed, fused, duplicated, or malformed anatomy.
 - STYLE AT EVERY IMAGE PLANE: Every visible person is a porcelain mannequin even when unnamed, blurred, distant, reflected, photographed, or shown inside a monitor, television, phone, projection, bodycam recording, or archival footage. A nested image or screen is NEVER permission to render photorealistic humans.
@@ -1042,14 +1092,16 @@ EXAMPLE OUTPUT (follow this structure and level of detail exactly — note the v
 
 // Addendum applied when scenes are split into sequential segments (the scene's
 // narration audio outlasts a single video clip, so multiple shots are needed).
-const buildSegmentAddendum = (variationsPerSegment) => `
+export const buildSegmentAddendum = (variationsPerSegment) => `
 
 SEQUENTIAL SEGMENTS (CRITICAL — READ CAREFULLY):
 Each scene now contains a "segments" array. Each segment is a SEPARATE SEQUENTIAL SHOT of the same scene — together they play back-to-back to cover the scene's narration audio.
-- Segment 1 establishes the moment described in visual_description.
-- Each following segment must ADVANCE the action — a later beat of the same moment: the action progresses, the camera relocates, the subject moves, tension escalates. It must feel like the story is CONTINUING, never like a re-render of the same instant.
+- visual_beats is the authored editorial progression. When visual_beats.length equals segments.length, segment_index N MUST execute visual_beats[N] exactly, including its action and shot_type.
+- When there are more segments than visual_beats, subdivide the matching beat into genuine sequential action phases without inventing a new event. When there are fewer segments, combine adjacent beats in causal order while preserving their most informative visual change.
+- Segment 1 does not always need to be a wide establishing shot. Follow the assigned authored beat. Establish context only when the viewer genuinely needs it.
+- Each following segment must ADVANCE information — a later action phase, evidence, consequence, reaction, spatial relationship, or story-relevant detail. A different crop of the same unchanged pose is a duplicate and is forbidden.
 - Keep hard continuity across segments: same mannequin(s), same clothing (exact outfit), same environment, same weather and time of day, same key props. Only the action, framing, and camera evolve.
-- Think like a film editor cutting within a scene: wide establishing → move closer as the action develops → detail or reaction as it peaks.
+- Think like a film editor cutting on meaning. Vary shot scale when it strengthens the beat, but never force a mechanical wide → medium → close pattern onto an event that does not earn it.
 - Generate exactly ${variationsPerSegment} distinct variation(s) per segment (vary lens/lighting/angle across variations of the SAME beat — variations are alternatives for the same shot, segments are different sequential shots).
 
 OUTPUT FORMAT OVERRIDE (MANDATORY WHEN SEGMENTS ARE PRESENT):
@@ -1074,6 +1126,32 @@ Return ONLY valid JSON in this exact shape:
   ]
 }`;
 
+export const buildImagePromptScenesData = (sourceScenes = [], useSegments = false) => (
+  sourceScenes.map(scene => ({
+    scene_id: scene.scene_id,
+    scene_number: scene.scene_number,
+    visual_description: scene.visual_description,
+    shot_type: scene.shot_type,
+    camera_intent: scene.camera_intent,
+    mannequin_details: scene.mannequin_details,
+    environment: scene.environment,
+    pacing_profile: scene.pacing_profile,
+    visual_beat_count: scene.visual_beat_count,
+    visual_beats: scene.visual_beats,
+    scenario_id: scene.scenario_id,
+    scenario_continuity: scene.scenario_continuity,
+    environment_family_id: scene.environment_family_id,
+    environment_family_continuity: scene.environment_family_continuity,
+    ...(useSegments ? {
+      segments: (scene.segments?.length ? scene.segments : [{ segment_index: 0 }]).map(seg => ({
+        segment_index: seg.segment_index ?? 0,
+        covers_seconds: seg.target_duration || undefined,
+        narration: seg.narration || undefined,
+      }))
+    } : {})
+  }))
+);
+
 router.post('/image-prompts', async (req, res) => {
   try {
     enforceSonnetPromptAuthor(req);
@@ -1093,22 +1171,7 @@ router.post('/image-prompts', async (req, res) => {
     const useSegments = sourceScenes.some(s => Array.isArray(s.segments) && s.segments.length > 0);
     const variations = Math.min(4, Math.max(1, parseInt(variationsPerSegment) || 4));
 
-    const scenesData = sourceScenes.map(scene => ({
-      scene_id: scene.scene_id,
-      scene_number: scene.scene_number,
-      visual_description: scene.visual_description,
-      shot_type: scene.shot_type,
-      camera_intent: scene.camera_intent,
-      mannequin_details: scene.mannequin_details,
-      environment: scene.environment,
-      ...(useSegments ? {
-        segments: (scene.segments?.length ? scene.segments : [{ segment_index: 0 }]).map(seg => ({
-          segment_index: seg.segment_index ?? 0,
-          covers_seconds: seg.target_duration || undefined,
-          narration: seg.narration || undefined,
-        }))
-      } : {})
-    }));
+    const scenesData = buildImagePromptScenesData(sourceScenes, useSegments);
 
     const systemPrompt = useSegments
       ? IMAGE_PROMPT_SYSTEM + buildSegmentAddendum(variations)
@@ -1212,6 +1275,12 @@ router.post('/video-prompts', async (req, res) => {
         segment_index: scene.segment_index ?? 0,
         segment_count: scene.segment_count || 1,
         duration_seconds: scene.duration_seconds,
+        target_duration: scene.target_duration,
+        action_duration_seconds: scene.action_duration_seconds,
+        usable_duration_seconds: scene.usable_duration_seconds,
+        editorial_duration_seconds: scene.editorial_duration_seconds,
+        clip_duration: scene.clip_duration,
+        playback_rate: scene.playback_rate,
         narration: scene.narration || undefined,
         full_scene_narration: scene.full_scene_narration || undefined,
         visual_description: scene.visual_description,
@@ -1712,16 +1781,22 @@ Exclude anonymous crowds, generic officers/guards/workers, archival background f
 Before returning, audit every narration unit and visual scene for named people, role-based recurring people, aliases, and pronouns. Merge aliases for the same person. List every excluded candidate and the exact continuity reason for excluding them. Return only valid JSON.`;
 
 router.post('/characters/extract', async (req, res) => {
+  const controller = new AbortController();
+  const cancelIfDisconnected = () => {
+    if (!res.writableEnded) controller.abort();
+  };
+  res.once('close', cancelIfDisconnected);
   try {
     const { story, scenePlan, narration } = req.body;
     if (!story || !Array.isArray(scenePlan?.scenes)) {
       return res.status(400).json({ error: true, message: 'story and scenePlan.scenes are required' });
     }
+    const storyContext = buildCharacterStoryContext(story);
     const sceneContext = buildCharacterSceneContext(scenePlan, narration);
     const text = await callClaudeCli('sonnet', CHARACTER_EXTRACTION_SYSTEM, `Extract the recurring visual cast for this documentary.
 
 STORY:
-${JSON.stringify(story, null, 2)}
+${JSON.stringify(storyContext, null, 2)}
 
 SCENES:
 ${JSON.stringify(sceneContext, null, 2)}
@@ -1745,13 +1820,21 @@ Return:
     }],
     "coverage_notes": "brief confirmation of which narration and visual material was checked"
   }
-}`, { noSessionPersistence: true, timeoutMs: 15 * 60_000 });
+}`, {
+      noSessionPersistence: true,
+      timeoutMs: 3 * 60_000,
+      effort: 'low',
+      signal: controller.signal,
+    });
     const data = safeParseJSON(text);
     const normalized = normalizeExtractedCharacters(data, scenePlan.scenes.length);
     res.json({ ...normalized, model: 'sonnet' });
   } catch (error) {
+    if (controller.signal.aborted && !res.headersSent) return;
     console.error('Character extraction error:', error);
     res.status(500).json({ error: true, message: error.message, code: 'CHARACTER_EXTRACTION_ERROR' });
+  } finally {
+    res.off('close', cancelIfDisconnected);
   }
 });
 

@@ -24,6 +24,17 @@ The scene plan describes pictures and timing. It does not define prose boundarie
 
 Each unit must remain independently alignable by Whisper, so never split a sentence or syntactic clause across units. Continuity comes from meaning and connective tissue, not from cutting a sentence in half.
 
+## Visual momentum without choppy speech
+
+Fast documentary editing and fluent narration are separate controls. The pictures may change two or three times while the narrator delivers one connected sentence. Never shorten sentences into fragments merely to manufacture edit points.
+
+- Keep the causal spoken line flowing, but make it visually actionable: prefer concrete actors, objects, evidence, locations, decisions, reactions, and consequences over abstract summary.
+- A typical 6 to 10 second passage should contain enough concrete information for two meaningfully different images when the facts support it. Physical action, reversals, urgent discoveries, and hooks may support three. An earned emotional hold or singular reveal may support one.
+- Each new visual must advance information. Reframing the same unchanged pose, repeating the same action, or cutting between nearly identical close-ups does not create momentum.
+- Vary the rhythm intentionally. Mix quick evidence or action beats with occasional longer holds so the edit has contrast instead of becoming a metronome.
+- Do not pad a moment to match a video provider's source-clip length. Provider duration is a production constraint; the final edit may use only the useful action window.
+- When a location returns later, write enough concrete environmental context to recover the same physical scenario without re-explaining facts the audience already knows.
+
 ## Unit contracts
 
 ### Trailer

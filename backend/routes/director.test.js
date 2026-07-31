@@ -20,12 +20,27 @@ test('Director mechanically limits maps to one per full program minute', () => {
   assert.equal(twoMinute.maps.length, 2);
 });
 
+test('Director sanitizes sparse transition choices and rejects invalid boundaries', () => {
+  const plan = sanitizePlan({
+    transitions: [
+      { before_scene: 1, type: 'cross-dissolve', duration_seconds: 0.6 },
+      { before_scene: 2, type: 'blur-dissolve', duration_seconds: 9, reason: 'Time moves forward.' },
+      { before_scene: 2, type: 'dip', duration_seconds: 0.4, reason: 'Duplicate target.' },
+      { before_scene: 3, type: 'unknown-transition' },
+    ],
+  }, 3, { audioDurations: { 1: 30, 2: 30, 3: 30 } });
+  assert.deepEqual(plan.transitions.map(item => item.type), ['soft-blur']);
+  assert.equal(plan.transitions[0].duration_seconds, 1.2);
+  assert.equal(plan.transitions[0].before_segment_index, 0);
+});
+
 test('Director gives every real chrome element a deliberate sound policy', () => {
   const plan = sanitizePlan({
     lower_thirds: [{ scene_number: 1, text: 'Allen West', subtitle: 'The architect' }],
     date_chips: [{ scene_number: 1, text: '11 JUNE 1962' }],
     title_cards: [{ after_scene: 1, text: 'LEFT BEHIND' }],
     maps: [{ after_scene: 1, request: { subject: 'Alcatraz Island' } }],
+    transitions: [{ before_scene: 2, type: 'soft-blur', duration_seconds: 0.65 }],
     trailer: {
       shots: [{ scene_number: 1 }, { scene_number: 2 }, { scene_number: 3 }],
       title: 'THE MAN LEFT BEHIND',
@@ -41,6 +56,8 @@ test('Director gives every real chrome element a deliberate sound policy', () =>
   });
 
   assert.equal(plan.date_chips[0].sound_design.cues[0].role, 'reveal');
+  assert.equal(plan.transitions[0].sound_design.cues[0].role, 'transition');
+  assert.match(plan.transitions[0].sound_design.cues[0].description, /soft-blur/i);
   assert.equal(plan.lower_thirds[0].sound_design.cues[0].role, 'reveal');
   assert.equal(plan.title_cards[0].sound_design.cues[0].role, 'reveal');
   assert.equal(plan.trailer.sound_design.cues[0].role, 'reveal');
@@ -132,4 +149,41 @@ test('Director collapses semantically duplicated two-sided data into one minimal
   assert.equal(graphic.composition.layout.archetype, 'minimal');
   assert.equal(graphic.composition.content.body, '');
   assert.match(graphic.editorial_adjustments.join(' '), /duplicated primary fact/i);
+});
+
+test('Map duration is capped by the narration it plays under, with a 6s floor', () => {
+  // Scene 4 narration is 6.8s: a director-requested 12s map anchored to
+  // scene 4 must not bleed into scene 5 (observed failure: map hid three
+  // shots across two scenes). after_scene names the map's anchor scene.
+  const capped = sanitizePlan({
+    maps: [{ after_scene: 4, duration_seconds: 12, request: { subject: 'Antwerp' } }],
+  }, 12, { audioDurations: { 1: 30, 2: 30, 3: 30, 4: 6.8, 5: 9.2 } });
+  assert.equal(capped.maps.length, 1);
+  assert.equal(capped.maps[0].duration_seconds, 6.8);
+  assert.equal(capped.maps[0].request.duration_seconds, 6.8);
+
+  // Even with long narration, the hard ceiling is 7s.
+  const ceiling = sanitizePlan({
+    maps: [{ after_scene: 1, duration_seconds: 18, request: { subject: 'Europe' } }],
+  }, 12, { audioDurations: { 1: 60, 2: 40 } });
+  assert.equal(ceiling.maps[0].duration_seconds, 7);
+
+  // Short but sufficient narration keeps its own length; the old 10s floor
+  // must not inflate it.
+  const short = sanitizePlan({
+    maps: [{ after_scene: 1, duration_seconds: 7, request: { subject: 'Belgium' } }],
+  }, 12, { audioDurations: { 1: 60, 2: 20 } });
+  assert.equal(short.maps[0].duration_seconds, 7);
+
+  // A narration under 6s cannot earn a full-frame takeover: the map is dropped.
+  const dropped = sanitizePlan({
+    maps: [{ after_scene: 3, duration_seconds: 18, request: { subject: 'Vault' } }],
+  }, 12, { audioDurations: { 1: 60, 2: 60, 3: 4.5 } });
+  assert.equal(dropped.maps.length, 0);
+
+  // Without audio data the clamp still applies but nothing is invented.
+  const unknown = sanitizePlan({
+    maps: [{ after_scene: 1, duration_seconds: 40, request: { subject: 'Europe' } }],
+  }, 12, { audioDurations: { 1: 61, 2: 61 } });
+  assert.equal(unknown.maps[0].duration_seconds, 7);
 });

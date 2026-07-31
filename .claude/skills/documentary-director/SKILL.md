@@ -75,11 +75,22 @@ Every element must be *motivated by the narration at that moment*. The
 viewer should never notice "an effect"; they should feel the story getting
 clearer. Quantified limits (hard rules):
 
-- **Maps**: at most 1 per 60 seconds of runtime; 12–30 s each; ONLY when
+- **Maps**: at most 1 per 60 seconds of runtime; 6–7 s each (7 is a hard
+  ceiling), never longer than the narration lines the map plays under (the
+  runner clamps this mechanically — a map that outlasts its excerpt bleeds
+  into a scene about something else and hides that scene's footage); ONLY when
   narration names geography — a journey, an invasion, an empire's extent,
   a strategic position. Never for mood. World coverage available: lon
   −15…180, lat −15…80 (Europe/Africa-north/Asia/West-Pacific). If the
   story's geography is outside this (Americas), do NOT plan a map there.
+- **Map scale floor**: the map engine is a country/continental atlas. Its
+  maximum zoom still shows ≈17° of longitude, so the finest thing a map can
+  depict is a CITY, and a city only as a single marker with plaque text.
+  Never request district outlines, street positions, station-side geometry,
+  buildings, or multiple points inside one city — that detail belongs in the
+  marker's plaque text ("Schupstraat · Antwerp Diamond Center"), never in
+  the drawn geography. If the narration's geographic payoff is genuinely
+  street-scale, a map cannot deliver it: place no map.
 - **Map complexity budget**: a map may show ONLY what its narration_excerpt
   says. Count what depicting the excerpt honestly requires: if it needs more
   than ~4 routes plus ~3 markers, DO NOT place the map — a crowded map is
@@ -144,9 +155,17 @@ execute. Include: `subject` (what territory/movement the map shows), `era`,
 ISO numeric ids when you know them), `beats` (ordered: what appears/moves
 and roughly when as fractions of the segment), `narration_excerpt` (the
 exact narration lines the map plays under), `style` (from the request
-settings), `duration_seconds` (12–30, matched to how long the relevant
-narration runs). The map plays OVER the footage (full-frame takeover) while
-narration continues — so its duration must fit within the scenes it covers.
+settings), `duration_seconds` (6–7, matched to how long the excerpt's
+narration actually runs — the runner also caps it at the duration of the
+scene the map plays under). The map plays over the footage while narration
+continues — so its duration must fit within the scene it covers, and
+`geography` must respect the scale floor above: no districts, streets, or
+sub-city features as drawable geography. Also set `presentation_hint`:
+`"split"` (side-by-side panel with the live footage — the default choice for
+most maps), `"corner"` (small top-right overlay card — for simple locator
+maps that only orient), or `"full"` (full-frame takeover — reserve for the
+rare map that IS the scene's whole story, e.g. a campaign with routes; full
+screen is overwhelming when overused). The editor can override this hint.
 
 The `narration_excerpt` is a CONTRACT, not context: the map author is
 instructed to draw only what those lines say, and validators reject routes
@@ -178,6 +197,16 @@ Respond with a single JSON object in a ```json fence, no prose:
           { "at": 0.55, "what": "arrows cross the strait to Korea" },
           { "at": 0.7, "what": "Korea joins the red empire" } ],
         "narration_excerpt": "…", "style": "chronicle", "duration_seconds": 18 } }
+  ],
+  "transitions": [
+    {
+      "id": "transition-1",
+      "before_scene": 4,
+      "before_segment_index": 0,
+      "type": "cross-dissolve",
+      "duration_seconds": 0.6,
+      "reason": "The narration leaves the method and enters its consequence; a restrained optical handoff makes that temporal turn legible."
+    }
   ],
   "lower_thirds": [
     { "scene_number": 2, "text": "Emperor Meiji", "subtitle": "1852 – 1912",
@@ -217,6 +246,32 @@ element types you (correctly) decided not to place. `after_scene` means the
 map starts when that scene's narration reaches its geographic beat — the
 runner aligns it to the scene's audio window.
 
+### Transition direction
+
+Hard cuts are the default and must remain the majority. Author a transition
+whenever the narration makes a real change in time, place, chapter,
+perspective, evidence mode, or emotional pressure — and those turns happen
+often in documentary scripts, so expect roughly one transition every 10–18
+seconds of runtime (a 3-minute film should usually carry 8–14, not 2).
+Under-transitioning is as much a failure as decorating every cut: audit every
+scene boundary and ask "did time, place, or pressure just change?" — if yes,
+that boundary gets a transition. Chapter starts and any jump in date or
+location are near-mandatory. Never add one merely to make a cut look
+decorated, and never place transitions on consecutive boundaries.
+
+`before_scene` identifies the incoming scene. `before_segment_index` is the
+incoming shot inside that scene and defaults to 0. Available library types:
+
+- `cross-dissolve`: geographic, temporal, or visual continuity.
+- `dip-to-black`: a decisive chapter, death, verdict, or major time jump.
+- `soft-blur`: memory, inference, uncertainty, or a change of focus.
+- `film-dissolve`: archival/historical evidence changing era or source.
+
+Keep durations between 0.25 and 1.2 seconds. Most should be 0.45–0.75s.
+The reason must name the exact narrative turn. Do not use transitions to hide
+weak shot selection, and do not replace an energetic hard cut when the cut is
+itself the correct punctuation.
+
 ## Self-check before answering
 
 1. Is every placement motivated by a specific narration line? (If you
@@ -229,4 +284,9 @@ runner aligns it to the scene's audio window.
    audio?
 6. Does each score change correspond to a real narrative turn, with no
    scene-by-scene music churn?
+7. Are transitions motivated, non-consecutive, and attached to an exact
+   incoming scene/shot? Did you audit EVERY scene boundary for a time,
+   place, chapter, or pressure change (target ≈1 per 10–18s — a 3-minute
+   film with only 2 transitions is under-directed)? Would any be stronger
+   as a hard cut?
 Fix violations BEFORE emitting the JSON.

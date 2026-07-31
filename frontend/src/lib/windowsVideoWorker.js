@@ -6,6 +6,7 @@ export const WINDOWS_VIDEO_API_ROUTES = Object.freeze({
   pause: '/videos/windows/pause',
   resume: '/videos/windows/resume',
   retryMissing: '/videos/windows/retry-missing',
+  regenerate: '/videos/windows/regenerate',
   cancel: '/videos/windows/cancel',
   manualAttach: '/videos/manual-attach',
 })
@@ -17,6 +18,23 @@ export const usesWindowsVideoBackend = (settings = {}) =>
     && settings.videoProvider === WINDOWS_VIDEO_PROVIDER
   )
 
+const VEO_8_SECOND_MODELS = new Set([
+  WINDOWS_VIDEO_MODEL,
+  'veo-3.1-fast',
+])
+
+const isEightSecondVeoPrompt = (prompt = {}) => (
+  VEO_8_SECOND_MODELS.has(prompt.video_model)
+  && Number(prompt.duration_seconds || 8) === 8
+)
+
+const isEightSecondGeminiOmniTarget = (settings = {}) => (
+  settings.videoGenerationBackend === 'hosted-provider'
+  && settings.videoProvider === 'geminigen'
+  && settings.videoModel === 'veo-3.1-fast'
+  && (settings.aspectRatio == null || settings.aspectRatio === '16:9')
+)
+
 // Prompt provenance is advisory for the shared Windows/Veo route. The worker
 // consumes the immutable full prompt and fixed Windows settings; it does not
 // require the prompt to have been authored while "windows-default" was
@@ -25,6 +43,10 @@ export const isPromptCompatibleWithVideoSettings = (prompt = {}, settings = {}) 
   usesWindowsVideoBackend(settings)
   || !prompt.video_model
   || prompt.video_model === settings.videoModel
+  || (
+    isEightSecondVeoPrompt(prompt)
+    && isEightSecondGeminiOmniTarget(settings)
+  )
 )
 
 export const WINDOWS_VIDEO_STATES = Object.freeze([
@@ -266,12 +288,16 @@ export const mergeWindowsTasksIntoJobs = (jobs = {}, snapshot = {}) => {
   const merged = { ...jobs }
   for (const task of snapshot.tasks || []) {
     const existing = merged[task.unitId] || {}
+    const currentStatus = normalizeWindowsVideoState(task.status)
     merged[task.unitId] = {
       ...existing,
       jobId: task.jobId || existing.jobId || null,
       provider: WINDOWS_VIDEO_PROVIDER,
-      status: task.status,
-      url: task.url || existing.url || null,
+      status: currentStatus,
+      // A previous MP4 is evidence/history, not the current output once its
+      // source image, prompt, or settings have been superseded. Keeping this
+      // URL made stale cards look playable and current after reconciliation.
+      url: currentStatus === 'completed' ? (task.url || existing.url || null) : null,
       error: task.error,
       attempt: task.attempt,
       maxAttempts: task.maxAttempts,

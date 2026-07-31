@@ -169,3 +169,117 @@ test('an over-wide single-line label is stacked into two lines (run-2 attempt 1)
   const reich = result.plan.props.labels.find((l) => l.lines.join(' ').replace('\n', ' ') === 'German Reich');
   assert.equal(reich.lines.length, 2, `expected stacked lines, got ${JSON.stringify(reich.lines)}`);
 });
+
+// Observed Antwerp failure (2026-07-29): a city marker and a street marker
+// 0.02° apart — the same pixel at every legal zoom. The validator must call
+// it out and the repair layer must merge the pair deterministically.
+test('sub-resolution marker pairs are diagnosed and merged into one story point', () => {
+  const plan = {
+    bakes: [],
+    focus: [
+      { frame: 60, subject: 'Belgium among its neighbours', kind: 'establishing', bounds: [1.5, 47.5, 8, 53.5] },
+    ],
+    props: {
+      variant: 'archival',
+      durationInFrames: 360,
+      camera: [
+        { frame: 0, lon: 5.2, lat: 50.4, zoom: 1.6 },
+        { frame: 359, lon: 4.6, lat: 51.0, zoom: 2.2, ease: 'inOut' },
+      ],
+      fills: [],
+      labels: [
+        { lines: ['BELGIUM'], lon: 4.6, lat: 50.6, size: 40, tracking: 0.7, heroFrame: 60, appear: [10, 40] },
+        { lines: ['NORTH SEA'], lon: 2.5, lat: 53.0, size: 26, tracking: 0.6, heroFrame: 60, appear: [10, 40] },
+        { lines: ['FRANCE'], lon: 2.2, lat: 48.6, size: 30, tracking: 0.65, heroFrame: 60, appear: [10, 40] },
+      ],
+      arrows: [],
+      markers: [
+        { lon: 4.4, lat: 51.221, appear: [145, 170], fade: [260, 290], color: 'red', radius: 14, label: 'Antwerp', heroFrame: 180 },
+        { lon: 4.4179, lat: 51.2155, appear: [295, 325], color: 'red', radius: 16, label: 'Schupstraat', detail: 'Antwerp Diamond Center', heroFrame: 320 },
+      ],
+      grade: [],
+    },
+  };
+
+  const { errors } = validateAndFix(structuredClone(plan), 12);
+  assert.ok(
+    errors.some((error) => /below the engine's resolvable scale/.test(error)),
+    `expected a resolvable-scale error, got: ${JSON.stringify(errors)}`
+  );
+
+  const repaired = repairPlan({ plan, durationSeconds: 12 });
+  assert.ok(
+    repaired.log.some((entry) => entry.op === 'marker-merge'),
+    `expected a marker-merge repair, got: ${JSON.stringify(repaired.log)}`
+  );
+  assert.ok(
+    !repaired.errors.some((error) => /below the engine's resolvable scale/.test(error)),
+    `scale error should be resolved, got: ${JSON.stringify(repaired.errors)}`
+  );
+  const markers = repaired.plan.props.markers;
+  assert.equal(markers.length, 1);
+  assert.equal(markers[0].label, 'Schupstraat');
+  // The survivor inherits the pair's earliest entrance so the story point
+  // exists for the whole city-to-street push.
+  assert.equal(markers[0].appear[0], 145);
+  assert.equal(markers[0].detail, 'Antwerp Diamond Center');
+});
+
+// Observed failure (2026-07-30 Antwerp run): a small city label colliding
+// with a small river label burned all three attempts, and the eventual
+// label-shift exiled ANTWERP 1.24° into the North Sea. Small labels must
+// stay pinned near their feature; a stubborn pair resolves by dropping the
+// smaller label, never by dislocating geography.
+test('stubborn small-label collisions drop the smaller label instead of exiling it', () => {
+  const plan = {
+    bakes: [],
+    focus: [
+      { frame: 60, subject: 'Belgium among its neighbours', kind: 'establishing', bounds: [1.5, 47.5, 8, 53.5] },
+    ],
+    props: {
+      variant: 'archival',
+      durationInFrames: 360,
+      camera: [
+        { frame: 0, lon: 5.2, lat: 50.4, zoom: 1.6 },
+        { frame: 359, lon: 4.6, lat: 51.0, zoom: 2.2, ease: 'inOut' },
+      ],
+      fills: [],
+      labels: [
+        { lines: ['BELGIUM'], lon: 4.6, lat: 50.6, size: 40, tracking: 0.7, heroFrame: 60, appear: [10, 40], fade: [200, 230] },
+        { lines: ['NORTH SEA'], lon: 2.5, lat: 53.0, size: 26, tracking: 0.6, heroFrame: 60, appear: [10, 40], fade: [200, 230] },
+        { lines: ['FRANCE'], lon: 2.2, lat: 48.6, size: 30, tracking: 0.65, heroFrame: 60, appear: [10, 40], fade: [200, 230] },
+        { lines: ['ANTWERP'], lon: 4.45, lat: 51.3, size: 26, tracking: 0.55, heroFrame: 320, appear: [240, 270] },
+        { lines: ['SCHELDT'], lon: 4.42, lat: 51.25, size: 15, tracking: 0.6, heroFrame: 320, appear: [240, 270] },
+      ],
+      arrows: [],
+      markers: [
+        { lon: 4.4025, lat: 51.2194, appear: [145, 170], color: 'red', radius: 16, label: 'Schupstraat', detail: 'Antwerp Diamond Center', heroFrame: 300 },
+      ],
+      grade: [],
+    },
+  };
+
+  const repaired = repairPlan({ plan, durationSeconds: 12 });
+  assert.deepEqual(repaired.errors, [], `expected clean repair, got: ${JSON.stringify(repaired.errors)}`);
+
+  const antwerp = repaired.plan.props.labels.find((label) => label.lines.join(' ') === 'ANTWERP');
+  const scheldt = repaired.plan.props.labels.find((label) => label.lines.join(' ') === 'SCHELDT');
+  if (scheldt) {
+    // If both survive, neither small label may have travelled beyond its
+    // 0.6° honesty budget.
+    for (const label of [antwerp, scheldt]) {
+      const original = label.lines.join(' ') === 'ANTWERP' ? { lon: 4.45, lat: 51.3 } : { lon: 4.42, lat: 51.25 };
+      const travel = Math.hypot(label.lon - original.lon, label.lat - original.lat);
+      assert.ok(travel <= 0.6 + 1e-6, `${label.lines.join(' ')} travelled ${travel.toFixed(2)}°`);
+    }
+  } else {
+    // Dropped pair member must be the smaller one; the survivor stays home.
+    assert.ok(antwerp, 'ANTWERP (the larger label) must survive');
+    assert.ok(
+      repaired.log.some((entry) => entry.op === 'label-drop' && entry.target === 'SCHELDT'),
+      `expected SCHELDT label-drop, got: ${JSON.stringify(repaired.log)}`
+    );
+    const travel = Math.hypot(antwerp.lon - 4.45, antwerp.lat - 51.3);
+    assert.ok(travel <= 0.6 + 1e-6, `ANTWERP travelled ${travel.toFixed(2)}°`);
+  }
+});

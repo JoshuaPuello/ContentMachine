@@ -62,6 +62,32 @@ export const buildCharacterSceneContext = (scenePlan, narration) => {
   });
 };
 
+const CHARACTER_STORY_FIELDS = [
+  'id',
+  'input_mode',
+  'title',
+  'summary',
+  'era',
+  'location',
+  'stakes',
+  'emotional_core',
+  'surprise_factor',
+];
+
+// Character extraction needs identity evidence, not the full research dossier.
+// Keeping the compact story spine plus the finalized scene/narration context
+// avoids sending duplicated sources and research notes to Sonnet.
+export const buildCharacterStoryContext = (story) => {
+  if (!story || typeof story !== 'object') return story;
+  const context = {};
+  for (const field of CHARACTER_STORY_FIELDS) {
+    const value = story[field];
+    if (value == null || value === '') continue;
+    context[field] = value;
+  }
+  return context;
+};
+
 export const buildCharacterReferencePrompt = (character = {}, supplementalDirection = '') => {
   const name = cleanText(character.name, 'Recurring documentary character');
   const role = cleanText(character.role, 'recurring documentary subject');

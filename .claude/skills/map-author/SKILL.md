@@ -90,6 +90,27 @@ them before rendering). `props` is the full scene. Frames are at 30fps.
 - Generated custom `polys` are disabled. Never invent a border or shape.
   Country fills use real ISO ids; local sites use exact markers and arrows.
 
+## The scale floor (read this before planning any close-up)
+
+This engine is a country/continental atlas. Maximum zoom is 3.4, where the
+view still spans ≈17° of longitude — so an honest `detail` focus subject must
+span roughly 5° or more (a small country). There is NO street level, NO city
+level, NO district level:
+
+- Districts, streets, stations, buildings, and city outlines can never be
+  drawn as geography. If the request names them, collapse everything below
+  city scale into ONE marker whose `detail` text carries the fine-grained
+  place ("Schupstraat · Diamond District" is plaque text, not geometry).
+- Never place two markers within 0.25° of each other — at every legal zoom
+  they are the same dot, and the validator rejects the pair. One place, one
+  marker; the finer of the two names goes in `detail`.
+- Never declare a `detail` focus whose true bounds are smaller than ≈5° of
+  longitude. If the story's subject is a single city, the closing phase is a
+  country-or-region `detail` focus (the highlighted nation and its
+  neighbours) with the city as its hero marker — not a fictional zoom the
+  plane cannot deliver. Do not widen `bounds` beyond the actual subject to
+  game occupancy; state the honest region you are showing.
+
 ## Camera grammar (this is what makes it cinematic)
 
 - Nominal visible longitude span ≈ `43° / zoom` at the anchor line, but the

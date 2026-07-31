@@ -163,6 +163,7 @@ function VideoGeneration() {
   const [selectedModal, setSelectedModal] = useState(null)
   const [showExportModal, setShowExportModal] = useState(false)
   const [currentPage, setCurrentPage] = useState(0)
+  const [reprocessingVideos, setReprocessingVideos] = useState(false)
   const initializedRef = useRef(false)
   const pollingActiveRef = useRef(false)   // true while the poll loop is running
   const pollingTimerRef = useRef(null)     // the current setTimeout handle
@@ -171,6 +172,7 @@ function VideoGeneration() {
     selectedStory,
     scenes,
     selectedImages,
+    sceneSheetWorkflow,
     videoPrompts,
     videoPromptsLoading,
     videoPromptsError,
@@ -209,12 +211,15 @@ function VideoGeneration() {
     retryMissingWindowsVideos,
     cancelWindowsVideoGeneration,
     attachWindowsVideo,
+    resetToImages,
+    selectAllExpandedSceneSheetPanels,
   } = usePipelineStore()
 
   const completedCount = Object.values(videoJobs).filter(j => j.status === 'completed').length
   const failedCount    = Object.values(videoJobs).filter(j =>
     ['failed', 'canceled', 'superseded'].includes(j.status)
   ).length
+  const supersededCount = Object.values(videoJobs).filter(j => j.status === 'superseded').length
   const totalCount     = videoPrompts.length || scenes.length
   const selectedCount  = Object.keys(selectedVideos).length
   const allSelected    = completedCount > 0 && selectedCount >= completedCount
@@ -529,6 +534,57 @@ function VideoGeneration() {
     }
   }
 
+  const handleReprocessFromCurrentImages = async () => {
+    if (reprocessingVideos) return
+    const sheetPanels = (sceneSheetWorkflow?.groups || [])
+      .flatMap(group => (group.panels || []).map(panel => ({ group, panel })))
+    const pendingExpandedPanels = sheetPanels.filter(({ panel }) => (
+      !(panel.expandedUrl || panel.expanded_url)
+    ))
+    if (settings.sceneSheetEnabled && pendingExpandedPanels.length > 0) {
+      toast.error(`${pendingExpandedPanels.length} scene-sheet frame${pendingExpandedPanels.length === 1 ? ' is' : 's are'} still pending. Finish them in Images before rebuilding videos.`)
+      navigate('/images')
+      return
+    }
+    const latestSheetFramesNotSelected = sheetPanels.filter(({ group, panel }) => {
+      const expandedUrl = panel.expandedUrl || panel.expanded_url
+      const selected = selectedImages[panel.unitId]
+      return expandedUrl && (
+        selected?.sceneSheetGroupId !== group.id
+        || selected?.url !== expandedUrl
+      )
+    })
+    const confirmed = confirm(
+      'Reprocess every video from the latest approved images?\n\n'
+      + (latestSheetFramesNotSelected.length > 0
+        ? `${latestSheetFramesNotSelected.length} newly expanded scene-sheet frame${latestSheetFramesNotSelected.length === 1 ? '' : 's'} will replace older image selections first.\n\n`
+        : '')
+      + 'This permanently removes the previous video prompts, generated videos, video history, selections, Editor timeline, thumbnails, and final renders. Story, audio, characters, scene sheets, generated images, and your current image selections are preserved.\n\n'
+      + 'Content Machine will then write fresh motion prompts and immediately generate a new video for every current shot.'
+    )
+    if (!confirmed) return
+
+    setReprocessingVideos(true)
+    stopPollLoop()
+    const toastId = toast.loading('Resetting previous videos safely…')
+    try {
+      if (latestSheetFramesNotSelected.length > 0) {
+        selectAllExpandedSceneSheetPanels()
+      }
+      await resetToImages()
+      toast.loading('Writing fresh motion prompts from the current images…', { id: toastId })
+      const prompts = await usePipelineStore.getState().fetchVideoPrompts()
+      if (!prompts?.length) throw new Error('No fresh video prompts were produced')
+      toast.loading(`Generating ${prompts.length} new videos…`, { id: toastId })
+      await usePipelineStore.getState().startVideoGeneration(prompts)
+      toast.success('Fresh video generation started from the current images', { id: toastId })
+    } catch (error) {
+      toast.error(error.response?.data?.error || error.message, { id: toastId })
+    } finally {
+      setReprocessingVideos(false)
+    }
+  }
+
   const pageVariants = {
     initial: { opacity: 0, y: 8 },
     animate: { opacity: 1, y: 0 },
@@ -635,6 +691,14 @@ function VideoGeneration() {
               <p className="text-xs text-text-secondary">{selectedStory?.title}</p>
             </div>
             <div className="flex items-center gap-3">
+              <button
+                onClick={handleReprocessFromCurrentImages}
+                disabled={reprocessingVideos}
+                title="Delete downstream video work, rebuild motion prompts from current selected images, and generate again"
+                className="py-1.5 px-3 text-xs rounded-lg border border-accent/35 text-accent hover:bg-accent/10 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+              >
+                {reprocessingVideos ? 'Reprocessing…' : 'Reprocess from current images'}
+              </button>
               <div className="flex items-center gap-1.5 text-sm">
                 <span className="text-success font-semibold">{completedCount}</span>
                 <span className="text-text-disabled">/</span>
@@ -701,9 +765,14 @@ function VideoGeneration() {
 
               {isWindowsWorker && remainingVideoCount > 0 && (
                 <button
-                  onClick={() => retryMissingWindowsVideos().catch(err =>
-                    toast.error(`Retry failed: ${err.message}`)
-                  )}
+                  onClick={async () => {
+                    try {
+                      const result = await retryMissingWindowsVideos()
+                      if (!result || result.noMissing) toast.success('Every required shot already has a completed video. Use Regenerate on an individual card to create a fresh version.')
+                    } catch (err) {
+                      toast.error(`Retry failed: ${err.message}`)
+                    }
+                  }}
                   className="py-1 px-3 text-xs rounded-lg border border-accent/30 text-accent hover:bg-accent/10 transition-colors"
                 >
                   Retry missing ({remainingVideoCount})
@@ -744,6 +813,19 @@ function VideoGeneration() {
       </div>
 
       <div className="max-w-6xl mx-auto p-8 space-y-8">
+        {supersededCount > 0 && (
+          <div className="rounded-xl border border-warning/30 bg-warning/[0.07] px-4 py-3 flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <p className="text-sm font-medium text-text-primary">Previous videos no longer match the current images</p>
+              <p className="text-xs text-text-secondary mt-1">{supersededCount} stale output{supersededCount === 1 ? '' : 's'} were removed from the current run. Reprocess to author fresh motion prompts and generate replacements.</p>
+            </div>
+            <button
+              onClick={handleReprocessFromCurrentImages}
+              disabled={reprocessingVideos}
+              className="btn-primary py-2 px-4 text-xs disabled:opacity-40"
+            >Reprocess all videos</button>
+          </div>
+        )}
         {isWindowsWorker && (
           <div className="rounded-xl border border-border bg-surface overflow-hidden">
             <div className="px-4 py-3 flex flex-wrap items-center gap-x-5 gap-y-2 border-b border-border">

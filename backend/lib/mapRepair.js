@@ -248,7 +248,11 @@ function repairOverlapRetime(plan, error) {
 }
 
 /** R6 — remaining collision: shift the smaller label away along the line
- * between centers, bounded to 2°; if that fails, one 12% size step-down. */
+ * between centers, bounded by the label's scale; if that fails, one 12% size
+ * step-down. Small labels (cities, rivers — size < 28) get a tight 0.6°
+ * budget: a city label exiled from its city reads as a geography error
+ * (observed failure: ANTWERP shifted 1.24° into the North Sea). Large
+ * region/sea labels float over big features and may travel up to 2°. */
 function repairOverlapShift(plan, error) {
   const match = /^labels overlap at frame (\d+): '(.+?)' and '(.+?)'$/.exec(error);
   if (!match) return null;
@@ -279,9 +283,11 @@ function repairOverlapShift(plan, error) {
   const lonPerPx = 0.1 / (stepLon.x - origin.x);
   const latPerPx = -0.1 / (stepLat.y - origin.y);
 
+  const maxShift = (Number(mover.size) || 0) >= 28 ? 2.0 : 0.6;
   for (let step = 0; step < 40; step += 1) {
     const ratio = overlapRatio(labelScreenBox(mover, camera), labelScreenBox(anchor, camera));
     if (ratio <= 0.1) break;
+    if (Math.hypot(mover.lon - startLon, mover.lat - startLat) >= maxShift) break;
     mover.lon += directionX * 12 * lonPerPx;
     mover.lat += directionY * 12 * latPerPx;
   }
@@ -289,7 +295,7 @@ function repairOverlapShift(plan, error) {
   const resolved =
     overlapRatio(labelScreenBox(mover, camera), labelScreenBox(anchor, camera)) <= 0.1;
   const heroBox = labelScreenBox(mover, cameraAt(plan.props.camera, mover.heroFrame));
-  if (resolved && shift <= 2.0 && labelSafetyMargin(heroBox) >= 0) {
+  if (resolved && shift <= maxShift && labelSafetyMargin(heroBox) >= 0) {
     mover.lon = Number(mover.lon.toFixed(3));
     mover.lat = Number(mover.lat.toFixed(3));
     return {
@@ -469,6 +475,28 @@ function repairOverlapStack(plan, error) {
   return null;
 }
 
+/** R6d — the geography-honest last resort for a stubborn label pair: drop
+ * the smaller label rather than exiling it from its feature or burning a
+ * whole model retry on a text collision. Never drops below the 3-label
+ * minimum. */
+function repairOverlapDrop(plan, error) {
+  const match = /^labels overlap at frame \d+: '(.+?)' and '(.+?)'$/.exec(error);
+  if (!match) return null;
+  const labels = plan.props.labels;
+  if (!Array.isArray(labels) || labels.length <= 3) return null;
+  const first = labelByText(plan, match[1]);
+  const second = labelByText(plan, match[2]);
+  if (!first || !second || first === second) return null;
+  const dropped = (Number(first.size) || 0) <= (Number(second.size) || 0) ? first : second;
+  const kept = dropped === first ? second : first;
+  plan.props.labels = labels.filter((label) => label !== dropped);
+  return {
+    op: 'label-drop',
+    target: dropped.lines.join(' '),
+    detail: `dropped to clear '${kept.lines.join(' ')}' without dislocating geography`,
+  };
+}
+
 /** R4m — marker dot off the safe frame: rescan its visible window for a safe
  * hero frame (also render-inert; the renderer auto-places the callout). */
 function repairMarkerHeroFrame(plan, error, durationInFrames) {
@@ -585,7 +613,37 @@ function repairUnexplainedEndpoints(plan) {
   };
 }
 
+/** R7 — two markers below the engine's resolvable scale are one story point
+ * authored twice (a city plus a street inside it). Keep the later hero — the
+ * narration's destination — inherit the earliest appear start, and carry the
+ * dropped place name in the survivor's detail text if it has none. */
+function repairMarkerMerge(plan, error) {
+  const match = /^markers '(.+?)' and '(.+?)' are [\d.]+° apart/.exec(error);
+  if (!match) return null;
+  const markers = plan.props.markers ?? [];
+  const first = markers.find((m) => (m.label || 'unnamed') === match[1]);
+  const second = markers.find((m) => (m.label || 'unnamed') === match[2]);
+  if (!first || !second || first === second) return null;
+  const kept = (Number(second.heroFrame) || 0) >= (Number(first.heroFrame) || 0) ? second : first;
+  const dropped = kept === second ? first : second;
+  if (Array.isArray(kept.appear) && Array.isArray(dropped.appear) && dropped.appear[0] < kept.appear[0]) {
+    const rampLength = kept.appear[1] - kept.appear[0];
+    kept.appear = [dropped.appear[0], dropped.appear[0] + rampLength];
+  }
+  if (!kept.detail && dropped.label && dropped.label !== kept.label) {
+    kept.detail = String(dropped.label).slice(0, 38);
+  }
+  kept.radius = Math.max(Number(kept.radius) || 16, Number(dropped.radius) || 16);
+  plan.props.markers = markers.filter((m) => m !== dropped);
+  return {
+    op: 'marker-merge',
+    target: `${dropped.label || 'unnamed'} → ${kept.label || 'unnamed'}`,
+    detail: `sub-resolution pair merged; '${kept.label || 'unnamed'}' keeps the story point`,
+  };
+}
+
 const OPERATOR_CHAIN = [
+  { name: 'marker-merge', matches: /below the engine's resolvable scale/, apply: repairMarkerMerge },
   { name: 'spray-to-dots', matches: /^too many routes/, apply: repairSprayToDots },
   { name: 'endpoint-dots', matches: /^route \d+ ends unexplained/, apply: repairUnexplainedEndpoints },
   { name: 'coverage-zoom', matches: /exposes the finite map plane/, apply: repairCoverage },
@@ -594,6 +652,7 @@ const OPERATOR_CHAIN = [
   { name: 'label-retime', matches: /^labels overlap at frame /, apply: repairOverlapRetime },
   { name: 'label-stack', matches: /^labels overlap at frame /, apply: repairOverlapStack },
   { name: 'label-shift', matches: /^labels overlap at frame /, apply: repairOverlapShift },
+  { name: 'label-drop', matches: /^labels overlap at frame /, apply: repairOverlapDrop },
   { name: 'label-nudge', matches: /^label '.+?' is clipped at heroFrame /, apply: repairLabelClip },
   { name: 'label-heroframe', matches: /^label '.+?' is (?:clipped|only \d+px) at heroFrame /, apply: repairLabelHeroFrame },
   { name: 'marker-heroframe', matches: /^marker '.+?' .*at heroFrame /, apply: repairMarkerHeroFrame },

@@ -66,7 +66,10 @@ export function normalizeMasterTimeline(timeline) {
   const filmEnd = filmEndFrame(out);
   const fullFrame = out.overlays
     .filter((o) =>
-      FULL_FRAME_KINDS.has(o.kind)
+      // Split/corner maps keep the footage on screen — no exposed-window
+      // flash to close, so only full/inset maps count as takeovers here.
+      (FULL_FRAME_KINDS.has(o.kind)
+        && !(o.kind === 'map' && (o.presentation === 'split' || o.presentation === 'corner')))
       || (o.kind === 'motion-graphic' && o.spec?.presentation === 'takeover')
     )
     .sort((a, b) => a.startFrame - b.startFrame);

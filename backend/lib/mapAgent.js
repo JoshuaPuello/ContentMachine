@@ -53,10 +53,6 @@ const MAP_IDEATION_TIMEOUT_MS = Math.max(
   60_000,
   Number(process.env.MAP_IDEATION_TIMEOUT_MS) || 3 * 60_000,
 );
-const MAP_REVIEW_TIMEOUT_MS = Math.max(
-  60_000,
-  Number(process.env.MAP_REVIEW_TIMEOUT_MS) || 3 * 60_000,
-);
 const IDEATION_PROMPT_VERSION = 3;
 
 const safePathSegment = (value, fallback) => {
@@ -130,6 +126,12 @@ function createRunRecorder({ mapsDir, mapId, runId, request, durationSeconds, st
   return { trace, touch, event, finish, path: tracePath };
 }
 
+/** Server-side hiccups worth waiting out; anything else fails immediately. */
+const TRANSIENT_API_ERROR =
+  /overloaded|rate.?limit|too many requests|API Error: 5\d\d|status 5\d\d|\b(?:529|503|502|504)\b|ECONNRESET|ETIMEDOUT|socket hang up/i;
+const TRANSIENT_API_TRIES = 3;
+const TRANSIENT_API_BACKOFF_MS = [20_000, 45_000];
+
 async function runTracedClaude({
   collection,
   label,
@@ -157,22 +159,42 @@ async function runTracedClaude({
   if (Array.isArray(collection)) collection.push(entry);
   recorder.touch(true);
   try {
-    const raw = await callClaudeCli(model, systemPrompt, userPrompt, {
-      timeoutMs,
-      stream: true,
-      tools,
-      addDirs,
-      effort,
-      safeMode: true,
-      noSessionPersistence: true,
-      onText: (_delta, full) => {
-        entry.response = full;
-        recorder.touch();
-      },
-    });
-    entry.response = raw;
-    entry.status = 'completed';
-    return raw;
+    let lastError = null;
+    for (let apiTry = 1; apiTry <= TRANSIENT_API_TRIES; apiTry += 1) {
+      try {
+        const raw = await callClaudeCli(model, systemPrompt, userPrompt, {
+          timeoutMs,
+          stream: true,
+          tools,
+          addDirs,
+          effort,
+          safeMode: true,
+          noSessionPersistence: true,
+          onText: (_delta, full) => {
+            entry.response = full;
+            recorder.touch();
+          },
+        });
+        entry.response = raw;
+        entry.status = 'completed';
+        return raw;
+      } catch (error) {
+        lastError = error;
+        const message = String(error?.message || error);
+        // A 529/5xx/rate-limit is the provider having a moment, not a flaw in
+        // the prompt or the plan. Observed failure: two whole map runs (with
+        // valid ideation) thrown away over a single transient 529.
+        if (apiTry === TRANSIENT_API_TRIES || !TRANSIENT_API_ERROR.test(message)) throw error;
+        const backoffMs = TRANSIENT_API_BACKOFF_MS[apiTry - 1] ?? 60_000;
+        entry.response = '';
+        recorder.event(
+          `Transient API error on '${label}' (${compactText(message, 140)}); retrying in ${Math.round(backoffMs / 1000)}s (${apiTry}/${TRANSIENT_API_TRIES - 1} retries used).`,
+          'warning'
+        );
+        await new Promise((resolve) => setTimeout(resolve, backoffMs));
+      }
+    }
+    throw lastError;
   } catch (error) {
     entry.status = /timed out/i.test(String(error?.message || error)) ? 'timed-out' : 'failed';
     entry.error = String(error?.message || error);
@@ -184,9 +206,7 @@ async function runTracedClaude({
 }
 
 const IDEATION_SYSTEM_PROMPT = `You are the senior documentary cartographic director.
-Design a concise, executable narrative strategy for one map segment. THE NARRATION IS THE DRIVER: the request's narration_excerpt is the only story this map may tell — the map plays under that voiceover, and every route, marker, and beat must restate something the narration actually says. If the narration names one journey, draw one route; if it names a place, mark the place; never invent movements, destinations, or context the listener will not hear. Geography labels (countries, seas, cities) are always allowed for orientation. Use ONLY facts and locations explicitly supplied by the request; do not research, enrich, or enumerate implied stops. Simplicity is the style: aim for 1–4 routes and 1–3 markers; represent mass dispersal as a field of pulsing dots, never an arrow per participant. If reserved_overlay_texts is present, those texts already appear as screen overlays — the map must not repeat them. The downstream engine allows 2–4 phases, at most two major camera moves, a continuously drifting camera, and red/teal/neutral routes—never white. For a 10–18 second map, use 2–3 phases. Prefer close readable views and group distant outcomes symbolically instead of listing every route. Return JSON only with: summary, narrative_phases (each with purpose, locations, movement, labels, and a narration_ref quoting the exact narration words it illustrates), critical_facts, and execution_notes. Do not produce Remotion props. Maximum 600 words. This is a compact blueprint, not an essay; engine constraints always outrank creative ambition.`;
-
-const REVIEW_SYSTEM_PROMPT = `You are a ruthless senior documentary-map quality reviewer. Use the Read tool to inspect every supplied proof PNG. Judge geographic truth, full-frame coverage, subject scale, arrow continuity, label readability, collisions, and professional finish. Return JSON only: {"pass":boolean,"summary":string,"issues":[string],"recommended":boolean}. A merely usable result does not pass; it must be publication quality.`;
+Design a concise, executable narrative strategy for one map segment. THE NARRATION IS THE DRIVER: the request's narration_excerpt is the only story this map may tell — the map plays under that voiceover, and every route, marker, and beat must restate something the narration actually says. If the narration names one journey, draw one route; if it names a place, mark the place; never invent movements, destinations, or context the listener will not hear. Geography labels (countries, seas, cities) are always allowed for orientation. Use ONLY facts and locations explicitly supplied by the request; do not research, enrich, or enumerate implied stops. Simplicity is the style: aim for 1–4 routes and 1–3 markers; represent mass dispersal as a field of pulsing dots, never an arrow per participant. If reserved_overlay_texts is present, those texts already appear as screen overlays — the map must not repeat them. The downstream engine allows 2–4 phases, at most two major camera moves, a continuously drifting camera, and red/teal/neutral routes—never white. For a 10–18 second map, use 2–3 phases. Prefer close readable views and group distant outcomes symbolically instead of listing every route. SCALE FLOOR: this is a country/continental atlas — at maximum zoom a detail subject must still span roughly 5 degrees of longitude, so districts, streets, stations, buildings, and city outlines can never be drawn as geography. Collapse everything below city scale into ONE marker whose detail text names the street or building; never plan two markers inside the same city, and never plan district outlines or sub-city polygons. A narration that only names a place needs at most: region settles, one marker resolves. Return JSON only with: summary, narrative_phases (each with purpose, locations, movement, labels, and a narration_ref quoting the exact narration words it illustrates), critical_facts, and execution_notes. Do not produce Remotion props. Maximum 600 words. This is a compact blueprint, not an essay; engine constraints always outrank creative ambition.`;
 
 const compactText = (value, max = 500) => String(value ?? '').replace(/\s+/g, ' ').trim().slice(0, max);
 
@@ -609,6 +629,22 @@ export function validateAndFix(plan, durationSeconds, options = {}) {
     }
   }
 
+  // Two markers closer than the engine can resolve (max zoom 3.4 puts 0.25°
+  // at ~38 screen px) are one story point authored twice — typically a city
+  // plus a street inside it. The finer place belongs in detail text.
+  for (let i = 0; i < p.markers.length; i += 1) {
+    for (let j = i + 1; j < p.markers.length; j += 1) {
+      const a = p.markers[i];
+      const b = p.markers[j];
+      const separation = Math.hypot(a.lon - b.lon, a.lat - b.lat);
+      if (Number.isFinite(separation) && separation < 0.25) {
+        errors.push(
+          `markers '${a.label || 'unnamed'}' and '${b.label || 'unnamed'}' are ${separation.toFixed(2)}° apart — below the engine's resolvable scale; merge them into one marker and carry the finer place in its detail text`
+        );
+      }
+    }
+  }
+
   // Every route must END at something the viewer can read: a marker plaque,
   // a pulsing dot, a nearby map label, or a continuation leg. An arrow into
   // unlabeled emptiness leaves the audience blind about what it just watched.
@@ -993,6 +1029,11 @@ export async function generateMapSegment({
   mapId = 'map',
   onLog = () => {},
   onTrace = () => {},
+  // Interactive gate: called after each attempt renders a playable option.
+  // Resolves 'accept' (finish with this option), 'continue' (next attempt),
+  // or 'stop' (end the run now; retained options go to needs-selection).
+  // When absent, the legacy autonomous flow runs (clean attempt auto-accepts).
+  onAttemptDecision = null,
 }) {
   const allowedModels = new Set(['opus', 'sonnet']);
   const selectedModels = {
@@ -1002,7 +1043,10 @@ export async function generateMapSegment({
   };
   const variant = { chronicle: 'archival', heritage: 'atlas', nocturne: 'obsidian' }[style] || 'archival';
   const systemPrompt = await buildSystemPrompt();
-  const dur = Math.max(8, Math.min(35, Number(durationSeconds) || 18));
+  // Floor must match sanitizePlan's 6s minimum: the Director may legitimately
+  // send a short narration-matched map, and inflating it here would desync
+  // the rendered video from its timeline slot.
+  const dur = Math.max(6, Math.min(35, Number(durationSeconds) || 18));
   const sessionKey = safePathSegment(sessionId, 'session');
   const mapKey = safePathSegment(mapId, 'map');
   const runId = Date.now().toString(36);
@@ -1047,6 +1091,25 @@ export async function generateMapSegment({
     : [];
 
   try {
+    // Preflight the baker before any model call: a missing Natural Earth
+    // raster fails in seconds here, instead of after twenty minutes and a
+    // fully validated plan (observed failure mode). First run may download
+    // the public-domain inputs, so give it room.
+    onLog('preflighting map baker assets...');
+    try {
+      await execFileAsync(
+        'node',
+        ['tools/epic-map/bake-highlight.mjs', '--preflight'],
+        { cwd: STORYFORGE_PATH, maxBuffer: 8 * 1024 * 1024, timeout: 10 * 60 * 1000 }
+      );
+    } catch (error) {
+      throw new Error(
+        `map baker preflight failed — Natural Earth inputs are missing and could not be downloaded. ` +
+        `Run 'node tools/epic-map/bake-highlight.mjs --preflight' in ${STORYFORGE_PATH} to see why. ` +
+        `Underlying error: ${String(error?.stderr || error?.message || error).slice(0, 600)}`
+      );
+    }
+
     if (cachedIdeation) {
       direction = cachedIdeation.direction;
       recorder.trace.phases.ideation.push({
@@ -1081,6 +1144,27 @@ export async function generateMapSegment({
       }
     }
 
+    const decideOnOption = async (option) => {
+      if (!onAttemptDecision) return null;
+      const canContinue = attempts < 3;
+      onLog(`attempt ${attempts} rendered — waiting for your decision in the editor`);
+      recorder.event(
+        `Attempt ${attempts} rendered — waiting for editor decision (${canContinue ? 'use it or try another attempt' : 'use it or stop'}).`
+      );
+      recorder.touch(true);
+      let decision = null;
+      try {
+        decision = await onAttemptDecision({ option, attempt: attempts, canContinue });
+      } catch {
+        decision = 'stop';
+      }
+      if (!['accept', 'continue', 'stop'].includes(decision)) decision = 'stop';
+      recorder.event(`Editor decision for attempt ${attempts}: ${decision}.`);
+      recorder.touch(true);
+      return decision;
+    };
+
+    let stopRequested = false;
     while (attempts < 3) {
       attempts += 1;
       // Retries are the hardest calls (all constraints plus every fix at
@@ -1164,6 +1248,52 @@ export async function generateMapSegment({
             previousBest = { attemptNumber: attempts, plan: repair.plan, errors: repair.errors };
           }
           onLog(`validation errors after ${repair.log.length} repair(s): ${repair.errors.join('; ')}`);
+          // The editor may still prefer this attempt over whatever a retry
+          // produces: render it best-effort as a playable, selectable option.
+          // A render failure here only costs the option, never the run.
+          try {
+            await ensureMapPublicDir();
+            await runBakes(repair.plan.bakes ?? [], variant, onLog);
+            const rejectedPropsPath = path.join(mapsDir, `${runMapKey}.attempt-${attempts}.props.json`);
+            await fs.writeFile(rejectedPropsPath, JSON.stringify(repair.plan.props, null, 2));
+            const candidate = await renderMapOption({
+              plan: repair.plan,
+              propsPath: rejectedPropsPath,
+              mapsDir,
+              mapId: runMapKey,
+              attempt: attempts,
+              sessionId: sessionKey,
+              log: onLog,
+            });
+            const option = {
+              ...candidate,
+              status: 'validation-rejected',
+              createdAt: nowIso(),
+              models: selectedModels,
+              review: { validationErrors: repair.errors },
+            };
+            recorder.trace.options.push(option);
+            execution.optionId = option.id;
+            execution.artifacts = { video: option.url, poster: option.posterUrl, props: option.propsUrl };
+            recorder.touch(true);
+            onLog(`option ${attempts} rendered despite ${repair.errors.length} open validation issue(s) — kept as a selectable alternative`);
+            const decision = await decideOnOption(option);
+            if (decision === 'accept') {
+              acceptedPlan = repair.plan;
+              acceptedOption = option;
+              recorder.trace.recommendedOptionId = option.id;
+              break;
+            }
+            if (decision === 'stop') {
+              stopRequested = true;
+              break;
+            }
+          } catch (renderError) {
+            recorder.event(
+              `Best-effort render of attempt ${attempts} failed: ${String(renderError?.message || renderError).slice(0, 300)}`,
+              'warning'
+            );
+          }
           continue;
         }
         onLog(`deterministic repair resolved ${errors.length} validation error(s) with ${repair.log.length} operation(s)`);
@@ -1215,43 +1345,18 @@ export async function generateMapSegment({
         log: onLog,
       });
 
-      let aiReview = null;
-      let aiReviewError = null;
-      onLog(`quality review (model: ${selectedModels.reviewer})`);
-      const reviewPrompt =
-        `Inspect these proof frames:\n${proof.paths.join('\n')}\n\n` +
-        `Map request:\n${JSON.stringify(mapRequest, null, 2)}\n\n` +
-        `Mechanical review:\n${JSON.stringify(proof.review, null, 2)}\n\n` +
-        `Executable plan:\n${JSON.stringify(fixed, null, 2)}`;
-      try {
-        const reviewRaw = await runTracedClaude({
-          collection: recorder.trace.phases.review,
-          label: `Visual quality review · option ${attempts}`,
-          model: selectedModels.reviewer,
-          systemPrompt: REVIEW_SYSTEM_PROMPT,
-          userPrompt: reviewPrompt,
-          timeoutMs: MAP_REVIEW_TIMEOUT_MS,
-          recorder,
-          tools: 'Read',
-          addDirs: [mapsDir],
-        });
-        aiReview = safeParseJSON(extractJsonBlock(reviewRaw));
-        if (!aiReview) aiReviewError = 'Reviewer response was not parseable JSON';
-      } catch (error) {
-        aiReviewError = error.message;
-      }
-
-      const reviewPass = proof.review.pass && (!aiReview || aiReview.pass !== false);
+      // No model-based visual review: it re-judged options against the raw
+      // request (including asks the scale floor forbids), rejected maps the
+      // editor actually wanted, and cost an Opus call per attempt. The
+      // mechanical proof review (projection + rendered-frame checks) is the
+      // only gate; the editor is the human reviewer of retained options.
+      const reviewPass = proof.review.pass;
       const option = {
         ...candidate,
-        status: reviewPass ? 'recommended' : 'review-rejected',
+        status: reviewPass ? 'recommended' : 'mechanical-rejected',
         createdAt: nowIso(),
         models: selectedModels,
-        review: {
-          mechanical: proof.review,
-          claude: aiReview,
-          claudeError: aiReviewError,
-        },
+        review: { mechanical: proof.review },
       };
       recorder.trace.options.push(option);
       execution.optionId = option.id;
@@ -1264,22 +1369,44 @@ export async function generateMapSegment({
       recorder.touch(true);
 
       if (!reviewPass) {
-        const issues = [
-          ...proof.review.errors,
-          ...(Array.isArray(aiReview?.issues) ? aiReview.issues : []),
-        ];
-        const reviewErrors = issues.length ? issues : ['visual reviewer rejected this option'];
+        const reviewErrors = proof.review.errors.length
+          ? proof.review.errors
+          : ['mechanical proof review rejected this option'];
         violationHistory.push({ attempt: attempts, errors: reviewErrors });
         // A rendered, reviewed plan is the strongest possible anchor for the
         // next attempt regardless of its issue count.
         previousBest = { attemptNumber: attempts, plan: fixed, errors: reviewErrors };
-        onLog(`option ${attempts} retained, but review requested another attempt: ${reviewErrors.join('\n')}`);
+        onLog(`option ${attempts} retained, but mechanical review requested another attempt: ${reviewErrors.join('\n')}`);
+        const decision = await decideOnOption(option);
+        if (decision === 'accept') {
+          acceptedPlan = fixed;
+          acceptedOption = option;
+          recorder.trace.recommendedOptionId = option.id;
+          break;
+        }
+        if (decision === 'stop') {
+          stopRequested = true;
+          break;
+        }
         continue;
+      }
+      onLog(`option ${attempts} passed mechanical review`);
+      const decision = await decideOnOption(option);
+      if (decision === 'continue') {
+        // The editor declined a mechanically clean take: anchor the retry on
+        // it and ask for a meaningfully different composition.
+        const declineNote = `the editor declined attempt ${attempts}; produce a meaningfully different composition (different camera path, label rhythm, or phase structure) while keeping the same narration contract`;
+        violationHistory.push({ attempt: attempts, errors: [declineNote] });
+        previousBest = { attemptNumber: attempts, plan: fixed, errors: [declineNote] };
+        continue;
+      }
+      if (decision === 'stop') {
+        stopRequested = true;
+        break;
       }
       acceptedPlan = fixed;
       acceptedOption = option;
       recorder.trace.recommendedOptionId = option.id;
-      onLog(`option ${attempts} passed mechanical and visual review`);
       break;
     }
 
@@ -1301,10 +1428,18 @@ export async function generateMapSegment({
         dots: acceptedPlan.props.dots?.length ?? 0,
         labels: acceptedPlan.props.labels?.length ?? 0,
       };
-      const suggestedPresentation =
-        complexity.arrows <= 2 && complexity.markers <= 2 && complexity.dots === 0
-          ? 'inset'
-          : 'full';
+      // The Director's hint wins when present. Otherwise: a simple locator
+      // (no movement, one point) earns only a corner card; a heavy campaign
+      // (3+ routes) earns the full frame; everything else splits with the
+      // footage. Full-frame is the deliberate exception, never the default.
+      const hint = request?.presentation_hint;
+      const suggestedPresentation = ['split', 'corner', 'full', 'inset'].includes(hint)
+        ? hint
+        : complexity.arrows >= 3
+          ? 'full'
+          : complexity.arrows === 0 && complexity.markers <= 1 && complexity.dots === 0
+            ? 'corner'
+            : 'split';
       return {
         ...canonical,
         plan: acceptedPlan,
@@ -1318,7 +1453,9 @@ export async function generateMapSegment({
     }
 
     if (recorder.trace.options.length > 0) {
-      const message = `No option passed review after ${attempts} attempts. Review the retained playable options or retry.`;
+      const message = stopRequested
+        ? `Run stopped after ${attempts} attempt(s) — every rendered attempt is kept as a playable option; pick one in the inspector or retry.`
+        : `No attempt was accepted after ${attempts} tries — every rendered attempt is kept as a playable option; pick one in the inspector or retry.`;
       await recorder.finish('needs-selection', message);
       finished = true;
       return {

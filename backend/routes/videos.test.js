@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import {
   applySubmissionLedgerEntry,
   buildFalInput,
+  buildRegenerationSubmittedScene,
   buildReplicateInput,
   requireHttpsImageUrl,
   selectedImageReferenceFromProject,
@@ -97,6 +98,59 @@ test('does not treat narration or prior-frame context as a new motion instructio
     ...validScene,
     video_prompt: contextualPrompt,
   }), [])
+})
+
+test('requires a protected clean tail when provider output exceeds the editorial window', () => {
+  const shortEditScene = {
+    ...validScene,
+    duration_seconds: 8,
+    target_duration: 4,
+  }
+  const issues = validateVideoSubmission(shortEditScene).join(' ')
+  assert.match(issues, /missing protected EDITORIAL TIMING/i)
+  assert.match(issues, /missing a CLEAN HOLD/i)
+  assert.match(issues, /forbid new story action/i)
+
+  const protectedShortPrompt = protectedPrompt
+    .replace(
+      'STORYBOARD / SHOT LIST — 00:00–00:02:',
+      `EDITORIAL TIMING:
+The provider generates 8 seconds; complete the action by 4 seconds, then allow no new story action.
+
+STORYBOARD / SHOT LIST — 00:00–00:08:`
+    )
+    .replace(
+      'SHOT 1 — 00:00–00:02',
+      `SHOT 1 — 00:00–00:04 [ACTION WINDOW]
+The subject completes the wrench turn.
+
+SHOT 2 — 00:04–00:08 [CLEAN HOLD]`
+    )
+  assert.deepEqual(validateVideoSubmission({
+    ...shortEditScene,
+    video_prompt: protectedShortPrompt,
+  }), [])
+})
+
+test('regeneration preserves editorial timing metadata for validation and provider submission', () => {
+  const submitted = buildRegenerationSubmittedScene({
+    ...validScene,
+    duration_seconds: 8,
+    target_duration: 4,
+    action_duration_seconds: 3.5,
+    editorial_duration_seconds: 3,
+    clip_duration: 8,
+    playback_rate: 1,
+  })
+  assert.equal(submitted.target_duration, 4)
+  assert.equal(submitted.action_duration_seconds, 3.5)
+  assert.equal(submitted.editorial_duration_seconds, 3)
+  assert.equal(submitted.clip_duration, 8)
+  assert.equal(submitted.playback_rate, 1)
+  assert.match(
+    validateVideoSubmission(submitted).join(' '),
+    /missing protected EDITORIAL TIMING/i
+  )
 })
 
 test('restores a durable selected image reference from the project session', () => {

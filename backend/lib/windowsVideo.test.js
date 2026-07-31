@@ -10,11 +10,13 @@ import {
   missingWindowsUnits,
   queueWindowsUnits,
   readWindowsState,
+  regenerateWindowsUnit,
   recoverBrokerProjectTasks,
   reconcileWindowsProject,
   resumeWindowsProject,
   snapshotWindowsInput,
   WINDOWS_SETTINGS,
+  windowsStatus,
 } from './windowsVideo.js'
 import { readSessionSnapshot, sessionDirectory, writeSessionSnapshot } from './sessionStore.js'
 
@@ -32,6 +34,24 @@ test('Windows prompt does not duplicate an already embedded negative block', () 
   const negative = 'extra figures, human skin, unstable edges'
   const full = `One continuous documentary shot.\n\nAvoid: ${negative}.`
   assert.equal(buildWindowsPrompt({ full_prompt_string: full, negative_prompt: negative }), full)
+})
+
+test('explicit regeneration revision produces a fresh broker fingerprint prompt', () => {
+  const original = buildWindowsPrompt({ full_prompt_string: 'Locked action.' })
+  const regenerated = buildWindowsPrompt({
+    full_prompt_string: 'Locked action.',
+    generation_revision: 2,
+  })
+  assert.equal(original, 'Locked action.')
+  assert.equal(regenerated, 'Locked action.\n\nTAKE REVISION: 2.')
+})
+
+test('regeneration revision preserves near-limit quality prompts', () => {
+  const regenerated = buildWindowsPrompt({
+    full_prompt_string: 'x'.repeat(4975),
+    generation_revision: 12,
+  })
+  assert.equal(regenerated.length, 4995)
 })
 
 test('Windows snapshot uses the exact selected bytes, fixed adapter contract, and stable unit mapping', async () => {
@@ -119,7 +139,7 @@ test('Windows snapshot rejects oversized remote images before buffering the resp
   assert.equal(canceled, true)
 })
 
-const startFakeBroker = async ({ appliedFailures = 0, inputDelayMs = 0 } = {}) => {
+const startFakeBroker = async ({ appliedFailures = 0, inputDelayMs = 0, projectDeleted = false } = {}) => {
   const seen = {
     headers: [],
     uploads: 0,
@@ -130,6 +150,8 @@ const startFakeBroker = async ({ appliedFailures = 0, inputDelayMs = 0 } = {}) =
     maxActiveInputSessions: 0,
     applied: 0,
     appliedFailures,
+    projectDeleted,
+    reactivations: 0,
   }
   const server = http.createServer(async (request, response) => {
     const pathname = new URL(request.url, 'http://127.0.0.1').pathname
@@ -148,6 +170,11 @@ const startFakeBroker = async ({ appliedFailures = 0, inputDelayMs = 0 } = {}) =
       response.writeHead(200); response.end(); return
     }
     if (pathname === '/api/media-producers/v1/inputs/session') {
+      if (seen.projectDeleted) {
+        response.writeHead(409, { 'content-type': 'application/json' })
+        response.end(JSON.stringify({ requestId: randomUUID(), data: null, error: { code: 'TASK_CANCELED', message: 'Producer project was deleted', retryable: false } }))
+        return
+      }
       seen.activeInputSessions += 1
       seen.maxActiveInputSessions = Math.max(
         seen.maxActiveInputSessions,
@@ -158,6 +185,12 @@ const startFakeBroker = async ({ appliedFailures = 0, inputDelayMs = 0 } = {}) =
       }
       seen.activeInputSessions -= 1
       send({ method: 'PUT', objectKey: `media-jobs/v1/producer-inputs/content-machine/${body.projectId}/${body.itemId}/${body.sha256}.png`, uploadUrl: `http://127.0.0.1:${server.address().port}/upload`, requiredHeaders: { 'Content-Type': body.contentType, 'Content-Length': String(body.sizeBytes), 'x-amz-meta-sha256': body.sha256 }, expiresAt: new Date(Date.now() + 60_000).toISOString(), alreadyExists: false }); return
+    }
+    const projectReactivateMatch = pathname.match(/^\/api\/media-producers\/v1\/projects\/([^/]+)\/reactivate$/)
+    if (projectReactivateMatch && request.method === 'POST') {
+      seen.projectDeleted = false
+      seen.reactivations += 1
+      send({ accepted: true, projectId: decodeURIComponent(projectReactivateMatch[1]), reactivated: true }); return
     }
     if (pathname === '/api/media-producers/v1/tasks' && request.method === 'POST') {
       const id = randomUUID()
@@ -241,6 +274,63 @@ test('fake broker E2E survives browser closure and completion updates evidence w
   assert.equal(staleBrowser.video_jobs['1_0'].status, 'completed')
 })
 
+test('queueing recovers a still-live project from an obsolete broker deletion tombstone', async (t) => {
+  const sessionId = `session_worker_reactivate_${randomUUID().replaceAll('-', '')}`
+  const broker = await startFakeBroker({ projectDeleted: true })
+  t.after(async () => {
+    await new Promise((resolve) => broker.server.close(resolve))
+    await fs.rm(sessionDirectory(sessionId), { recursive: true, force: true })
+  })
+  process.env.MEDIA_BROKER_URL = broker.url
+  process.env.MEDIA_BROKER_PRODUCER_ID = 'content-machine'
+  process.env.MEDIA_BROKER_PRODUCER_TOKEN = 'test-producer-secret'
+  process.env.MEDIA_BROKER_PROTOCOL_VERSION = '1'
+  await writeSessionSnapshot(sessionId, {
+    selected_images: { '1_0': { url: `data:image/png;base64,${onePixelPng}` } },
+    video_prompts: [{ scene_number: 1, segment_index: 0, full_prompt_string: 'A deliberate camera move.' }],
+    video_jobs: {},
+    selected_videos: {},
+  })
+
+  const queued = await queueWindowsUnits(sessionId, ['1_0'])
+
+  assert.equal(queued[0].error, undefined)
+  assert.equal(broker.seen.reactivations, 1)
+  assert.equal(broker.seen.uploads, 1)
+})
+
+test('individual regeneration replaces a completed job with a genuinely fresh queued task', async (t) => {
+  const sessionId = `session_worker_regenerate_${randomUUID().replaceAll('-', '')}`
+  const broker = await startFakeBroker()
+  t.after(async () => {
+    await new Promise((resolve) => broker.server.close(resolve))
+    await fs.rm(sessionDirectory(sessionId), { recursive: true, force: true })
+  })
+  process.env.MEDIA_BROKER_URL = broker.url
+  process.env.MEDIA_BROKER_PRODUCER_ID = 'content-machine'
+  process.env.MEDIA_BROKER_PRODUCER_TOKEN = 'test-producer-secret'
+  process.env.MEDIA_BROKER_PROTOCOL_VERSION = '1'
+  await writeSessionSnapshot(sessionId, {
+    selected_images: { '1_0': { url: `data:image/png;base64,${onePixelPng}` } },
+    video_prompts: [{ scene_number: 1, segment_index: 0, full_prompt_string: 'Locked action.' }],
+    video_jobs: {},
+    video_history: {},
+    selected_videos: {},
+  })
+  await queueWindowsUnits(sessionId, ['1_0'])
+  await reconcileWindowsProject(sessionId)
+
+  const regenerated = await regenerateWindowsUnit(sessionId, '1_0')
+  const project = await readSessionSnapshot(sessionId)
+
+  assert.equal(regenerated.error, undefined)
+  assert.equal(project.video_jobs['1_0'].status, 'queued')
+  assert.equal(project.video_prompts[0].generation_revision, 1)
+  assert.equal(project.video_history['1_0'].length, 1)
+  assert.equal(broker.seen.taskRequests.length, 2)
+  assert.match(broker.seen.taskRequests[1].prompt, /TAKE REVISION: 1/)
+})
+
 test('late broker completion is superseded when the current prompt changed', async (t) => {
   const sessionId = `session_worker_stale_${randomUUID().replaceAll('-', '')}`
   const broker = await startFakeBroker()
@@ -263,6 +353,40 @@ test('late broker completion is superseded when the current prompt changed', asy
   await reconcileWindowsProject(sessionId)
   const final = await readSessionSnapshot(sessionId)
   assert.equal(final.video_jobs['2_0'].status, 'superseded')
+  assert.equal(final.selected_videos['2_0'], undefined)
+})
+
+test('a completed selected video is cleared when its selected source image changes', async (t) => {
+  const sessionId = `session_worker_completed_stale_${randomUUID().replaceAll('-', '')}`
+  const broker = await startFakeBroker()
+  t.after(async () => {
+    await new Promise((resolve) => broker.server.close(resolve))
+    await fs.rm(sessionDirectory(sessionId), { recursive: true, force: true })
+  })
+  process.env.MEDIA_BROKER_URL = broker.url
+  process.env.MEDIA_BROKER_PRODUCER_TOKEN = 'test-producer-secret'
+  await writeSessionSnapshot(sessionId, {
+    selected_images: { '2_0': { url: `data:image/png;base64,${onePixelPng}` } },
+    video_prompts: [{ scene_number: 2, segment_index: 0, full_prompt_string: 'Original prompt.' }],
+    video_jobs: {},
+    selected_videos: {},
+  })
+  await queueWindowsUnits(sessionId, ['2_0'])
+  await reconcileWindowsProject(sessionId)
+
+  const changed = await readSessionSnapshot(sessionId)
+  changed.selected_videos['2_0'] = { url: changed.video_jobs['2_0'].url }
+  const changedBytes = Buffer.concat([
+    Buffer.from(onePixelPng, 'base64'),
+    Buffer.from([0]),
+  ]).toString('base64')
+  changed.selected_images['2_0'] = { url: `data:image/png;base64,${changedBytes}` }
+  await writeSessionSnapshot(sessionId, changed)
+
+  await windowsStatus(sessionId)
+  const final = await readSessionSnapshot(sessionId)
+  assert.equal(final.video_jobs['2_0'].status, 'superseded')
+  assert.equal(final.video_jobs['2_0'].url, undefined)
   assert.equal(final.selected_videos['2_0'], undefined)
 })
 

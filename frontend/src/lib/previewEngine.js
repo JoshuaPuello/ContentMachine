@@ -8,6 +8,7 @@
 // never by seeking a playing element.
 //
 // The pure planning/math helpers are exported for unit tests.
+import { transitionForClip, transitionPlayback } from './transitionLibrary.js'
 
 const clamp01 = (v) => Math.max(0, Math.min(1, v))
 const smooth = (v) => { const x = clamp01(v); return x * x * (3 - 2 * x) }
@@ -154,8 +155,7 @@ export const driftAdjustedRate = (baseRate, drift) => {
 
 // ── The engine ───────────────────────────────────────────────────────────────
 
-const CROSSFADE_S = 0.27
-const DIP_S = 0.17
+const BLEND_TYPES = new Set(['crossfade', 'blur-dissolve', 'film-dissolve'])
 
 export class PreviewEngine {
   constructor({ resolveSrc = (s) => s, onEnded = () => {}, onActiveClipChange = () => {} } = {}) {
@@ -284,14 +284,20 @@ export class PreviewEngine {
 
   maintainVideo(t, force) {
     const plan = planClips(this.items, t)
+    const incomingTransition = transitionForClip(this.items, plan.active)
+    const transition = transitionPlayback(incomingTransition, plan.active)
     if (this.swapLock && (t >= this.swapLock.until || t < this.swapLock.since)) this.swapLock = null
     // A crossfade cut must lock the outgoing slot BEFORE reassignment, so the
     // old clip's tail stays on screen underneath the incoming ramp instead of
     // being replaced by the next prep clip in the same tick.
     const currentVisibleClipId = this.pool.slots[this.pool.visible]?.clipId
     const willSwap = plan.active && currentVisibleClipId && currentVisibleClipId !== plan.active.id
-    if (willSwap && plan.active.payload?.transitionIn === 'crossfade' && this.pool.visible >= 0 && !this.swapLock) {
-      this.swapLock = { slotIndex: this.pool.visible, since: t, until: plan.active.startTime + CROSSFADE_S + 0.12 }
+    if (willSwap && BLEND_TYPES.has(transition.type) && this.pool.visible >= 0 && !this.swapLock) {
+      this.swapLock = {
+        slotIndex: this.pool.visible,
+        since: t,
+        until: plan.active.startTime + transition.duration + 0.12,
+      }
     }
     const locked = this.swapLock ? [this.swapLock.slotIndex] : []
     const next = poolAssign(this.pool, plan, { locked })
@@ -362,8 +368,8 @@ export class PreviewEngine {
       const isLockedOutgoing = this.swapLock && index === this.swapLock.slotIndex
       let opacity = 0
       if (isVisible && active) {
-        opacity = active.payload?.transitionIn === 'crossfade'
-          ? clamp01((t - active.startTime) / CROSSFADE_S)
+        opacity = BLEND_TYPES.has(transition.type)
+          ? clamp01((t - active.startTime) / Math.max(0.01, transition.duration))
           : 1
       } else if (isLockedOutgoing) {
         opacity = 1 // sits under the incoming layer while it fades in
@@ -371,6 +377,15 @@ export class PreviewEngine {
       const z = isVisible ? 2 : isLockedOutgoing ? 1 : 0
       if (el.style.opacity !== String(opacity)) el.style.opacity = String(opacity)
       if (el.style.zIndex !== String(z)) el.style.zIndex = String(z)
+      const blendP = isVisible && active
+        ? clamp01((t - active.startTime) / Math.max(0.01, transition.duration))
+        : 1
+      const filter = transition.type === 'blur-dissolve' && isVisible
+        ? `blur(${(1 - blendP) * 12}px) saturate(${0.78 + blendP * 0.22})`
+        : transition.type === 'film-dissolve' && isVisible
+          ? `sepia(${(1 - blendP) * 0.18}) contrast(${0.92 + blendP * 0.08})`
+          : 'none'
+      if (el.style.filter !== filter) el.style.filter = filter
     })
 
     if (active && this.playing) {

@@ -1,8 +1,15 @@
 import { create } from 'zustand'
 import { createJSONStorage, persist } from 'zustand/middleware'
 import api from '../services/api'
-import { planSceneSegments, getClipOptions, unitKey, MIN_SEGMENT_SECONDS } from '../lib/segmentation'
+import {
+  buildScenePacingContext,
+  planSceneSegments,
+  getClipOptions,
+  unitKey,
+  MIN_SEGMENT_SECONDS,
+} from '../lib/segmentation'
 import { deriveBaseTimeline, applyDirectorPlan, buildNarrationSfxItems, newItemId, normalizeTimeline, trackOf } from '../lib/timeline'
+import { transitionDefinition } from '../lib/transitionLibrary'
 import {
   buildContinuityContext,
   derivePreviousEndingState,
@@ -16,6 +23,11 @@ import {
   videoPromptFailureMessage,
 } from '../lib/videoPromptBatches'
 import { replanPendingImageVariations } from '../lib/imageVariationQueue'
+import {
+  enrichedVideoPromptTiming,
+  selectedVideoTargetDuration,
+  videoRequestTimingFields,
+} from '../lib/videoEditorialTiming'
 import {
   MAX_CONCURRENT_VIDEO_REQUESTS,
   activeVideoRequestCount,
@@ -48,6 +60,8 @@ import {
   usesWindowsVideoBackend,
 } from '../lib/windowsVideoWorker'
 import { reconcileTimelineVideoSelections } from '../lib/videoSelectionTimeline'
+import { runSceneSheetMutationWithTokenRecovery } from '../lib/sceneSheetSession'
+import { hydrateSceneSheetReferences } from '../lib/sceneSheets'
 
 const emptyWindowsVideoStatus = () => ({
   paused: false,
@@ -95,6 +109,12 @@ const isProjectScopeCurrent = (get, scope) => (
 const sessionSaveSchedulers = new Map()
 const sessionWriteTokens = new Map()
 const abandonedSessionIds = new Set()
+const withoutRecordKeys = (record = {}, keys = []) => {
+  if (!keys?.length) return record
+  const next = { ...record }
+  keys.forEach(key => delete next[key])
+  return next
+}
 // Three bounded Opus authoring attempts plus proof/final Remotion renders.
 // The backend emits live authoring/render progress throughout this window.
 // Three ten-minute executor ceilings plus optional ideation/review/rendering.
@@ -112,6 +132,26 @@ const mergeMapOptions = (existing = [], incoming = []) => {
 
 const rememberSessionWriteToken = (sessionId, token) => {
   if (sessionId && token) sessionWriteTokens.set(sessionId, token)
+}
+
+const executeSceneSheetMutation = async ({ sessionId, get, set, operation }) => {
+  // Finish any settings/project autosave that was already queued. It may
+  // rotate the optimistic token, and the mutation must use the resulting one.
+  await get().autoSaveSession()
+  return runSceneSheetMutationWithTokenRecovery({
+    getToken: () => get().sessionWriteToken,
+    operation,
+    refresh: async () => {
+      const refreshed = await api.getSceneSheets(sessionId)
+      if (getSessionId() !== sessionId) return refreshed
+      if (refreshed?.writeToken) rememberSessionWriteToken(sessionId, refreshed.writeToken)
+      set({
+        sceneSheetWorkflow: refreshed?.workflow || refreshed?.scene_sheet_workflow || null,
+        ...(refreshed?.writeToken ? { sessionWriteToken: refreshed.writeToken } : {}),
+      })
+      return refreshed
+    },
+  })
 }
 
 const drainSessionSaves = async (sessionId, scheduler) => {
@@ -330,6 +370,12 @@ export const usePipelineStore = create(
         videoSpeedFactor: 0.8,
         // Image variations generated per segment (1-4)
         imageVariations: 4,
+        // Number of distinct Extra High alternatives requested for each
+        // Windows image task. The v1 desktop worker supports exactly 1-3.
+        windowsImageOutputs: 3,
+        // Experimental continuity-first image workflow: compatible shots are
+        // authored as manually generated scene sheets, then expanded here.
+        sceneSheetEnabled: false,
         // Full-script copy format on the audio step: 'plain' | 'expressive'
         audioScriptFormat: 'plain',
         // ── Cinema / Director ──
@@ -391,6 +437,8 @@ export const usePipelineStore = create(
       // an array of { url, prompt } entries oldest-first. The current images[key]
       // is always the latest; history lets the user browse and re-select prior versions.
       imageHistory: {},
+      sceneSheetWorkflow: null,
+      downstreamResetRevision: null,
 
       // videoPrompts: one entry per segment — includes scene_number + segment_index
       videoPrompts: [],
@@ -532,7 +580,8 @@ export const usePipelineStore = create(
           fal: 'fal-ai/flux-pro',
           replicate: 'black-forest-labs/flux-1.1-pro',
           gemini: 'gemini-3-pro-image-preview',
-          vertex: 'gemini-2.5-flash-image'
+          vertex: 'gemini-2.5-flash-image',
+          'windows-image': 'extra-high',
         }
         set((state) => ({
           settings: {
@@ -653,6 +702,242 @@ export const usePipelineStore = create(
         }
       },
 
+      setSceneSheetEnabled: (value) => {
+        set((state) => ({
+          settings: { ...state.settings, sceneSheetEnabled: !!value },
+        }))
+        void get().autoSaveSession()
+      },
+
+      setWindowsImageOutputs: (count) => {
+        const value = Math.max(1, Math.min(3, Number(count) || 1))
+        set((state) => ({
+          settings: { ...state.settings, windowsImageOutputs: value },
+        }))
+        void get().autoSaveSession()
+      },
+
+      prepareSceneSheets: async () => {
+        const sessionId = getSessionId()
+        const result = await executeSceneSheetMutation({
+          sessionId,
+          get,
+          set,
+          operation: writeToken => api.planSceneSheets(sessionId, writeToken),
+        })
+        if (getSessionId() !== sessionId) return null
+        const workflow = result?.workflow || result?.scene_sheet_workflow || result
+        if (result?.writeToken) rememberSessionWriteToken(sessionId, result.writeToken)
+        set(state => ({
+          sceneSheetWorkflow: workflow,
+          selectedImages: withoutRecordKeys(state.selectedImages, result?.invalidatedUnitIds),
+          ...(result?.writeToken ? { sessionWriteToken: result.writeToken } : {}),
+        }))
+        return workflow
+      },
+
+      refreshSceneSheets: async () => {
+        const sessionId = getSessionId()
+        const result = await api.getSceneSheets(sessionId)
+        if (getSessionId() !== sessionId) return null
+        const workflow = result?.workflow || result?.scene_sheet_workflow || result
+        if (result?.writeToken) rememberSessionWriteToken(sessionId, result.writeToken)
+        set(state => ({
+          sceneSheetWorkflow: workflow,
+          selectedImages: withoutRecordKeys(state.selectedImages, result?.invalidatedUnitIds),
+          ...(result?.writeToken ? { sessionWriteToken: result.writeToken } : {}),
+        }))
+        return workflow
+      },
+
+      uploadSceneSheet: async (groupId, file) => {
+        const sessionId = getSessionId()
+        const result = await executeSceneSheetMutation({
+          sessionId,
+          get,
+          set,
+          operation: writeToken => api.uploadSceneSheet(sessionId, groupId, file, writeToken),
+        })
+        if (getSessionId() !== sessionId) return null
+        const workflow = result?.workflow || result?.scene_sheet_workflow || result
+        if (result?.writeToken) rememberSessionWriteToken(sessionId, result.writeToken)
+        set(state => ({
+          sceneSheetWorkflow: workflow,
+          selectedImages: withoutRecordKeys(state.selectedImages, result?.invalidatedUnitIds),
+          ...(result?.writeToken ? { sessionWriteToken: result.writeToken } : {}),
+        }))
+        return workflow
+      },
+
+      generateWindowsSceneSheet: async (groupId, outputCount = 3, retry = false) => {
+        const sessionId = getSessionId()
+        const result = await executeSceneSheetMutation({
+          sessionId,
+          get,
+          set,
+          operation: writeToken => api.generateWindowsSceneSheet(
+            sessionId,
+            groupId,
+            outputCount,
+            writeToken,
+            retry,
+          ),
+        })
+        if (getSessionId() !== sessionId) return null
+        set(state => ({
+          sceneSheetWorkflow: {
+            ...state.sceneSheetWorkflow,
+            groups: (state.sceneSheetWorkflow?.groups || []).map(group =>
+              group.id === groupId
+                ? { ...group, windowsGeneration: result.job }
+                : group
+            ),
+          },
+        }))
+        return result.job
+      },
+
+      refreshWindowsSceneSheet: async (groupId) => {
+        const sessionId = getSessionId()
+        const result = await api.getWindowsSceneSheetStatus(sessionId, groupId)
+        if (getSessionId() !== sessionId) return null
+        set(state => ({
+          sceneSheetWorkflow: {
+            ...state.sceneSheetWorkflow,
+            groups: (state.sceneSheetWorkflow?.groups || []).map(group =>
+              group.id === groupId
+                ? { ...group, windowsGeneration: result.job }
+                : group
+            ),
+          },
+        }))
+        return result.job
+      },
+
+      selectWindowsSceneSheetOption: async (groupId, ordinal) => {
+        const sessionId = getSessionId()
+        const result = await executeSceneSheetMutation({
+          sessionId,
+          get,
+          set,
+          operation: writeToken => api.selectWindowsSceneSheetOption(
+            sessionId,
+            groupId,
+            ordinal,
+            writeToken,
+          ),
+        })
+        if (getSessionId() !== sessionId) return null
+        const workflow = result?.workflow || result?.scene_sheet_workflow || result
+        if (result?.writeToken) rememberSessionWriteToken(sessionId, result.writeToken)
+        set(state => ({
+          sceneSheetWorkflow: workflow,
+          selectedImages: withoutRecordKeys(state.selectedImages, result?.invalidatedUnitIds),
+          ...(result?.writeToken ? { sessionWriteToken: result.writeToken } : {}),
+        }))
+        return workflow
+      },
+
+      expandSceneSheet: async (groupId, panelOrdinals) => {
+        const sessionId = getSessionId()
+        const result = await executeSceneSheetMutation({
+          sessionId,
+          get,
+          set,
+          operation: writeToken => api.expandSceneSheet(
+            sessionId,
+            groupId,
+            panelOrdinals,
+            writeToken,
+          ),
+        })
+        if (getSessionId() !== sessionId) return null
+        const workflow = result?.workflow || result?.scene_sheet_workflow || result
+        if (result?.writeToken) rememberSessionWriteToken(sessionId, result.writeToken)
+        set(state => ({
+          sceneSheetWorkflow: workflow,
+          selectedImages: {
+            ...withoutRecordKeys(state.selectedImages, result?.invalidatedUnitIds),
+            ...(result?.selectedImages || result?.selected_images || {}),
+          },
+          ...(result?.writeToken ? { sessionWriteToken: result.writeToken } : {}),
+        }))
+        return workflow
+      },
+
+      selectSceneSheetPanel: (groupId, unitId) => {
+        const group = get().sceneSheetWorkflow?.groups?.find(item => item.id === groupId)
+        const panel = group?.panels?.find(item => item.unitId === unitId)
+        const url = panel?.expandedUrl || panel?.expanded_url || panel?.cropUrl || panel?.crop_url
+        if (!url) throw new Error('Expand this panel before selecting it')
+        set((state) => ({
+          selectedImages: {
+            ...state.selectedImages,
+            [unitId]: {
+              url,
+              prompt: panel.prompt,
+              promptIndex: 'scene-sheet',
+              source: 'scene-sheet',
+              sceneSheetGroupId: groupId,
+              panelOrdinal: panel.ordinal,
+            },
+          },
+        }))
+        void get().autoSaveSession()
+      },
+
+      selectAllExpandedSceneSheetPanels: () => {
+        const workflow = get().sceneSheetWorkflow
+        const expandedSelections = {}
+        for (const group of workflow?.groups || []) {
+          for (const panel of group.panels || []) {
+            const url = panel.expandedUrl || panel.expanded_url
+            if (!url) continue
+            expandedSelections[panel.unitId] = {
+              url,
+              prompt: panel.prompt,
+              promptIndex: 'scene-sheet',
+              source: 'scene-sheet',
+              sceneSheetGroupId: group.id,
+              panelOrdinal: panel.ordinal,
+            }
+          }
+        }
+        if (!Object.keys(expandedSelections).length) {
+          throw new Error('No expanded scene-sheet frames are available')
+        }
+        set((state) => ({
+          selectedImages: {
+            ...state.selectedImages,
+            ...expandedSelections,
+          },
+        }))
+        void get().autoSaveSession()
+        return expandedSelections
+      },
+
+      resetToImages: async () => {
+        const sessionId = getSessionId()
+        // Drain any older queued snapshot before the backend rotates the write
+        // token. The backend's reset revision then blocks stale resurrection.
+        await get().autoSaveSession()
+        let result
+        try {
+          result = await api.resetSessionToImages(sessionId, get().sessionWriteToken)
+        } catch (error) {
+          const writeToken = error?.response?.data?.writeToken
+          if (writeToken && getSessionId() === sessionId) {
+            rememberSessionWriteToken(sessionId, writeToken)
+            set({ sessionWriteToken: writeToken })
+          }
+          throw error
+        }
+        if (getSessionId() !== sessionId) return null
+        const project = result?.project || result?.session || result
+        get().loadProject(project)
+        return result
+      },
+
       setAudioScriptFormat: (format) => set((state) => ({
         settings: { ...state.settings, audioScriptFormat: format }
       })),
@@ -762,20 +1047,31 @@ export const usePipelineStore = create(
       // Compute per-scene video segments from measured audio durations.
       // Falls back to the scene plan's duration when a scene has no audio yet.
       computeSceneSegments: () => {
-        const { scenePlan, audio, settings } = get()
+        const { scenePlan, audio, settings, ttsScript, scenes } = get()
         if (!scenePlan?.scenes) return {}
 
         const clipOptions = getClipOptions(settings.videoModel, settings.videoClipDuration)
         const speedFactor = settings.videoSpeedFactor || 1
+        const narrationUnits = ttsScript?.narration_sequence || ttsScript?.scene_breakdown || []
 
         const sceneSegments = {}
         for (const planScene of scenePlan.scenes) {
           const sceneAudio = audio.sceneAudio?.[planScene.scene_id]
+          const narrationUnit = narrationUnits.find(unit =>
+            unit.scene_id === planScene.scene_id
+            || unit.scene_number === planScene.scene_number
+          )
+          const generatedScene = scenes.find(unit =>
+            unit.scene_number === planScene.scene_number
+          )
           const audioDuration = sceneAudio?.durationSeconds
             || planScene.duration_seconds
             || null
           sceneSegments[planScene.scene_number] = planSceneSegments(
-            audioDuration, clipOptions, speedFactor
+            audioDuration,
+            clipOptions,
+            speedFactor,
+            buildScenePacingContext(planScene, narrationUnit, generatedScene)
           )
         }
         set({ sceneSegments })
@@ -966,39 +1262,74 @@ export const usePipelineStore = create(
               characterSceneLinks: {},
               characterAudit: extracted.audit || null,
               characterStatus: 'ready',
+              characterError: null,
             })
+            await get().autoSaveSession()
             return []
           }
-          set({ characters, characterAudit: extracted.audit || null, characterStatus: 'generating' })
+          set({
+            characters,
+            characterAudit: extracted.audit || null,
+            characterStatus: 'generating',
+            characterError: null,
+          })
+          // Persist extraction before portrait generation. A provider failure
+          // must not discard Sonnet's completed cast audit.
+          await get().autoSaveSession()
           const generated = []
           for (const character of characters) {
-            const result = await api.generateImages(
-              [character.visual_prompt],
-              settings.imageProvider,
-              settings.imageModel,
-              '9:16',
-              [],
-              character.description,
-              character
-            )
-            if (!isProjectScopeCurrent(get, scope)) return []
-            const option = result?.[0]
-            const image = option?.url ? await toBase64DataUri(option.url) : null
-            generated.push({
-              ...character,
-              image,
-              image_options: image ? [{ url: image, prompt: character.visual_prompt }] : [],
-              error: option?.error || (!image ? 'No image returned' : null),
-            })
+            let generatedCharacter
+            try {
+              const result = await api.generateImages(
+                [character.visual_prompt],
+                settings.imageProvider,
+                settings.imageModel,
+                '9:16',
+                [],
+                character.description,
+                character,
+                {
+                  sessionId: getSessionId(),
+                  itemIds: [`character-${character.id}`],
+                  outputCount: settings.windowsImageOutputs || 1,
+                },
+              )
+              if (!isProjectScopeCurrent(get, scope)) return []
+              const option = result?.[0]
+              const rawOptions = settings.imageProvider === 'windows-image'
+                ? (option?.alternatives?.length ? option.alternatives : (option?.url ? [option] : []))
+                : (option?.url ? [option] : [])
+              const imageOptions = await Promise.all(rawOptions.map(async candidate => ({
+                url: await toBase64DataUri(candidate.url),
+                prompt: character.visual_prompt,
+              })))
+              const image = imageOptions[0]?.url || null
+              generatedCharacter = {
+                ...character,
+                image,
+                image_options: imageOptions,
+                error: option?.error || (!image ? 'No image returned' : null),
+              }
+            } catch (error) {
+              if (!isProjectScopeCurrent(get, scope)) return []
+              generatedCharacter = {
+                ...character,
+                image: null,
+                image_options: [],
+                error: error.message || 'Character portrait generation failed',
+              }
+            }
+            generated.push(generatedCharacter)
             set({ characters: [...generated, ...characters.slice(generated.length)] })
-            get().autoSaveSession()
+            await get().autoSaveSession()
           }
           set({ characters: generated, characterStatus: 'review' })
-          get().autoSaveSession()
+          await get().autoSaveSession()
           return generated
         } catch (error) {
           if (!isProjectScopeCurrent(get, scope)) return []
           set({ characterStatus: 'error', characterError: error.message })
+          await get().autoSaveSession()
           throw error
         }
       },
@@ -1010,7 +1341,10 @@ export const usePipelineStore = create(
         const count = Math.max(1, Math.min(2, Number(optionCount) || 1))
         set({ characters: state.characters.map(item => item.id === characterId ? { ...item, generating: true, error: null } : item) })
         try {
-          const prompts = Array.from({ length: count }, () => prompt || character.visual_prompt)
+          const prompts = Array.from(
+            { length: state.settings.imageProvider === 'windows-image' ? 1 : count },
+            () => prompt || character.visual_prompt,
+          )
           const useVertexEdit = !!(useCurrentReference && character.image && state.settings.keysConfigured?.vertex)
           const editProvider = useVertexEdit ? 'vertex' : state.settings.imageProvider
           const editModel = useVertexEdit && state.settings.imageProvider !== 'vertex'
@@ -1023,9 +1357,18 @@ export const usePipelineStore = create(
             '9:16',
             useCurrentReference && character.image ? [character.image] : [],
             character.description,
-            character
+            character,
+            {
+              sessionId: getSessionId(),
+              itemIds: [`character-${character.id}-regenerate`],
+              outputCount: count,
+              retry: true,
+            },
           )
-          const options = await Promise.all(result.filter(item => item?.url).map(async item => ({
+          const rawOptions = state.settings.imageProvider === 'windows-image'
+            ? (result[0]?.alternatives || [])
+            : result
+          const options = await Promise.all(rawOptions.filter(item => item?.url).map(async item => ({
             url: await toBase64DataUri(item.url),
             prompt: item.prompt || prompts[0],
           })))
@@ -1080,6 +1423,7 @@ export const usePipelineStore = create(
           return result.links || {}
         } catch (error) {
           set({ characterStatus: 'error', characterError: error.message })
+          await get().autoSaveSession()
           throw error
         }
       },
@@ -1167,6 +1511,7 @@ export const usePipelineStore = create(
             imagesError: null,
             imageBatches: [],
             imageHistory: {},
+            sceneSheetWorkflow: null,
             videoPrompts: [],
             videoBatches: [],
             videoJobs: {},
@@ -1318,16 +1663,37 @@ export const usePipelineStore = create(
                   target_duration: t.targetDuration ?? null,
                   clip_duration: t.clipDuration ?? null,
                   playback_rate: t.playbackRate ?? 1,
+                  scenario_id: planScene?.scenario_id || scene.scenario_id || null,
+                  scenario_continuity: planScene?.scenario_continuity || scene.scenario_continuity || '',
+                  environment_family_id: planScene?.environment_family_id || scene.environment_family_id || null,
+                  environment_family_continuity: planScene?.environment_family_continuity || scene.environment_family_continuity || '',
                 }
               })
             })
 
             set({ scenes })
-            get().autoSaveSession()  // scene plan + image prompts ready
+            await get().autoSaveSession()  // canonical units must exist before sheet planning
           }
 
           // ── Step 2: Generate the actual images unit-by-unit (scene+segment) ───
-          const allPrompts = scenes.flatMap(unit =>
+          let sheetWorkflow = get().sceneSheetWorkflow
+          if (settings.sceneSheetEnabled) {
+            if (!sheetWorkflow || !resumeFromPending) {
+              get().logActivity('Planning continuity scene sheets with Claude Sonnet…', 'running')
+              sheetWorkflow = await get().prepareSceneSheets()
+              get().logActivity(
+                `${sheetWorkflow?.groups?.length || 0} continuity sheet${sheetWorkflow?.groups?.length === 1 ? '' : 's'} planned · ${(sheetWorkflow?.isolatedUnitIds || []).length} isolated shot${(sheetWorkflow?.isolatedUnitIds || []).length === 1 ? '' : 's'}`,
+                'success'
+              )
+            }
+          }
+          const isolatedUnitIds = settings.sceneSheetEnabled
+            ? new Set(sheetWorkflow?.isolatedUnitIds || sheetWorkflow?.isolated_unit_ids || [])
+            : null
+          const unitsForDirectGeneration = isolatedUnitIds
+            ? scenes.filter(unit => isolatedUnitIds.has(`${unit.scene_number}_${unit.segment_index ?? 0}`))
+            : scenes
+          const allPrompts = unitsForDirectGeneration.flatMap(unit =>
             unit.prompts.map((prompt, idx) => ({
               sceneNumber: unit.scene_number,
               segmentIndex: unit.segment_index ?? 0,
@@ -1377,19 +1743,7 @@ export const usePipelineStore = create(
             return sa - sb || ga - gb
           })
 
-          for (const uk of unitKeys) {
-            if (get().checkShouldStop()) {
-              const remaining = unitKeys
-                .slice(unitKeys.indexOf(uk))
-                .flatMap(u => promptsByUnit[u].map(keyOf))
-              set(state => ({
-                imageProgress: { ...state.imageProgress, pending: remaining },
-                imagesLoading: {}
-              }))
-              get().logActivity(`Image generation interrupted — ${remaining.length} images pending, resume anytime`, 'info')
-              return
-            }
-
+          const processImageUnit = async (uk) => {
             const unitPrompts = promptsByUnit[uk]
             const unitPromptTexts = unitPrompts.map(p => p.prompt)
             const { sceneNumber: sceneNum, segmentIndex: segIdx, segmentCount: segCount } = unitPrompts[0]
@@ -1406,7 +1760,13 @@ export const usePipelineStore = create(
                 settings.imageModel,
                 settings.aspectRatio,
                 references.images,
-                references.description
+                references.description,
+                null,
+                {
+                  sessionId: getSessionId(),
+                  itemIds: unitPrompts.map(keyOf),
+                  outputCount: settings.windowsImageOutputs || 1,
+                }
               )
               if (!isProjectScopeCurrent(get, scope)) return null
 
@@ -1423,6 +1783,8 @@ export const usePipelineStore = create(
                   url: base64Urls[idx] || result?.url || null,
                   prompt: result?.prompt || unitPromptTexts[idx],
                   error: result?.error || null,
+                  alternatives: result?.alternatives || [],
+                  taskId: result?.taskId || null,
                   loading: false
                 }
                 completedKeys.push(key)
@@ -1470,7 +1832,38 @@ export const usePipelineStore = create(
               })
             }
 
-            await new Promise(r => setTimeout(r, 800))
+            if (settings.imageProvider !== 'windows-image') {
+              await new Promise(r => setTimeout(r, 800))
+            }
+          }
+
+          if (settings.imageProvider === 'windows-image') {
+            // Queue five independent jobs before waiting for results. The
+            // Windows worker owns its five persistent Chrome slots; serial
+            // browser-side awaits would starve four of them.
+            let nextUnitIndex = 0
+            const worker = async () => {
+              while (nextUnitIndex < unitKeys.length && !get().checkShouldStop()) {
+                const uk = unitKeys[nextUnitIndex]
+                nextUnitIndex += 1
+                await processImageUnit(uk)
+              }
+            }
+            await Promise.all(
+              Array.from({ length: Math.min(5, unitKeys.length) }, worker),
+            )
+          } else {
+            for (const uk of unitKeys) {
+              if (get().checkShouldStop()) break
+              await processImageUnit(uk)
+            }
+          }
+
+          if (get().checkShouldStop()) {
+            const remaining = get().imageProgress.pending
+            set({ imagesLoading: {} })
+            get().logActivity(`Image generation interrupted — ${remaining.length} images pending, resume anytime`, 'info')
+            return
           }
 
           set({ imagesLoading: {} })
@@ -1634,7 +2027,14 @@ export const usePipelineStore = create(
                 settings.imageModel,
                 settings.aspectRatio,
                 references.images,
-                references.description
+                references.description,
+                null,
+                {
+                  sessionId: getSessionId(),
+                  itemIds: [key],
+                  outputCount: settings.windowsImageOutputs || 1,
+                  retry: true,
+                },
               )
               if (!isProjectScopeCurrent(get, scope)) return null
               const base64Url = results[0]?.url ? await toBase64DataUri(results[0].url) : null
@@ -1642,7 +2042,17 @@ export const usePipelineStore = create(
                 const newLoading = { ...state.imagesLoading }
                 delete newLoading[key]
                 return {
-                  images: { ...state.images, [key]: { url: base64Url || results[0]?.url || null, prompt, error: null, loading: false } },
+                  images: {
+                    ...state.images,
+                    [key]: {
+                      url: base64Url || results[0]?.url || null,
+                      prompt,
+                      error: results[0]?.error || null,
+                      loading: false,
+                      alternatives: results[0]?.alternatives || [],
+                      taskId: results[0]?.taskId || null,
+                    },
+                  },
                   imagesLoading: newLoading,
                   imageProgress: {
                     ...state.imageProgress,
@@ -1713,7 +2123,13 @@ export const usePipelineStore = create(
             settings.imageModel,
             settings.aspectRatio,
             references.images,
-            references.description
+            references.description,
+            {
+              sessionId: getSessionId(),
+              itemIds: [key],
+              outputCount: settings.windowsImageOutputs || 1,
+              retry: true,
+            },
           )
           const b64url = await toBase64DataUri(result.url)
           if (!isProjectScopeCurrent(get, scope)) return null
@@ -1727,7 +2143,14 @@ export const usePipelineStore = create(
 
             const updatedImages = {
               ...state.images,
-              [key]: { url: b64url, prompt, error: null, loading: false }
+              [key]: {
+                url: b64url,
+                prompt,
+                error: null,
+                loading: false,
+                alternatives: result.alternatives || [],
+                taskId: result.taskId || null,
+              }
             }
             // If this image is currently selected for its unit, update selectedImages too
             const updatedSelectedImages = { ...state.selectedImages }
@@ -1780,14 +2203,27 @@ export const usePipelineStore = create(
             ? 'gemini-2.5-flash-image'
             : get().settings.imageModel
           const results = await api.generateImages(
-            Array.from({ length: count }, () => prompt),
+            Array.from(
+              { length: editProvider === 'windows-image' ? 1 : count },
+              () => prompt,
+            ),
             editProvider,
             editModel,
             get().settings.aspectRatio,
             [source.url, ...references.images],
-            references.description
+            references.description,
+            null,
+            {
+              sessionId: getSessionId(),
+              itemIds: [`${key}-edit`],
+              outputCount: count,
+              retry: true,
+            },
           )
-          const options = await Promise.all(results.filter(result => result?.url).map(async result => ({
+          const rawOptions = editProvider === 'windows-image'
+            ? (results[0]?.alternatives || [])
+            : results
+          const options = await Promise.all(rawOptions.filter(result => result?.url).map(async result => ({
             url: await toBase64DataUri(result.url),
             prompt,
           })))
@@ -1836,14 +2272,18 @@ export const usePipelineStore = create(
 
       regenerateAllImages: async () => {
         const scope = captureProjectScope(get)
-        const { scenes, settings, characterImages, characterDescription } = get()
+        const { scenes, settings, characterImages, characterDescription, sceneSheetWorkflow } = get()
         const charImgList = Object.values(characterImages || {}).filter(Boolean)
         if (!scenes.length) return
 
         // Build list of all prompts grouped by unit (scene + segment)
         const promptsByUnit = {}
+        const isolatedUnitIds = settings.sceneSheetEnabled
+          ? new Set(sceneSheetWorkflow?.isolatedUnitIds || sceneSheetWorkflow?.isolated_unit_ids || [])
+          : null
         scenes.forEach(unit => {
           const uk = `${unit.scene_number}_${unit.segment_index ?? 0}`
+          if (isolatedUnitIds && !isolatedUnitIds.has(uk)) return
           const prompts = unit.prompts || []
           prompts.forEach((prompt, idx) => {
             if (!promptsByUnit[uk]) promptsByUnit[uk] = []
@@ -1896,7 +2336,18 @@ export const usePipelineStore = create(
 
           try {
             const results = await api.generateImages(
-              unitPromptTexts, settings.imageProvider, settings.imageModel, settings.aspectRatio, charImgList, characterDescription
+              unitPromptTexts,
+              settings.imageProvider,
+              settings.imageModel,
+              settings.aspectRatio,
+              charImgList,
+              characterDescription,
+              null,
+              {
+                sessionId: getSessionId(),
+                itemIds: unitPrompts.map(keyOf),
+                outputCount: settings.windowsImageOutputs || 1,
+              },
             )
             if (!isProjectScopeCurrent(get, scope)) return null
 
@@ -1913,7 +2364,9 @@ export const usePipelineStore = create(
                 url: base64Urls[idx] || result?.url || null,
                 prompt: result?.prompt || unitPromptTexts[idx],
                 error: result?.error || null,
-                loading: false
+                loading: false,
+                alternatives: result?.alternatives || [],
+                taskId: result?.taskId || null,
               }
               completedKeys.push(key)
             })
@@ -1921,8 +2374,21 @@ export const usePipelineStore = create(
             set(state => {
               const newLoading = { ...state.imagesLoading }
               completedKeys.forEach(k => delete newLoading[k])
+              const selectedImages = { ...state.selectedImages }
+              unitPrompts.forEach((promptItem, idx) => {
+                const selectedKey = `${promptItem.sceneNumber}_${promptItem.segmentIndex}`
+                const selected = selectedImages[selectedKey]
+                if (selected?.source === 'scene-sheet' || selected?.promptIndex !== promptItem.promptIndex) return
+                const replacement = imageUpdates[keyOf(promptItem)]
+                if (replacement?.url) selectedImages[selectedKey] = {
+                  ...selected,
+                  url: replacement.url,
+                  prompt: replacement.prompt,
+                }
+              })
               return {
                 images: { ...state.images, ...imageUpdates },
+                selectedImages,
                 imagesLoading: newLoading,
                 imageProgress: {
                   ...state.imageProgress,
@@ -1987,7 +2453,7 @@ export const usePipelineStore = create(
 
       // ─── Video Prompts ────────────────────────────────────────────────────
       fetchVideoPrompts: async () => {
-        const { scenePlan, selectedImages, settings, scenes } = get()
+        const { scenePlan, selectedImages, settings, scenes, ttsScript } = get()
         if (!scenePlan) return
         const scope = captureProjectScope(get)
 
@@ -2007,11 +2473,21 @@ export const usePipelineStore = create(
         const currentAudio = get().audio
         const clipOptions = getClipOptions(settings.videoModel, settings.videoClipDuration)
         const speedFactor = settings.videoSpeedFactor || 1
+        const narrationUnits = ttsScript?.narration_sequence || ttsScript?.scene_breakdown || []
         const plannedSegments = Object.fromEntries(planScenes.map(ps => {
           const audioDuration = currentAudio.sceneAudio?.[ps.scene_id]?.durationSeconds
             || ps.duration_seconds
             || null
-          return [ps.scene_number, planSceneSegments(audioDuration, clipOptions, speedFactor)]
+          const narrationUnit = narrationUnits.find(unit =>
+            unit.scene_id === ps.scene_id || unit.scene_number === ps.scene_number
+          )
+          const generatedScene = scenes.find(unit => unit.scene_number === ps.scene_number)
+          return [ps.scene_number, planSceneSegments(
+            audioDuration,
+            clipOptions,
+            speedFactor,
+            buildScenePacingContext(ps, narrationUnit, generatedScene)
+          )]
         }))
         if (scenes.length > 0) {
           for (const ps of planScenes) {
@@ -2083,7 +2559,7 @@ export const usePipelineStore = create(
             scene_number: unit.scene_number,
             segment_index: unit.segment_index ?? 0,
             segment_count: unit.segment_count ?? 1,
-            duration_seconds: unit.clip_duration || ps.duration_seconds,
+            ...videoRequestTimingFields(unit, {}, ps.duration_seconds),
             visual_description: ps.visual_description,
             camera_intent: ps.camera_intent,
             mannequin_details: ps.mannequin_details,
@@ -2215,9 +2691,12 @@ export const usePipelineStore = create(
               ...vp,
               segment_index: segIdx,
               segment_count: unit?.segment_count ?? storeUnit?.segment_count ?? 1,
-              duration_seconds: unit?.duration_seconds || vp.duration_seconds || sceneFromPlan?.duration_seconds || 6,
-              target_duration: unit?.target_duration ?? storeUnit?.target_duration ?? null,
-              playback_rate: unit?.playback_rate ?? storeUnit?.playback_rate ?? 1,
+              ...enrichedVideoPromptTiming(
+                vp,
+                unit,
+                storeUnit,
+                sceneFromPlan?.duration_seconds || 6
+              ),
               visual_description: sceneFromPlan?.visual_description,
               video_model: settings.videoModel,
               video_provider: settings.videoProvider,
@@ -2297,7 +2776,7 @@ export const usePipelineStore = create(
             scene_number: sceneNum,
             segment_index: segIdx || 0,
             segment_count: storeUnit?.segment_count ?? 1,
-            duration_seconds: storeUnit?.clip_duration || ps.duration_seconds,
+            ...videoRequestTimingFields(storeUnit, {}, ps.duration_seconds),
             visual_description: ps.visual_description,
             camera_intent: ps.camera_intent,
             mannequin_details: ps.mannequin_details,
@@ -2353,9 +2832,12 @@ export const usePipelineStore = create(
               ...vp,
               segment_index: segIdx,
               segment_count: unit?.segment_count ?? 1,
-              duration_seconds: unit?.duration_seconds || vp.duration_seconds || sceneFromPlan?.duration_seconds || 6,
-              target_duration: unit?.target_duration ?? storeUnit?.target_duration ?? null,
-              playback_rate: unit?.playback_rate ?? storeUnit?.playback_rate ?? 1,
+              ...enrichedVideoPromptTiming(
+                vp,
+                unit,
+                storeUnit,
+                sceneFromPlan?.duration_seconds || 6
+              ),
               visual_description: sceneFromPlan?.visual_description,
               video_model: settings.videoModel,
               video_provider: settings.videoProvider,
@@ -2436,7 +2918,7 @@ export const usePipelineStore = create(
             negative_prompt: vp.negative_prompt || '',
             motion_prompt_version: vp.motion_prompt_version,
             source_frame_locked: vp.source_frame_locked === true,
-            duration_seconds: vp.duration_seconds || 6,
+            ...videoRequestTimingFields(vp, {}, vp.duration_seconds || 6),
             image_url
           }
         })
@@ -2812,6 +3294,8 @@ export const usePipelineStore = create(
         if (requested.length === 0) return null
         const response = await api.retryMissingWindowsVideos(scope.sessionId, requested, get().sessionWriteToken)
         if (!isProjectScopeCurrent(get, scope)) return null
+        const canonicalNoMissing = Array.isArray(response?.missing)
+          && response.missing.length === 0
         const queueErrors = (response.results || []).filter(result => result?.error)
         const queuedResults = (response.results || []).filter(result => !result?.error)
         if (queueErrors.length > 0) {
@@ -2859,7 +3343,7 @@ export const usePipelineStore = create(
         }))
         get().logActivity(`Retrying ${requested.length} missing Windows video${requested.length === 1 ? '' : 's'}`, 'running')
         await get().refreshWindowsVideoStatus()
-        return snapshot
+        return canonicalNoMissing ? { ...snapshot, noMissing: true } : snapshot
       },
 
       cancelWindowsVideoGeneration: async (unitIds) => {
@@ -3044,7 +3528,7 @@ export const usePipelineStore = create(
                 url: job.url,
                 prompt: vp?.full_prompt_string || '',
                 duration: vp?.duration_seconds,
-                target_duration: vp?.target_duration ?? null,
+                target_duration: selectedVideoTargetDuration(vp),
                 playback_rate: vp?.playback_rate ?? 1,
                 scene_number: sceneNum,
                 segment_index: segIdx || 0,
@@ -3087,7 +3571,7 @@ export const usePipelineStore = create(
                 url,
                 prompt: vp?.full_prompt_string || '',
                 duration: vp?.duration_seconds,
-                target_duration: vp?.target_duration ?? null,
+                target_duration: selectedVideoTargetDuration(vp),
                 playback_rate: vp?.playback_rate ?? 1,
                 scene_number: sceneNum,
                 segment_index: segIdx || 0,
@@ -3169,10 +3653,63 @@ export const usePipelineStore = create(
               generationPhase: 'videos',
             }
           })
-          // The shared broker reads the durable ContentMachine session. Ensure
-          // an edited prompt is persisted before requesting a fresh attempt.
-          await get().autoSaveSession()
-          return get().retryMissingWindowsVideos([unitId])
+          let response
+          try {
+            response = await api.regenerateWindowsVideo(
+              scope.sessionId,
+              unitId,
+              prompt,
+              get().sessionWriteToken,
+            )
+          } catch (error) {
+            const payload = error.response?.data || {}
+            const code = payload.code || 'WINDOWS_REGENERATE_FAILED'
+            const message = payload.message || payload.error?.message || error.message || 'Windows regeneration failed'
+            if (isProjectScopeCurrent(get, scope)) {
+              set(state => ({
+                generationState: 'stopped',
+                videoJobs: {
+                  ...state.videoJobs,
+                  [unitId]: {
+                    ...state.videoJobs[unitId],
+                    provider: WINDOWS_VIDEO_PROVIDER,
+                    status: 'failed',
+                    url: null,
+                    error: message,
+                    errorCode: code,
+                    errorRetryable: payload.retryable !== false,
+                  },
+                },
+              }))
+              get().logActivity(`Windows retry ${unitId} failed [${code}]: ${message}`, 'error')
+            }
+            const surfaced = new Error(`[${code}] ${message}`)
+            surfaced.code = code
+            surfaced.cause = error
+            throw surfaced
+          }
+          if (!isProjectScopeCurrent(get, scope)) return null
+          const generationRevision = response?.result?.generationRevision
+          const snapshot = normalizeWindowsVideoStatus(response)
+          set(state => ({
+            generationState: 'running',
+            generationPhase: 'videos',
+            windowsVideoStatus: snapshot.tasks.length
+              ? snapshot
+              : { ...state.windowsVideoStatus, paused: false, error: null },
+            videoJobs: snapshot.tasks.length
+              ? mergeWindowsTasksIntoJobs(state.videoJobs, snapshot)
+              : state.videoJobs,
+            videoPrompts: state.videoPrompts.map(candidate =>
+              candidate.scene_number === sceneNum
+                && (candidate.segment_index ?? 0) === (segIdx || 0)
+                && generationRevision
+                ? { ...candidate, generation_revision: generationRevision }
+                : candidate
+            ),
+          }))
+          get().logActivity(`Fresh Windows video queued for ${unitId}`, 'running')
+          return snapshot
         }
 
         // selectedImages[unitId].url is stripped from localStorage persist —
@@ -3220,7 +3757,15 @@ export const usePipelineStore = create(
             vp?.negative_prompt || '',
             vp?.motion_prompt_version,
             vp?.source_frame_locked === true,
-            scope.sessionId
+            scope.sessionId,
+            {
+              target_duration: vp?.target_duration,
+              action_duration_seconds: vp?.action_duration_seconds
+                ?? vp?.editorial_timing?.action_duration_seconds,
+              editorial_duration_seconds: vp?.editorial_duration_seconds,
+              clip_duration: vp?.clip_duration ?? vp?.duration_seconds,
+              playback_rate: vp?.playback_rate,
+            }
           )
           if (!isProjectScopeCurrent(get, scope)) return null
 
@@ -4024,7 +4569,18 @@ export const usePipelineStore = create(
             get().logActivity(`Director: chapter portrait ${i + 1}/${chapters.length} — ${ch.title}`, 'running')
             try {
               const results = await api.generateImages(
-                [ch.portrait_prompt], settings.imageProvider, settings.imageModel, '9:16', [], ''
+                [ch.portrait_prompt],
+                settings.imageProvider,
+                settings.imageModel,
+                '9:16',
+                [],
+                '',
+                null,
+                {
+                  sessionId: getSessionId(),
+                  itemIds: [`director-chapter-${ch.start_scene}-${i}`],
+                  outputCount: 1,
+                },
               )
               if (!isProjectScopeCurrent(get, scope)) return
               if (results?.[0]?.error) throw new Error(results[0].error)
@@ -4051,14 +4607,13 @@ export const usePipelineStore = create(
       // Start one map job and poll it to completion, patching the timeline
       // item's payload as it progresses. Sequential by design — the map agent
       // is heavyweight (claude -p + Remotion renders).
-      _runMapJob: async (itemId, request, durationSeconds, stageLabel = null) => {
+      _runMapJob: async (itemId, request, durationSeconds, stageLabel = null, { interactive = false } = {}) => {
         const scope = captureProjectScope(get)
         const { settings } = get()
         const currentItem = get().timeline.items.find(it => it.id === itemId)
         const models = {
           ideation: currentItem?.payload?.mapModels?.ideation || 'opus',
           executor: currentItem?.payload?.mapModels?.executor || 'opus',
-          reviewer: 'opus',
         }
         const patchPayload = (patch) => set((state) => ({
           timeline: {
@@ -4071,7 +4626,8 @@ export const usePipelineStore = create(
         patchPayload({
           status: 'rendering',
           error: null,
-          progressMessage: `Starting ${models.ideation} ideation → ${models.executor} execution → Opus review`,
+          awaitingDecision: null,
+          progressMessage: `Starting ${models.ideation} ideation → ${models.executor} execution`,
           mapModels: models,
         })
         const { jobId } = await api.directorMapStart({
@@ -4082,10 +4638,11 @@ export const usePipelineStore = create(
           model: models.executor,
           models,
           mapId: itemId,
+          interactive,
         })
         patchPayload({ mapJobId: jobId })
         if (!isProjectScopeCurrent(get, scope)) return null
-        const startedAt = Date.now()
+        let startedAt = Date.now()
         let consecutiveErrors = 0
         let lastProgress = ''
         try {
@@ -4130,6 +4687,23 @@ export const usePipelineStore = create(
               patchPayload({ progressMessage: progress })
               if (stageLabel) set({ directorStage: `${stageLabel} · ${progress}` })
             }
+            // Interactive runs pause after each rendered attempt; surface the
+            // pending decision so the Inspector can offer accept/continue.
+            {
+              const latestItem = get().timeline.items.find(it => it.id === itemId)
+              if (status.status === 'awaiting-decision') {
+                if (latestItem?.payload?.status !== 'awaiting-decision') {
+                  patchPayload({ status: 'awaiting-decision' })
+                }
+                patchPayload({ awaitingDecision: status.awaitingDecision || null })
+                // Waiting on the human doesn't count against the job budget.
+                startedAt = Date.now()
+                continue
+              }
+              if (status.status === 'running' && latestItem?.payload?.status === 'awaiting-decision') {
+                patchPayload({ status: 'rendering', awaitingDecision: null })
+              }
+            }
             if (status.status === 'completed') {
               const latestItem = get().timeline.items.find(it => it.id === itemId)
               patchPayload({
@@ -4139,11 +4713,13 @@ export const usePipelineStore = create(
                 mapOptions: mergeMapOptions(latestItem?.payload?.mapOptions, status.result?.options),
                 selectedOptionId: status.result?.selectedOptionId || null,
                 mapTrace: status.result?.trace || status.trace || null,
-                // Simple maps open as an inset card over the still-playing
-                // scene instead of a full-frame takeover (renderer decides
-                // from this hint; user can override in the editor payload).
-                presentation: status.result?.suggestedPresentation || latestItem?.payload?.presentation || 'full',
+                // The editor's explicit choice always wins; otherwise take
+                // the agent's suggestion; otherwise split — a full-frame
+                // takeover is the deliberate exception, never the default.
+                presentation: latestItem?.payload?.presentation || status.result?.suggestedPresentation || 'split',
+                suggestedPresentation: status.result?.suggestedPresentation || latestItem?.payload?.suggestedPresentation || null,
                 complexity: status.result?.complexity || null,
+                awaitingDecision: null,
                 progressMessage: null,
                 error: null,
               })
@@ -4156,6 +4732,7 @@ export const usePipelineStore = create(
                 status: 'needs-selection',
                 mapOptions: mergeMapOptions(latestItem?.payload?.mapOptions, status.result?.options),
                 mapTrace: status.result?.trace || status.trace || null,
+                awaitingDecision: null,
                 progressMessage: null,
                 error: status.result?.error || status.error || 'Review the retained map options.',
               })
@@ -4169,6 +4746,7 @@ export const usePipelineStore = create(
                 status: 'failed',
                 progressMessage: null,
                 error: message,
+                awaitingDecision: null,
                 mapTrace: status.trace || latestItem?.payload?.mapTrace || null,
                 mapOptions: mergeMapOptions(latestItem?.payload?.mapOptions, status.trace?.options),
               })
@@ -4177,8 +4755,28 @@ export const usePipelineStore = create(
             }
           }
         } catch (error) {
-          patchPayload({ status: 'failed', progressMessage: null, error: error.message })
+          patchPayload({ status: 'failed', progressMessage: null, awaitingDecision: null, error: error.message })
           throw error
+        }
+      },
+
+      // Resolve a paused interactive map run from the Inspector.
+      decideMapAttempt: async (itemId, action) => {
+        const item = get().timeline.items.find(it => it.id === itemId)
+        const jobId = item?.payload?.mapJobId
+        if (!jobId) return
+        try {
+          await api.directorMapDecision(jobId, action)
+          get().logActivity(
+            action === 'accept'
+              ? 'Map attempt accepted ✓'
+              : action === 'continue'
+                ? 'Trying another map attempt…'
+                : 'Map run stopped — options retained',
+            action === 'accept' ? 'success' : 'info'
+          )
+        } catch (err) {
+          get().logActivity(`Map decision failed: ${err.message}`, 'error')
         }
       },
 
@@ -4433,8 +5031,11 @@ export const usePipelineStore = create(
         if (!item || item.kind !== 'map' || !item.payload?.request) return null
         get().logActivity(`Regenerating map — ${item.payload.request?.subject || item.label}`, 'running')
         try {
+          // Individual regenerations are interactive (pause after each
+          // rendered attempt); the batch queue stays autonomous.
           const result = await get()._runMapJob(
-            itemId, item.payload.request, item.endTime - item.startTime
+            itemId, item.payload.request, item.endTime - item.startTime,
+            null, { interactive: !get().mapQueueRunning }
           )
           const ready = !!result?.url
           get().logActivity(
@@ -4706,13 +5307,28 @@ export const usePipelineStore = create(
           const item = state.timeline.items.find(it => it.id === id)
           if (!item || item.locked) return {}
           const dur = item.endTime - item.startTime
-          const start = Math.max(0, newStart)
+          let start = Math.max(0, newStart)
+          let payload = item.payload
+          if (item.kind === 'transition') {
+            const clips = state.timeline.items
+              .filter(candidate => candidate.kind === 'clip' && candidate.payload?.src)
+              .sort((a, b) => a.startTime - b.startTime)
+            const toIndex = clips.reduce((best, clip, index) => (
+              index > 0 && Math.abs(clip.startTime - start) < Math.abs(clips[best]?.startTime - start)
+                ? index
+                : best
+            ), clips.length > 1 ? 1 : 0)
+            if (toIndex > 0) {
+              start = clips[toIndex].startTime
+              payload = { ...payload, fromClipId: clips[toIndex - 1].id, toClipId: clips[toIndex].id }
+            }
+          }
           return {
             timelineDirty: true,
             timeline: {
               ...state.timeline,
               items: state.timeline.items.map(it => it.id === id
-                ? { ...it, startTime: start, endTime: start + dur }
+                ? { ...it, startTime: start, endTime: start + dur, payload }
                 : it),
             },
           }
@@ -4724,8 +5340,13 @@ export const usePipelineStore = create(
         set((state) => {
           const item = state.timeline.items.find(it => it.id === id)
           if (!item || item.locked) return {}
-          const start = Math.max(0, Math.min(newStart, newEnd - 0.5))
-          const end = Math.max(start + 0.5, newEnd)
+          const transitionDuration = Math.max(0.25, Math.min(1.2, newEnd - newStart))
+          const start = item.kind === 'transition'
+            ? item.startTime
+            : Math.max(0, Math.min(newStart, newEnd - 0.5))
+          const end = item.kind === 'transition'
+            ? start + transitionDuration
+            : Math.max(start + 0.5, newEnd)
           return {
             timelineDirty: true,
             timeline: {
@@ -4758,6 +5379,53 @@ export const usePipelineStore = create(
             items: [...state.timeline.items, item],
           },
         }))
+      },
+
+      // Manual transition at a clip boundary. Editor-authored transitions
+      // share the Director's item model, so preview and render treat them
+      // identically; the type is edited afterwards in the Inspector.
+      addTransitionBeforeClip: (clipId, typeId = 'cross-dissolve') => {
+        const items = get().timeline.items
+        const clips = items
+          .filter(it => it.kind === 'clip' && it.payload?.src)
+          .sort((a, b) => a.startTime - b.startTime || a.endTime - b.endTime)
+        const toIndex = clips.findIndex(clip => clip.id === clipId)
+        if (toIndex < 0) return
+        if (toIndex === 0) {
+          get().logActivity('The first clip has no preceding clip — a transition needs a boundary', 'info')
+          return
+        }
+        const fromClip = clips[toIndex - 1]
+        const toClip = clips[toIndex]
+        const existing = items.find(it =>
+          it.kind === 'transition'
+          && (it.payload?.toClipId === toClip.id || Math.abs(it.startTime - toClip.startTime) < 0.04)
+        )
+        if (existing) {
+          get().logActivity('This boundary already has a transition — select it to change the type', 'info')
+          return
+        }
+        const definition = transitionDefinition(typeId)
+        const duration = Math.max(
+          0.25,
+          Math.min(1.2, definition.defaultDuration, (toClip.endTime - toClip.startTime) * 0.45)
+        )
+        get().addTimelineItem({
+          id: newItemId('tr'),
+          kind: 'transition',
+          startTime: toClip.startTime,
+          endTime: toClip.startTime + duration,
+          label: definition.label,
+          payload: {
+            type: definition.id,
+            fromClipId: fromClip.id,
+            toClipId: toClip.id,
+            reason: 'Editor-authored transition',
+            authoredBy: 'editor',
+          },
+        })
+        get().logActivity(`Transition added — ${definition.label}`, 'success')
+        get().autoSaveSession()
       },
 
       // ── Final film render ──
@@ -4879,6 +5547,11 @@ export const usePipelineStore = create(
         // Migrate pre-segment projects: scene-level keys become unit keys
         // ("12" → "12_0", image "12_3" → "12_0_3", scenes gain segment_index 0)
         const project = migrateProjectToSegments(rawProject)
+        const loadedCharacters = project.characters || []
+        const loadedSceneSheetWorkflow = hydrateSceneSheetReferences(
+          project.scene_sheet_workflow || null,
+          loadedCharacters,
+        )
         rememberSessionWriteToken(getSessionId(), project._session?.write_token)
         const savedImageProgress = project.image_progress || { total: 0, completed: [], pending: [] }
         const hasPendingImages = savedImageProgress.pending.length > 0
@@ -4960,12 +5633,16 @@ export const usePipelineStore = create(
           images: project.images || {},
           imageHistory: project.image_history || {},
           selectedImages: project.selected_images || {},
-          characters: project.characters || [],
+          sceneSheetWorkflow: loadedSceneSheetWorkflow,
+          downstreamResetRevision: project.downstream_reset_revision
+            || project._session?.downstream_reset_revision
+            || null,
+          characters: loadedCharacters,
           characterSceneLinks: project.character_scene_links || {},
           characterAudit: project.character_audit || null,
           characterStatus: project.character_status
             || ((project.characters || []).length ? 'ready' : 'idle'),
-          characterError: null,
+          characterError: project.character_error || null,
           videoPrompts: project.video_prompts || [],
           videoJobs,
           videoHistory: project.video_history || {},
@@ -5020,6 +5697,10 @@ export const usePipelineStore = create(
           projectName: project.project_name || project._session?.name || null,
           settings: {
             ...get().settings,
+            // This experimental workflow is project-scoped. A legacy project
+            // without the persisted key must never inherit it from the
+            // previously opened project in the same tab.
+            sceneSheetEnabled: project.settings?.scene_sheet_enabled === true,
             // Optical finishing is project-scoped. Older projects without
             // these keys receive the restrained defaults instead of leaking
             // whichever treatment was active in the previously opened film.
@@ -5110,10 +5791,13 @@ export const usePipelineStore = create(
           images: state.images,
           image_history: state.imageHistory,
           selected_images: state.selectedImages,
+          scene_sheet_workflow: state.sceneSheetWorkflow,
+          downstream_reset_revision: state.downstreamResetRevision || undefined,
           characters: state.characters,
           character_scene_links: state.characterSceneLinks,
           character_audit: state.characterAudit,
           character_status: state.characterStatus,
+          character_error: state.characterError,
           video_prompts: state.videoPrompts,
           video_jobs: state.videoJobs,
           video_history: state.videoHistory,
@@ -5169,6 +5853,7 @@ export const usePipelineStore = create(
                 : 'hosted-provider'),
             video_resolution: state.settings.videoResolution,
             aspect_ratio:     state.settings.aspectRatio,
+            scene_sheet_enabled: !!state.settings.sceneSheetEnabled,
             chapters_enabled: state.settings.chaptersEnabled,
             trailer_intro_enabled: state.settings.trailerIntroEnabled,
             cinema_style: state.settings.cinemaStyle,
@@ -5253,6 +5938,22 @@ export const usePipelineStore = create(
 
           set(state => {
             const updates = {}
+
+            // Character portraits are durable backend assets and scene-sheet
+            // groups persist only their IDs. Always restore both together so
+            // a refresh cannot leave valid references without previews.
+            const restoredCharacters = project.characters?.length
+              ? project.characters
+              : state.characters
+            if (project.characters?.length) {
+              updates.characters = project.characters
+            }
+            if (project.scene_sheet_workflow || state.sceneSheetWorkflow) {
+              updates.sceneSheetWorkflow = hydrateSceneSheetReferences(
+                project.scene_sheet_workflow || state.sceneSheetWorkflow,
+                restoredCharacters,
+              )
+            }
 
             const savedSceneAudio = project.audio?.sceneAudio || {}
             const savedSfxAudio = project.audio?.sfxAudio || {}
@@ -5370,6 +6071,7 @@ export const usePipelineStore = create(
             videoGenerationBackend: 'windows-worker',
             videoClipDuration: 8,
             aspectRatio: '16:9',
+            sceneSheetEnabled: false,
           },
           // The fresh session has nothing to restore — unblock auto-save so
           // the new project starts persisting immediately
@@ -5398,6 +6100,7 @@ export const usePipelineStore = create(
             videoGenerationBackend: 'windows-worker',
             videoClipDuration: 8,
             aspectRatio: '16:9',
+            sceneSheetEnabled: false,
           },
           sessionRestoreDone: true,
           sessionWriteToken: null,
@@ -5453,6 +6156,7 @@ export const usePipelineStore = create(
             atmosphericGradeAmount: projectCinemaSettings.atmosphericGradeAmount,
             vignetteEnabled: projectCinemaSettings.vignetteEnabled,
             vignetteAmount: projectCinemaSettings.vignetteAmount,
+            sceneSheetEnabled: projectCinemaSettings.sceneSheetEnabled,
           },
         })
         return project
@@ -5495,6 +6199,8 @@ export const usePipelineStore = create(
           images: {},
           imageHistory: {},
           selectedImages: {},
+          sceneSheetWorkflow: null,
+          downstreamResetRevision: null,
           imagesLoading: {},
           imagesError: null,
           videoPrompts: [],

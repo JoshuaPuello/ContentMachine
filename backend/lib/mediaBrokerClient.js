@@ -112,7 +112,18 @@ export const mediaBroker = {
   cancelProject: (projectId, options = {}) => brokerRequest(`/api/media-producers/v1/projects/${encodeURIComponent(projectId)}/cancel`, {
     method: 'POST', body: JSON.stringify(options),
   }),
+  reactivateProject: (projectId) => brokerRequest(`/api/media-producers/v1/projects/${encodeURIComponent(projectId)}/reactivate`, {
+    method: 'POST', body: '{}',
+  }),
   markApplied: (taskId, projectId) => brokerRequest(`/api/media-producers/v1/tasks/${encodeURIComponent(taskId)}/applied?projectId=${encodeURIComponent(projectId)}`, {
     method: 'POST', body: '{}',
   }),
+  submitImageTask: (body) => brokerRequest('/api/media-workers/v1/image-tasks', {
+    method: 'POST',
+    headers: { 'Idempotency-Key': body.idempotencyKey },
+    body: JSON.stringify(body),
+  }),
+  getImageTask: (taskId) => brokerRequest(
+    `/api/media-workers/v1/image-tasks/${encodeURIComponent(taskId)}`,
+  ),
 }

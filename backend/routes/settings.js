@@ -48,6 +48,7 @@ router.get('/', async (req, res) => {
     geminigen: !!(keys.geminigen && keys.geminigen.trim()),
     r2: isR2Configured(),
     windowsWorker: isMediaBrokerConfigured(),
+    windowsImage: isMediaBrokerConfigured() && isR2Configured(),
     // Environment-based capabilities (configured in backend/.env, not via UI keys)
     vertex,
     vertexAccounts: vertexAccountCount(),

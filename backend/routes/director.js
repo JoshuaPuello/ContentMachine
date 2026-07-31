@@ -134,6 +134,7 @@ export function sanitizePlan(plan, sceneCount, options) {
   const out = {
     maps: [],
     motion_graphics: [],
+    transitions: [],
     lower_thirds: [],
     date_chips: [],
     title_cards: [],
@@ -142,7 +143,23 @@ export function sanitizePlan(plan, sceneCount, options) {
 
   for (const m of plan?.maps ?? []) {
     if (!inScene(m.after_scene) || !m.request) continue;
-    m.duration_seconds = Math.max(10, Math.min(30, Number(m.duration_seconds) || 18));
+    // The map is a full-frame takeover that plays under the NEXT scene's
+    // narration (its narration_excerpt contract). It must never outlast that
+    // narration — an over-long map bleeds into a scene about something else
+    // and hides that scene's footage.
+    // Hard 7s ceiling: a full-frame (or split) map beyond ~7s hides too much
+    // footage. The editor's placement logic may extend the on-screen window
+    // slightly (freeze-hold) to avoid ending within 2s of a clip boundary.
+    // `after_scene` names the map's anchor scene: the timeline places the map
+    // inside that scene's window and its excerpt quotes that scene's
+    // narration, so that is the audio the map plays under.
+    const playsUnder = Number(options?.audioDurations?.[String(m.after_scene)]);
+    let duration = Math.max(6, Math.min(7, Number(m.duration_seconds) || 7));
+    if (Number.isFinite(playsUnder) && playsUnder > 0) {
+      if (playsUnder < 6) continue;
+      duration = Math.min(duration, playsUnder);
+    }
+    m.duration_seconds = Math.round(duration * 10) / 10;
     m.request.duration_seconds = m.duration_seconds;
     out.maps.push(m);
   }
@@ -153,6 +170,39 @@ export function sanitizePlan(plan, sceneCount, options) {
   // four heavyweight map agents and appear frozen for most of an hour.
   const mapCap = Math.max(1, Math.min(4, Math.floor(totalDurationSeconds / 60) || 1));
   out.maps = out.maps.slice(0, mapCap);
+
+  const transitionTypes = new Map([
+    ['cross-dissolve', 'cross-dissolve'],
+    ['crossfade', 'cross-dissolve'],
+    ['dip-to-black', 'dip-to-black'],
+    ['dip', 'dip-to-black'],
+    ['soft-blur', 'soft-blur'],
+    ['blur-dissolve', 'soft-blur'],
+    ['film-dissolve', 'film-dissolve'],
+  ]);
+  const seenTransitionTargets = new Set();
+  for (const transition of plan?.transitions ?? []) {
+    const beforeScene = Number(transition.before_scene);
+    if (!Number.isInteger(beforeScene) || beforeScene < 2 || beforeScene > sceneCount) continue;
+    const beforeSegment = Math.max(0, Math.min(8, Math.round(Number(transition.before_segment_index) || 0)));
+    const target = `${beforeScene}:${beforeSegment}`;
+    if (seenTransitionTargets.has(target)) continue;
+    const type = transitionTypes.get(String(transition.type || '').toLowerCase());
+    if (!type) continue;
+    seenTransitionTargets.add(target);
+    out.transitions.push({
+      ...transition,
+      before_scene: beforeScene,
+      before_segment_index: beforeSegment,
+      type,
+      duration_seconds: Math.max(0.25, Math.min(1.2, Number(transition.duration_seconds) || 0.6)),
+      reason: String(transition.reason || '').slice(0, 300),
+    });
+  }
+  // A hard cut remains the default. Even in a long film, transitions should
+  // punctuate true editorial turns rather than decorate every boundary.
+  const transitionCap = Math.max(1, Math.min(10, Math.floor(totalDurationSeconds / 18) || 1));
+  out.transitions = out.transitions.slice(0, transitionCap);
 
   for (const lt of plan?.lower_thirds ?? []) {
     if (!inScene(lt.scene_number) || !lt.text) continue;
@@ -324,8 +374,15 @@ router.post('/plan', async (req, res) => {
   }
 });
 
+// A pending interactive decision auto-resolves to 'stop' after this long so
+// an abandoned tab cannot leave a zombie job holding the run open forever.
+const MAP_DECISION_TIMEOUT_MS = Math.max(
+  60_000,
+  Number(process.env.MAP_DECISION_TIMEOUT_MS) || 30 * 60_000,
+);
+
 router.post('/map/start', (req, res) => {
-  const { request, durationSeconds, style, sessionId, model, models, mapId } = req.body || {};
+  const { request, durationSeconds, style, sessionId, model, models, mapId, interactive } = req.body || {};
   if (!request || !sessionId) {
     return res.status(400).json({ error: 'request and sessionId required' });
   }
@@ -333,8 +390,25 @@ router.post('/map/start', (req, res) => {
     return res.status(400).json({ error: 'invalid sessionId or mapId' });
   }
   const jobId = `map_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
-  const job = { status: 'running', log: [], trace: null, result: null, error: null };
+  const job = { status: 'running', log: [], trace: null, result: null, error: null, decision: null };
   mapJobs.set(jobId, job);
+  // Interactive mode: pause after each rendered attempt and wait for the
+  // editor's accept/continue via POST /map/decision/:jobId.
+  const onAttemptDecision = interactive
+    ? ({ option, attempt, canContinue }) => new Promise((resolve) => {
+        const timer = setTimeout(() => {
+          if (job.decision?.resolve === settle) settle('stop');
+        }, MAP_DECISION_TIMEOUT_MS);
+        const settle = (action) => {
+          clearTimeout(timer);
+          job.decision = null;
+          job.status = 'running';
+          resolve(action);
+        };
+        job.decision = { resolve: settle, optionId: option.id, attempt, canContinue, since: Date.now() };
+        job.status = 'awaiting-decision';
+      })
+    : null;
   generateMapSegment({
     request,
     durationSeconds,
@@ -356,6 +430,7 @@ router.post('/map/start', (req, res) => {
       if (job.log.length > 100) job.log.splice(0, job.log.length - 100);
     },
     onTrace: (trace) => { job.trace = trace; },
+    onAttemptDecision,
   })
     .then((result) => {
       job.status = result.status === 'needs-selection' ? 'needs-selection' : 'completed';
@@ -412,7 +487,31 @@ router.get('/map/status/:jobId', (req, res) => {
     trace: job.trace,
     result: job.result,
     error: job.error,
+    awaitingDecision: job.decision
+      ? { optionId: job.decision.optionId, attempt: job.decision.attempt, canContinue: job.decision.canContinue }
+      : null,
   });
+});
+
+/** Resolve a paused interactive map run: accept the just-rendered attempt,
+ * continue to the next attempt, or stop with retained options. */
+router.post('/map/decision/:jobId', (req, res) => {
+  const job = mapJobs.get(req.params.jobId);
+  if (!job) {
+    return res.status(410).json({ error: 'Map job is no longer available.', code: 'MAP_JOB_LOST' });
+  }
+  if (!job.decision) {
+    return res.status(409).json({ error: 'This map run is not waiting for a decision.' });
+  }
+  const action = String(req.body?.action || '');
+  if (!['accept', 'continue', 'stop'].includes(action)) {
+    return res.status(400).json({ error: "action must be 'accept', 'continue', or 'stop'" });
+  }
+  if (action === 'continue' && !job.decision.canContinue) {
+    return res.status(409).json({ error: 'No attempts remain; accept an option or stop.' });
+  }
+  job.decision.resolve(action);
+  res.json({ ok: true });
 });
 
 export default router;

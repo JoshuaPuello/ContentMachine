@@ -2,10 +2,12 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   buildMotionPromptSystem,
+  buildEditorialShotGrid,
   buildShotGrid,
   composeMotionPromptBatch,
   createFallbackMotionPromptBatch,
   loadSeedanceMotionSkill,
+  resolveEditorialTiming,
   validateMotionPromptBatch,
 } from './motionPrompts.js';
 
@@ -36,9 +38,9 @@ const authored = {
     scene_intent: 'The driller braces the wrench and the stalled engine catches.',
     primary_camera_move: 'slow 12% push toward the engine housing',
     storyboard: [
-      { shot: 1, time: '00:00–00:02', subject_action: 'He begins exactly in the source pose and tightens his grip.', camera_progression: 'The push begins almost imperceptibly.', environment_motion: 'A cable trembles.' },
-      { shot: 2, time: '00:02–00:04', subject_action: 'He turns the wrench once while keeping both boots planted.', camera_progression: 'The same push continues.', environment_motion: 'The engine shudders.' },
-      { shot: 3, time: '00:04–00:06', subject_action: 'He stops turning and holds the wrench against the housing.', camera_progression: 'The push settles.', environment_motion: 'A faint exhaust plume steadies.' },
+      { shot: 1, time: '00:00–00:02', phase: 'action', subject_action: 'He begins exactly in the source pose and tightens his grip.', camera_progression: 'The push begins almost imperceptibly.', environment_motion: 'A cable trembles.' },
+      { shot: 2, time: '00:02–00:04', phase: 'action', subject_action: 'He turns the wrench once while keeping both boots planted.', camera_progression: 'The same push continues.', environment_motion: 'The engine shudders.' },
+      { shot: 3, time: '00:04–00:06', phase: 'action', subject_action: 'He stops turning and holds the wrench against the housing.', camera_progression: 'The push settles.', environment_motion: 'A faint exhaust plume steadies.' },
     ],
     ending_state: 'The mannequin holds the wrench against the running engine in a stable frame.',
   },
@@ -48,6 +50,26 @@ test('15-second shot grid uses seven beats and absorbs the remainder', () => {
   const grid = buildShotGrid(15);
   assert.equal(grid.length, 7);
   assert.equal(grid.at(-1).label, 'SHOT 7 — 00:12–00:15');
+});
+
+test('fixed provider duration can reserve a shorter editorial action window and clean tail', () => {
+  const timedScene = { ...scene, duration_seconds: 8, target_duration: 4.5 };
+  assert.deepEqual(resolveEditorialTiming(timedScene), {
+    provider_duration_seconds: 8,
+    action_duration_seconds: 4.5,
+    clean_hold_duration_seconds: 3.5,
+    trim_after_seconds: 4.5,
+  });
+  assert.deepEqual(
+    buildEditorialShotGrid(timedScene).map(({ start, end, phase }) => [start, end, phase]),
+    [
+      [0, 2, 'action'],
+      [2, 4, 'action'],
+      [4, 4.5, 'action'],
+      [4.5, 6, 'clean_hold'],
+      [6, 8, 'clean_hold'],
+    ]
+  );
 });
 
 test('runtime system prompt inlines the project skill and mannequin contract', () => {
@@ -66,6 +88,17 @@ test('validator requires complete exact storyboard coverage', () => {
   const broken = structuredClone(authored);
   broken.video_prompt.storyboard.pop();
   assert.match(validateMotionPromptBatch([broken], [scene]).join(' '), /exactly 3 storyboard beats/i);
+});
+
+test('validator requires stable clean-hold beats after the editorial trim boundary', () => {
+  const timedScene = { ...scene, duration_seconds: 8, action_duration_seconds: 4 };
+  const fallback = createFallbackMotionPromptBatch([timedScene]);
+  assert.deepEqual(validateMotionPromptBatch(fallback, [timedScene]), []);
+
+  const broken = structuredClone(fallback[0]);
+  broken.video_prompt.storyboard[2].subject_action = 'He raises the wrench and begins another repair.';
+  const issues = validateMotionPromptBatch([broken], [timedScene]).join(' ');
+  assert.match(issues, /clean_hold introduces new action/i);
 });
 
 test('protected local fallback produces complete valid prompts for every requested unit', () => {
@@ -173,6 +206,21 @@ test('composer protects mannequin, count, wardrobe, props and stable ending', ()
   assert.match(result.full_prompt_string, /One continuous unbroken take/i);
 });
 
+test('composer exposes the trim boundary and protects the provider tail from new action', () => {
+  const timedScene = { ...scene, duration_seconds: 8, target_duration: 4 };
+  const [fallback] = createFallbackMotionPromptBatch([timedScene]);
+  const [result] = composeMotionPromptBatch([fallback], [timedScene]);
+  assert.deepEqual(result.editorial_timing, {
+    provider_duration_seconds: 8,
+    action_duration_seconds: 4,
+    clean_hold_duration_seconds: 4,
+    trim_after_seconds: 4,
+  });
+  assert.match(result.full_prompt_string, /intended usable story action is 4 seconds/i);
+  assert.match(result.full_prompt_string, /SHOT 3 — 00:04–00:06 \[CLEAN HOLD\]/);
+  assert.match(result.full_prompt_string, /add no new story action/i);
+});
+
 test('selected frame remains authoritative when scene-plan wardrobe prose conflicts', () => {
   const drillerScene = {
     ...scene,
@@ -214,6 +262,7 @@ test('long 15-second prompts preserve every shot and protected tail under provid
       storyboard: buildShotGrid(15).map(({ shot, start, end }) => ({
         shot,
         time: `00:${String(start).padStart(2, '0')}–00:${String(end).padStart(2, '0')}`,
+        phase: 'action',
         subject_action: 'The same mannequin performs one physically plausible continuation of the documented action while every locked attribute remains unchanged. '.repeat(8),
         camera_progression: 'The same restrained push advances continuously. '.repeat(8),
         environment_motion: 'One subtle existing environmental element moves. '.repeat(8),
@@ -225,6 +274,23 @@ test('long 15-second prompts preserve every shot and protected tail under provid
   assert.match(result.full_prompt_string, /SHOT 7 — 00:12–00:15/);
   assert.match(result.full_prompt_string, /STABILITY \/ NEGATIVE CONSTRAINTS/);
   assert.match(result.full_prompt_string, /One continuous unbroken take/);
+});
+
+test('long trimmed prompts preserve the editorial contract under the provider cap', () => {
+  const longScene = {
+    ...scene,
+    duration_seconds: 8,
+    target_duration: 4,
+    narration: 'Long narration '.repeat(400),
+    selected_prompt: 'Long selected frame '.repeat(400),
+    continuity_context: 'Long continuity context '.repeat(300),
+  };
+  const [fallback] = createFallbackMotionPromptBatch([longScene]);
+  const [result] = composeMotionPromptBatch([fallback], [longScene]);
+  assert.ok(result.full_prompt_string.length <= 5000);
+  assert.match(result.full_prompt_string, /EDITORIAL TIMING:/);
+  assert.match(result.full_prompt_string, /\[CLEAN HOLD\]/);
+  assert.match(result.full_prompt_string, /allow no new story action/i);
 });
 
 test('composer chains the freshly authored ending and source frame into the next unit', () => {

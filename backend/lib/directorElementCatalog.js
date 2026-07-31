@@ -67,6 +67,50 @@ export const DIRECTOR_ELEMENT_CATALOG = Object.freeze({
     silenceReason:
       'Maps remain intentionally silent by default because narration, labels, arrows, and camera movement already carry dense information. A map may author bespoke cues later only when a specific narrated event earns them.',
   },
+  'transition-cross-dissolve': {
+    label: 'Cross Dissolve',
+    sound: {
+      role: 'transition',
+      at_seconds: 0,
+      generation_duration_seconds: 1.2,
+      gain_db: -25,
+      description:
+        'One isolated premium documentary cross-dissolve accent: an extremely soft, diffuse movement of linen air that gently passes from one side to the other and disappears. Natural, warm-neutral, smooth, subtle, narration-safe, and unpitched; no impact, click, chime, riser, bass, music, electronic texture, or long reverb tail.',
+    },
+  },
+  'transition-dip-to-black': {
+    label: 'Dip to Black',
+    sound: {
+      role: 'transition',
+      at_seconds: 0,
+      generation_duration_seconds: 1.1,
+      gain_db: -24,
+      description:
+        'One isolated restrained documentary dip-to-black accent: a short low cloth-air exhale that closes softly into silence, then releases with almost no tail. Tactile, dark, elegant, subtle, and narration-safe; no boom, braam, cinematic hit, heartbeat, melody, pitch, electronic sound, or dramatic whoosh.',
+    },
+  },
+  'transition-soft-blur': {
+    label: 'Soft Blur',
+    sound: {
+      role: 'transition',
+      at_seconds: 0,
+      generation_duration_seconds: 1.3,
+      gain_db: -25,
+      description:
+        'One isolated elegant soft-blur transition accent: a delicate feathered brush of air through fine fabric, briefly widening at the midpoint before vanishing. Organic, diffuse, smooth, understated, narration-safe, and unpitched; no shimmer, sparkle, chime, interface sound, synth, music, impact, or bass.',
+    },
+  },
+  'transition-film-dissolve': {
+    label: 'Film Dissolve',
+    sound: {
+      role: 'transition',
+      at_seconds: 0,
+      generation_duration_seconds: 1.3,
+      gain_db: -24,
+      description:
+        'One isolated archival film-dissolve accent: a very quiet short movement of celluloid and soft projector cloth friction, resolving cleanly without a mechanical click. Refined, analog, dry, subtle, narration-safe, and unpitched; no projector loop, camera shutter, scratch burst, beep, melody, music, impact, or electronic texture.',
+    },
+  },
 });
 
 export function directorElementSoundDesign(kind, id = kind) {
@@ -90,6 +134,11 @@ export function directorElementSoundDesign(kind, id = kind) {
 }
 
 export function attachDirectorElementSoundDesign(plan) {
+  for (const [index, item] of (plan.transitions || []).entries()) {
+    item.id ||= `transition-${index + 1}`;
+    const kind = `transition-${item.type || 'cross-dissolve'}`;
+    item.sound_design ||= directorElementSoundDesign(kind, item.id);
+  }
   for (const [index, item] of (plan.lower_thirds || []).entries()) {
     item.id ||= `lower-third-${index + 1}`;
     item.sound_design ||= directorElementSoundDesign('lower-third', item.id);
@@ -126,6 +175,7 @@ export function attachDirectorElementSoundDesign(plan) {
 export function directorSoundDesignOwners(plan) {
   return [
     ...(plan.motion_graphics || []),
+    ...(plan.transitions || []),
     ...(plan.lower_thirds || []),
     ...(plan.date_chips || []),
     ...(plan.title_cards || []),

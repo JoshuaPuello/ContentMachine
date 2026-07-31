@@ -643,6 +643,7 @@ function SettingsDrawer({ onClose }) {
     claudeCli: false,
     vertexError: null,
     windowsWorker: null,
+    windowsImage: false,
   })
   const [validating, setValidating] = useState({})
   const [saving, setSaving] = useState(false)
@@ -652,7 +653,8 @@ function SettingsDrawer({ onClose }) {
     setProvider, setModel,
     setClaudeProvider, setClaudeModel,
     setVideoProvider, setVideoModel,
-    setVideoClipDuration, setVideoSpeedFactor, setImageVariations,
+    setVideoClipDuration, setVideoSpeedFactor, setImageVariations, setSceneSheetEnabled,
+    setWindowsImageOutputs,
     setSoundEffectsVolume, setBackgroundMusicEnabled, setBackgroundMusicVolume,
     setFilmGrainEnabled, setFilmGrainAmount,
     setAtmosphericGradeEnabled, setAtmosphericGradeAmount,
@@ -690,6 +692,7 @@ function SettingsDrawer({ onClose }) {
           ?? status.windows_worker?.configured
           ?? status.windowsWorker
           ?? null,
+        windowsImage: !!status.windowsImage,
       })
       setKeysConfigured({
         fal: !!status.fal,
@@ -816,6 +819,8 @@ function SettingsDrawer({ onClose }) {
     ? REPLICATE_IMAGE_MODELS
     : settings.imageProvider === 'vertex'
     ? VERTEX_IMAGE_MODELS
+    : settings.imageProvider === 'windows-image'
+    ? [{ value: 'extra-high', label: 'Extra High (Windows Chrome)' }]
     : GEMINI_IMAGE_MODELS
 
   return (
@@ -1085,7 +1090,7 @@ function SettingsDrawer({ onClose }) {
           <section>
             <h3 className="text-xs font-semibold text-text-disabled uppercase tracking-wider mb-3">LLM Model</h3>
             <div className="space-y-2">
-              <div className="grid grid-cols-4 gap-1.5 bg-surface-raised rounded-lg p-1">
+              <div className="grid grid-cols-5 gap-1.5 bg-surface-raised rounded-lg p-1">
                 {[
                   { id: 'fal', label: 'fal.ai', enabled: isValid('fal') },
                   { id: 'replicate', label: 'Replicate', enabled: isValid('replicate') },
@@ -1146,12 +1151,13 @@ function SettingsDrawer({ onClose }) {
           <section>
             <h3 className="text-xs font-semibold text-text-disabled uppercase tracking-wider mb-3">Image Generation</h3>
             <div className="space-y-2">
-              <div className="grid grid-cols-4 gap-1.5 bg-surface-raised rounded-lg p-1">
+              <div className="grid grid-cols-5 gap-1.5 bg-surface-raised rounded-lg p-1">
                 {[
                   { id: 'fal', label: 'fal.ai', enabled: isValid('fal') },
                   { id: 'replicate', label: 'Replicate', enabled: isValid('replicate') },
                   { id: 'gemini', label: 'Gemini', enabled: isValid('gemini') },
-                  { id: 'vertex', label: 'Vertex', enabled: envStatus.vertex }
+                  { id: 'vertex', label: 'Vertex', enabled: envStatus.vertex },
+                  { id: 'windows-image', label: 'Windows', enabled: envStatus.windowsImage },
                 ].map(p => (
                   <button key={p.id}
                     onClick={() => setProvider(p.id)}
@@ -1176,6 +1182,43 @@ function SettingsDrawer({ onClose }) {
                   Uses the GCP service accounts configured in backend/.env — billed to GCP credits, rotates accounts on rate limits.
                 </p>
               )}
+              {settings.imageProvider === 'windows-image' && (
+                <div className="rounded-lg border border-accent/20 bg-accent/[0.06] p-3">
+                  <div className="flex items-center justify-between gap-3">
+                    <div>
+                      <p className="text-[10px] font-medium text-text-primary">Alternatives per task</p>
+                      <p className="text-[9px] text-text-disabled mt-0.5">Windows returns 1–3 unique validated images.</p>
+                    </div>
+                    <select
+                      value={settings.windowsImageOutputs || 3}
+                      onChange={event => setWindowsImageOutputs(event.target.value)}
+                      className="text-xs w-20"
+                    >
+                      {[1, 2, 3].map(count => <option key={count} value={count}>{count}</option>)}
+                    </select>
+                  </div>
+                </div>
+              )}
+              <label
+                className="mt-3 flex items-start gap-3 rounded-xl border border-border bg-surface-raised/60 p-3 cursor-pointer hover:border-accent/35 transition-colors"
+                title="Groups 2–6 compatible shots into a continuity sheet. You copy the complete prompt and ordered references, generate the sheet with your preferred provider, upload it, then Content Machine expands each panel into a selectable 16:9 frame. Isolated shots continue through normal image generation."
+              >
+                <input
+                  type="checkbox"
+                  checked={!!settings.sceneSheetEnabled}
+                  onChange={event => setSceneSheetEnabled(event.target.checked)}
+                  className="mt-0.5 accent-accent"
+                />
+                <span>
+                  <span className="flex items-center gap-2 text-xs font-medium text-text-primary">
+                    Continuity scene sheets
+                    <span className="rounded-full border border-accent/30 bg-accent/10 px-1.5 py-0.5 text-[8px] uppercase tracking-wider text-accent">Experimental</span>
+                  </span>
+                  <span className="block text-[10px] text-text-disabled leading-relaxed mt-1">
+                    Author shared environments as multi-shot sheets, upload them manually, then expand and approve each panel. Hover for the full workflow.
+                  </span>
+                </span>
+              </label>
             </div>
           </section>
 

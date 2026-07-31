@@ -3,6 +3,7 @@ import test from 'node:test';
 import {
   buildCharacterReferencePrompt,
   buildCharacterSceneContext,
+  buildCharacterStoryContext,
   normalizeExtractedCharacters,
 } from './characterContinuity.js';
 
@@ -17,6 +18,24 @@ test('uses finalized narration when scene-plan narration is absent', () => {
   });
 
   assert.equal(context[0].narration, 'Karen drops the wildflowers.');
+});
+
+test('character story context excludes duplicated research payloads', () => {
+  const context = buildCharacterStoryContext({
+    id: 'story-1',
+    title: 'A complete documentary',
+    summary: 'The identity-bearing story spine.',
+    historical_sources: [{ url: 'https://example.test/source', transcript: 'very large' }],
+    research_notes: 'duplicated long-form research',
+    source_context: 'raw user material',
+  });
+
+  assert.deepEqual(context, {
+    id: 'story-1',
+    title: 'A complete documentary',
+    summary: 'The identity-bearing story spine.',
+  });
+  assert.equal(JSON.stringify(context).includes('very large'), false);
 });
 
 test('mechanically enforces the mannequin contract even when Sonnet returns a weak prompt', () => {

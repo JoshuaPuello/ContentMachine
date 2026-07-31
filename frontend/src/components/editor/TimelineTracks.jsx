@@ -12,6 +12,7 @@ const SNAP_SEC = 0.15
 const MIN_DUR = 0.5
 
 const KIND_STYLES = {
+  transition:       'bg-cyan-950/85 border-cyan-500/70',
   clip:             'bg-slate-700/70 border-slate-500/50',
   narration:        'bg-emerald-950/85 border-emerald-700/50',
   map:              'bg-red-900/70 border-red-700/60',
@@ -225,6 +226,7 @@ function PlayheadCursor({ clock, zoom, onPointerDown }) {
 function TimelineTracks({
   items, zoom, snap, duration, clock, onSeek,
   selectedId, onSelect, onOpenInspector, onMove, onResize, onDelete, onToggleMute, onToggleTrackMute,
+  onAddTransition,
 }) {
   const contentRef = useRef(null)
   // Temp position while dragging: { id, start, end, mode }
@@ -535,6 +537,17 @@ function TimelineTracks({
             >
               {audioInfo(menu.item).muted ? 'Unmute audio' : 'Mute audio'}
             </button>
+            {menu.item.kind === 'clip' && (
+              <button
+                onClick={() => {
+                  onAddTransition?.(menu.item.id)
+                  setMenu(null)
+                }}
+                className="w-full text-left px-3 py-1.5 text-xs text-text-secondary hover:bg-surface-raised hover:text-text-primary transition-colors"
+              >
+                Add transition before
+              </button>
+            )}
             <button
               onClick={() => {
                 if (!menu.item.locked) onDelete?.(menu.item.id)

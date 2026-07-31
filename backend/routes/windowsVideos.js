@@ -12,6 +12,7 @@ import {
   missingWindowsUnits,
   pauseWindowsProject,
   queueWindowsUnits,
+  regenerateWindowsUnit,
   resetWindowsRepairBudget,
   resumeWindowsProject,
   windowsStatus,
@@ -98,6 +99,34 @@ router.post('/retry-missing', async (req, res) => {
     res.json({ missing, results: missing.length ? await queueWindowsUnits(sessionId, missing) : [], status: await windowsStatus(sessionId, false) })
   } catch (error) {
     res.status(error.status || 503).json({ error: true, code: error.code || 'WINDOWS_RETRY_FAILED', message: error.message })
+  }
+})
+
+router.post('/regenerate', async (req, res) => {
+  try {
+    const sessionId = safeSession(req.body?.sessionId)
+    await requireProjectAccess(req, sessionId)
+    const unitId = String(req.body?.unitId || '')
+    await assertWindowsUnit(sessionId, unitId)
+    const result = await regenerateWindowsUnit(sessionId, unitId, {
+      prompt: req.body?.prompt,
+    })
+    if (result?.error) {
+      return res.status(400).json({
+        error: true,
+        code: result.error.code || 'WINDOWS_REGENERATE_FAILED',
+        message: result.error.message,
+        retryable: result.error.retryable !== false,
+      })
+    }
+    return res.status(202).json({ result, status: await windowsStatus(sessionId, false) })
+  } catch (error) {
+    return res.status(error.status || 503).json({
+      error: true,
+      code: error.code || 'WINDOWS_REGENERATE_FAILED',
+      message: error.message,
+      retryable: error.retryable !== false,
+    })
   }
 })
 

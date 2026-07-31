@@ -5,6 +5,7 @@ import { usePipelineStore } from '../store/pipelineStore'
 import ImageCard from '../components/ImageCard'
 import ImageModal from '../components/ImageModal'
 import ExportModal from '../components/ExportModal'
+import SceneSheetWorkspace from '../components/SceneSheetWorkspace'
 import {
   areAllSelectableImageUnitsSelected,
   selectableImageUnitCount,
@@ -192,6 +193,8 @@ function SceneImages() {
   const [currentPage, setCurrentPage] = useState(0)
   const [showExportModal, setShowExportModal] = useState(false)
   const [characterEditor, setCharacterEditor] = useState(null)
+  const [showCharacterLibrary, setShowCharacterLibrary] = useState(true)
+  const [expandingAllSceneSheets, setExpandingAllSceneSheets] = useState(false)
   const allImagesCompleteToastedRef = useRef(false)
   const autoStartRef = useRef(false)
 
@@ -211,6 +214,7 @@ function SceneImages() {
     generationPhase,
     imageProgress,
     imageBatches,
+    sceneSheetWorkflow,
     settings,
     characters,
     characterSceneLinks,
@@ -235,6 +239,20 @@ function SceneImages() {
     retryImageBatch,
     fetchScenePlan,
     regenerateAllImages,
+    prepareSceneSheets,
+    refreshSceneSheets,
+    uploadSceneSheet,
+    generateWindowsSceneSheet,
+    refreshWindowsSceneSheet,
+    selectWindowsSceneSheetOption,
+    expandSceneSheet,
+    selectSceneSheetPanel,
+    selectAllExpandedSceneSheetPanels,
+    resetToImages,
+    videoPrompts,
+    videoJobs,
+    selectedVideos,
+    timeline,
   } = usePipelineStore()
 
   // scenes = one entry per (scene, segment) unit; selection is per unit
@@ -249,6 +267,49 @@ function SceneImages() {
   const imagesCompleteCount = Object.values(images).filter(img => img?.url && !img?.error).length
   const imagesTotalCount = scenes.reduce((sum, s) => sum + (s.prompts?.length ?? 0), 0)
   const allImagesComplete = imagesTotalCount > 0 && imagesCompleteCount === imagesTotalCount
+  const sceneSheetGroups = sceneSheetWorkflow?.groups || []
+  const pendingSceneSheetGroups = sceneSheetGroups
+    .map(group => ({
+      group,
+      ordinals: (group.panels || [])
+        .filter(panel => !(panel.expandedUrl || panel.expanded_url))
+        .map(panel => panel.ordinal),
+    }))
+    .filter(entry => entry.ordinals.length > 0)
+  const pendingSceneSheetPanelCount = pendingSceneSheetGroups
+    .reduce((sum, entry) => sum + entry.ordinals.length, 0)
+  const expandableSceneSheetGroups = pendingSceneSheetGroups
+    .filter(({ group }) => Boolean(group.sheetUrl || group.sheet_url))
+  const expandableSceneSheetPanelCount = expandableSceneSheetGroups
+    .reduce((sum, entry) => sum + entry.ordinals.length, 0)
+  const sceneSheetPlanFinalized = sceneSheetWorkflow != null
+    && !['not-planned', 'planning', 'failed'].includes(sceneSheetWorkflow.status)
+  const sceneSheetsReady = !settings.sceneSheetEnabled
+    || (sceneSheetPlanFinalized && pendingSceneSheetPanelCount === 0)
+  const allExpandedSheetFramesSelected = !settings.sceneSheetEnabled || sceneSheetGroups.every(group => (
+    (group.panels || []).every(panel => (
+      selectedImages[panel.unitId]?.sceneSheetGroupId === group.id
+      && selectedImages[panel.unitId]?.url === (panel.expandedUrl || panel.expanded_url)
+    ))
+  ))
+  const imagesReadyForVideos = allSelected && sceneSheetsReady && allExpandedSheetFramesSelected
+
+  const expandEveryPendingSceneSheetPanel = async () => {
+    if (expandingAllSceneSheets || !expandableSceneSheetGroups.length) return
+    setExpandingAllSceneSheets(true)
+    try {
+      // Keep workflow-token mutations sequential while each backend request
+      // may internally use the configured Vertex account pool.
+      for (const { group, ordinals } of expandableSceneSheetGroups) {
+        await expandSceneSheet(group.id, ordinals)
+      }
+      toast.success('Every scene-sheet panel is expanded and ready for review')
+    } catch (error) {
+      toast.error(error.response?.data?.message || error.message)
+    } finally {
+      setExpandingAllSceneSheets(false)
+    }
+  }
 
   // Redirect to home if no story selected — must be in useEffect, not render body,
   // to avoid calling navigate() during React 18 concurrent render
@@ -300,11 +361,17 @@ function SceneImages() {
   }, [allImagesComplete])
 
   // Pagination — only active when scenes exceed threshold
-  const totalPages = Math.ceil(scenes.length / SCENES_PER_PAGE)
-  const isPaginated = scenes.length > 80
-  const visibleScenes = isPaginated
-    ? scenes.slice(currentPage * SCENES_PER_PAGE, (currentPage + 1) * SCENES_PER_PAGE)
+  const isolatedSheetUnits = settings.sceneSheetEnabled && sceneSheetWorkflow
+    ? new Set(sceneSheetWorkflow.isolatedUnitIds || sceneSheetWorkflow.isolated_unit_ids || [])
+    : null
+  const standardFlowScenes = isolatedSheetUnits
+    ? scenes.filter(scene => isolatedSheetUnits.has(`${scene.scene_number}_${scene.segment_index ?? 0}`))
     : scenes
+  const totalPages = Math.ceil(standardFlowScenes.length / SCENES_PER_PAGE)
+  const isPaginated = standardFlowScenes.length > 80
+  const visibleScenes = isPaginated
+    ? standardFlowScenes.slice(currentPage * SCENES_PER_PAGE, (currentPage + 1) * SCENES_PER_PAGE)
+    : standardFlowScenes
 
   // Group per-segment units under their parent scene for display
   const groupedScenes = (() => {
@@ -385,9 +452,11 @@ function SceneImages() {
             </div>
           )}
 
-          {characterError && (
+          {(characterError || characterStatus === 'error') && (
             <div className="mb-5 p-4 rounded-xl border border-error/30 bg-error/10">
-              <p className="text-sm text-error">{characterError}</p>
+              <p className="text-sm text-error">
+                {characterError || 'Character preparation did not complete. Your project is safe; retry the continuity pass.'}
+              </p>
               <button onClick={() => prepareCharacters()} className="btn-secondary mt-3 text-xs px-3 py-1.5">Retry character preparation</button>
             </div>
           )}
@@ -619,6 +688,10 @@ function SceneImages() {
   const totalDuration = scenePlan?.total_duration_seconds || 0
   const durationMinutes = Math.floor(totalDuration / 60)
   const durationSeconds = totalDuration % 60
+  const hasDownstreamWork = videoPrompts.length > 0
+    || Object.keys(videoJobs || {}).length > 0
+    || Object.keys(selectedVideos || {}).length > 0
+    || !!timeline?.built
 
   return (
     <motion.div
@@ -637,6 +710,22 @@ function SceneImages() {
           </div>
 
           <div className="flex items-center gap-3">
+            {hasDownstreamWork && (
+              <button
+                onClick={async () => {
+                  if (!confirm('Reset this project to Images? This preserves story, audio, characters, prompts, scene sheets, and images, but permanently removes videos, editor work, thumbnails, and renders.')) return
+                  const pending = toast.loading('Safely resetting downstream work…')
+                  try {
+                    await resetToImages()
+                    toast.success('Project reset to Images', { id: pending })
+                  } catch (error) {
+                    toast.error(error.response?.data?.error || error.message, { id: pending })
+                  }
+                }}
+                className="btn-secondary px-3 py-1.5 text-xs"
+                title="Preserve everything through Images and remove downstream video/editor/render work"
+              >Reset downstream</button>
+            )}
             {/* Progress bar */}
             {imageProgress.total > 0 && (
               <div className="flex items-center gap-2">
@@ -691,6 +780,89 @@ function SceneImages() {
 
       {/* Scene grid */}
       <div className="max-w-6xl mx-auto p-8 space-y-10">
+
+        {characters.length > 0 && (
+          <section className="rounded-2xl border border-border bg-surface/70 overflow-hidden">
+            <button
+              type="button"
+              onClick={() => setShowCharacterLibrary(value => !value)}
+              className="w-full p-5 flex items-center justify-between gap-4 text-left bg-gradient-to-r from-accent/[0.07] to-transparent"
+              aria-expanded={showCharacterLibrary}
+            >
+              <div>
+                <p className="text-[10px] uppercase tracking-[0.2em] text-accent">Character continuity</p>
+                <h2 className="text-base font-semibold text-text-primary mt-1">
+                  Recurring cast · {characters.length}
+                </h2>
+                <p className="text-xs text-text-secondary mt-1">
+                  These approved references remain attached to the project and are supplied to every linked scene.
+                </p>
+              </div>
+              <span className="text-xs text-text-secondary shrink-0">
+                {showCharacterLibrary ? 'Hide characters' : 'View characters'}
+              </span>
+            </button>
+            {showCharacterLibrary && (
+              <div className="p-5 grid sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4 border-t border-border">
+                {characters.map(character => (
+                  <article key={character.id} className="rounded-xl border border-border bg-black/15 overflow-hidden">
+                    <a
+                      href={character.image || undefined}
+                      target="_blank"
+                      rel="noreferrer"
+                      className={`block aspect-[3/4] bg-black/35 ${character.image ? '' : 'pointer-events-none'}`}
+                      title={character.image ? `Open ${character.name} reference` : undefined}
+                    >
+                      {character.image
+                        ? <img src={character.image} alt={character.name} className="w-full h-full object-cover" />
+                        : <div className="w-full h-full grid place-items-center text-xs text-text-disabled">Reference unavailable</div>}
+                    </a>
+                    <div className="p-3">
+                      <div className="flex items-start justify-between gap-2">
+                        <div className="min-w-0">
+                          <h3 className="text-sm font-semibold text-text-primary truncate">{character.name}</h3>
+                          <p className="text-[9px] uppercase tracking-wider text-accent mt-0.5 line-clamp-2">{character.role}</p>
+                        </div>
+                        <span className="text-[9px] text-text-disabled shrink-0">{character.importance}</span>
+                      </div>
+                      <p className="text-[11px] text-text-secondary leading-relaxed mt-2 line-clamp-3">{character.description}</p>
+                      <div className="flex items-center justify-between gap-2 mt-3">
+                        <span className="text-[9px] text-text-disabled">
+                          {(character.scene_numbers || []).length} linked scene{(character.scene_numbers || []).length === 1 ? '' : 's'}
+                        </span>
+                        <button
+                          onClick={() => regenerateCharacter(character.id, character.visual_prompt, 1, false)
+                            .catch(error => toast.error(error.message))}
+                          disabled={character.generating}
+                          className="btn-secondary px-2.5 py-1 text-[10px] disabled:opacity-40"
+                        >
+                          {character.generating ? 'Generating…' : 'Regenerate'}
+                        </button>
+                      </div>
+                      {character.error && <p className="text-[10px] text-error mt-2">{character.error}</p>}
+                    </div>
+                  </article>
+                ))}
+              </div>
+            )}
+          </section>
+        )}
+
+        {settings.sceneSheetEnabled && (
+          <SceneSheetWorkspace
+            workflow={sceneSheetWorkflow}
+            selectedImages={selectedImages}
+            onPlan={prepareSceneSheets}
+            onRefresh={refreshSceneSheets}
+            onUpload={uploadSceneSheet}
+            onGenerateWindows={generateWindowsSceneSheet}
+            onRefreshWindows={refreshWindowsSceneSheet}
+            onSelectWindowsOption={selectWindowsSceneSheetOption}
+            onExpand={expandSceneSheet}
+            onSelect={selectSceneSheetPanel}
+            onSelectAllExpanded={selectAllExpandedSceneSheetPanels}
+          />
+        )}
 
         {/* Prompt batches still writing or failed — without this the grid
             silently shows a partial story (only the batches that finished) */}
@@ -1004,7 +1176,7 @@ function SceneImages() {
             >
               Replan Shots from Audio
             </button>
-            <button
+            {!settings.sceneSheetEnabled && <button
               onClick={async () => {
                 if (regeneratingAll) return
                 setRegeneratingAll(true)
@@ -1033,7 +1205,7 @@ function SceneImages() {
                   <span>Regenerate All</span>
                 </>
               )}
-            </button>
+            </button>}
             <button
               onClick={() => setShowExportModal(true)}
               disabled={imagesCompleteCount === 0}
@@ -1041,13 +1213,49 @@ function SceneImages() {
             >
               Export Project
             </button>
-            <button
-              onClick={() => navigate('/videos')}
-              disabled={!allSelected}
-              className="btn-primary px-6 py-2 disabled:opacity-40 disabled:cursor-not-allowed"
-            >
-              Continue to Videos →
-            </button>
+            {settings.sceneSheetEnabled && !sceneSheetsReady && (
+              <button
+                onClick={expandEveryPendingSceneSheetPanel}
+                disabled={
+                  expandingAllSceneSheets
+                  || expandableSceneSheetPanelCount === 0
+                }
+                title={expandableSceneSheetPanelCount > 0
+                  ? 'Expand every currently uploaded panel; sheets awaiting upload remain pending'
+                  : 'Upload at least one pending scene sheet before expanding panels'}
+                className="btn-primary px-5 py-2 disabled:opacity-40 disabled:cursor-not-allowed"
+              >
+                {expandingAllSceneSheets
+                  ? 'Expanding all panels…'
+                  : `Expand all available (${expandableSceneSheetPanelCount})`}
+              </button>
+            )}
+            {sceneSheetsReady ? (
+              <button
+                onClick={() => navigate('/videos')}
+                disabled={!imagesReadyForVideos}
+                title={imagesReadyForVideos
+                  ? 'Continue to video generation'
+                  : !allExpandedSheetFramesSelected
+                    ? 'Use the latest expanded frame for every scene-sheet shot first'
+                    : 'Select one approved image for every shot first'}
+                className="btn-primary px-6 py-2 disabled:opacity-40 disabled:cursor-not-allowed"
+              >
+                Continue to Videos →
+              </button>
+            ) : (
+              <button
+                disabled
+                title={sceneSheetWorkflow?.status === 'planning'
+                  ? 'Wait for every parallel Sonnet planning chunk to finish'
+                  : 'Every scene-sheet panel must be expanded before continuing'}
+                className="btn-primary px-6 py-2 opacity-40 cursor-not-allowed"
+              >
+                {sceneSheetWorkflow?.status === 'planning'
+                  ? 'Continue · planning scene sheets'
+                  : `Continue · ${pendingSceneSheetPanelCount} panels pending`}
+              </button>
+            )}
           </div>
         </div>
       </div>

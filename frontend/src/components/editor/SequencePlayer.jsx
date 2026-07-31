@@ -1,5 +1,7 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { PreviewEngine, planClips } from '../../lib/previewEngine'
+import { transitionDefinition } from '../../lib/transitionLibrary'
+import AgenticMotionGraphicPreview from './AgenticMotionGraphicPreview'
 
 // ─── SequencePlayer ──────────────────────────────────────────────────────────
 // Preview of the studio timeline. React renders structure only: a pool of
@@ -10,8 +12,8 @@ import { PreviewEngine, planClips } from '../../lib/previewEngine'
 // automation — lives in lib/previewEngine. Continuous time flows through the
 // external preview clock; React state changes only at discrete moments
 // (seek, play/pause, end), so the editor tree does not re-render per frame.
-// Overlays are approximations of the final render; full fidelity stays the
-// render's job.
+// Motion graphics use the renderer's fixed 1920x1080 contract. Other overlays
+// share the same normalized timing and geometry rules as their render peers.
 
 const SERIF = { fontFamily: "'Cormorant Garamond', Georgia, serif" }
 
@@ -128,11 +130,20 @@ function ChapterPanel({ item, t }) {
 }
 
 // ── Map: plays the real MP4; simple maps open as an inset card ──
+// Split choreography constants — mirror the renderer's mapSplitProgress
+// (22 enter / 26 exit frames at 30fps) so the preview matches the render.
+export const MAP_SPLIT_ENTER_S = 22 / 30
+export const MAP_SPLIT_EXIT_S = 26 / 30
+export function mapSplitProgressAt(local, dur) {
+  return smooth(local / MAP_SPLIT_ENTER_S) * smooth((dur - local) / MAP_SPLIT_EXIT_S)
+}
+
 function MapLayer({ item, t, registerMedia }) {
   const local = t - item.startTime
   const dur = item.endTime - item.startTime
   const src = item.payload?.src || null
-  const inset = item.payload?.presentation === 'inset'
+  const presentation = item.payload?.presentation || 'split'
+  const inset = presentation === 'inset'
 
   // Inset choreography mirrors the renderer: card in 0.47s, hold to 2.8s,
   // expand over 0.8s to full frame.
@@ -144,9 +155,10 @@ function MapLayer({ item, t, registerMedia }) {
   const w0 = 58
   const left = (100 - w0 - 6) * (1 - e)
   const width = w0 + (100 - w0) * e
+  const sourceStart = Number(item.payload?.sourceStart) || 0
   const mediaRef = useCallback(
-    element => registerMedia(item.id, element, item.startTime),
-    [item.id, item.startTime, registerMedia]
+    element => registerMedia(item.id, element, item.startTime - sourceStart),
+    [item.id, item.startTime, sourceStart, registerMedia]
   )
 
   const media = src ? (
@@ -167,6 +179,52 @@ function MapLayer({ item, t, registerMedia }) {
       </span>
     </div>
   )
+
+  if (presentation === 'split') {
+    // The clip stage narrows in lockstep (SplitStageDriver); the map panel
+    // slides in from the right so both edges meet at the seam.
+    const p = mapSplitProgressAt(local, dur)
+    if (p <= 0.001) return null
+    return (
+      <div className="absolute inset-0 pointer-events-none" style={{ zIndex: OVERLAY_Z.map }}>
+        <div
+          className="absolute inset-y-0 right-0 overflow-hidden bg-black"
+          style={{
+            width: '50%',
+            transform: `translateX(${(1 - p) * 100}%)`,
+            borderLeft: '2px solid rgba(236,228,210,0.28)',
+            boxShadow: '-18px 0 40px rgba(0,0,0,0.45)',
+          }}
+        >
+          {media}
+        </div>
+      </div>
+    )
+  }
+
+  if (presentation === 'corner') {
+    const enter = smooth(local / 0.4)
+    return (
+      <div className="absolute inset-0 pointer-events-none" style={{ zIndex: OVERLAY_Z.map }}>
+        <div
+          className="absolute overflow-hidden bg-black"
+          style={{
+            top: '4.5%',
+            right: '4%',
+            width: '31%',
+            aspectRatio: '16 / 9',
+            opacity: enter * fadeOut,
+            transform: `translateY(${(1 - enter) * -10}px)`,
+            borderRadius: 8,
+            border: '1px solid rgba(236,228,210,0.5)',
+            boxShadow: '0 14px 40px rgba(0,0,0,0.5)',
+          }}
+        >
+          {media}
+        </div>
+      </div>
+    )
+  }
 
   if (!inset) {
     return (
@@ -200,108 +258,16 @@ function MapLayer({ item, t, registerMedia }) {
 
 function MotionGraphicLayer({ item, t }) {
   const spec = item.payload?.spec || {}
-  const composition = spec.composition || {}
-  const content = composition.content || {}
-  const elements = content.elements || []
-  const background = composition.background || {}
-  const layout = composition.layout || {}
   const local = t - item.startTime
   const duration = item.endTime - item.startTime
-  const inP = smooth(local / Math.min(0.7, duration * 0.14))
-  const outP = clamp01((duration - local) / Math.min(0.65, duration * 0.14))
-  const accent = background.accent || '#d94b43'
-  const secondary = background.secondary || '#58b7aa'
-  const isTakeover = spec.presentation === 'takeover'
-  const reverse = !!layout.reverse_order || layout.focus_side === 'left'
-  const copyTokens = `${content.title || ''} ${content.body || ''}`.toLowerCase().replace(/[–—-]/g, ' ').split(/\W+/).filter(Boolean)
-  const labelTokens = String(content.primary_label || '').toLowerCase().replace(/[–—-]/g, ' ').split(/\W+/).filter(Boolean)
-  const repeatsPrimary = !!content.primary_value && (
-    copyTokens.includes(String(content.primary_value).toLowerCase())
-    || (labelTokens.length > 0 && labelTokens.filter(token => copyTokens.includes(token)).length / labelTokens.length >= 0.65)
-  )
-  const minimal = layout.archetype === 'minimal' || repeatsPrimary
-  const mode = background.mode || (isTakeover ? 'editorial-gradient' : 'footage-dim')
-  const bg = mode === 'archival-paper'
-    ? 'linear-gradient(125deg, rgba(37,31,24,.96), rgba(11,10,9,.94))'
-    : mode === 'soft-atmosphere'
-      ? `radial-gradient(circle at 20% 20%, ${accent}44, transparent 38%), linear-gradient(130deg, rgba(19,17,22,.96), rgba(7,9,13,.94))`
-      : mode === 'technical-grid' || mode === 'spatial-field'
-        ? `radial-gradient(circle at 78% 24%, ${secondary}33, transparent 34%), linear-gradient(135deg, rgba(4,12,17,.97), rgba(7,8,12,.95))`
-        : `radial-gradient(circle at 78% 24%, ${secondary}26, transparent 34%), linear-gradient(125deg, rgba(4,6,10,.94), rgba(8,10,15,.86))`
-
   return (
-    <div
-      className="absolute inset-0 overflow-hidden"
-      style={{ zIndex: OVERLAY_Z['motion-graphic'], opacity: inP * outP }}
-    >
-      <div className="absolute inset-0" style={{ background: bg, opacity: isTakeover ? 1 : (background.opacity ?? 0.68) }} />
-      {(mode === 'technical-grid' || mode === 'spatial-field') && (
-        <div
-          className="absolute inset-0 opacity-10"
-          style={{
-            backgroundImage: 'linear-gradient(rgba(255,255,255,.12) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,.1) 1px, transparent 1px)',
-            backgroundSize: '38px 38px',
-          }}
-        />
-      )}
-      <div
-        className={`absolute inset-[7%] grid gap-[6%] items-center ${reverse ? '[direction:rtl]' : ''}`}
-        style={{ gridTemplateColumns: minimal ? '1fr' : '0.9fr 1.1fr' }}
-      >
-        {minimal ? (
-          <div
-            className={`[direction:ltr] w-[58%] min-w-0 border border-white/20 border-l-[3px] rounded-xl p-[6%] shadow-2xl ${layout.focus_side === 'right' ? 'justify-self-end' : 'justify-self-start'}`}
-            style={{
-              borderLeftColor: accent,
-              background: 'linear-gradient(145deg, rgba(20,24,31,.70), rgba(8,10,14,.50))',
-              backdropFilter: 'blur(18px) saturate(.82)',
-            }}
-          >
-            {content.eyebrow && <p className="text-[9px] uppercase tracking-[.22em] font-semibold mb-2" style={{ color: accent }}>{content.eyebrow}</p>}
-            <h2 style={SERIF} className="text-white text-[clamp(22px,3.2vw,44px)] leading-[1.02] text-balance">{content.title || spec.intent}</h2>
-            {(content.primary_value || content.primary_label) && (
-              <div className="mt-4 pt-3 border-t border-white/10 flex items-baseline gap-3">
-                <p style={SERIF} className="text-white text-[clamp(44px,8vw,90px)] leading-none">{content.primary_value}</p>
-                <p style={{ ...SERIF, color: accent }} className="text-[clamp(13px,1.8vw,21px)] leading-tight">{content.primary_label}</p>
-              </div>
-            )}
-          </div>
-        ) : (
-          <>
-            <div className="[direction:ltr] min-w-0">
-              {content.eyebrow && <p className="text-[9px] uppercase tracking-[.22em] font-semibold mb-2" style={{ color: accent }}>{content.eyebrow}</p>}
-              <h2 style={SERIF} className="text-white text-[clamp(20px,3vw,42px)] leading-[1.02] text-balance">{content.title || spec.intent}</h2>
-              {content.body && <p style={SERIF} className="text-white/55 text-[clamp(10px,1.3vw,16px)] leading-relaxed mt-3 line-clamp-4">{content.body}</p>}
-            </div>
-            <div
-              className="[direction:ltr] min-w-0 border border-white/20 rounded-xl p-[7%] shadow-2xl"
-              style={{
-                background: 'linear-gradient(145deg, rgba(20,24,31,.70), rgba(8,10,14,.50))',
-                backdropFilter: 'blur(18px) saturate(.82)',
-              }}
-            >
-              {content.primary_value ? (
-                <>
-                  <p style={SERIF} className="text-white text-[clamp(48px,9vw,110px)] leading-none">{content.primary_value}</p>
-                  <p style={{ ...SERIF, color: accent }} className="text-[clamp(13px,2vw,22px)] mt-2">{content.primary_label}</p>
-                </>
-              ) : (
-                <div className={`grid gap-2 ${elements.length > 2 ? 'grid-cols-2' : 'grid-cols-1'}`}>
-                  {elements.slice(0, 6).map((element, index) => {
-                    const p = smooth((local - 0.35 - index * 0.22) / 0.55)
-                    return (
-                      <div key={element.id || index} className="border-l-2 bg-white/[.035] px-3 py-2 min-w-0" style={{ borderColor: element.accent || (index % 2 ? secondary : accent), opacity: p, transform: `translateY(${(1 - p) * 7}px)` }}>
-                        <p style={SERIF} className="text-white text-lg leading-none truncate">{element.value || element.title}</p>
-                        <p className="text-white/50 text-[8px] uppercase tracking-wider mt-1 truncate">{element.label || element.title}</p>
-                      </div>
-                    )
-                  })}
-                </div>
-              )}
-            </div>
-          </>
-        )}
-      </div>
+    <div className="absolute inset-0 overflow-hidden" style={{ zIndex: OVERLAY_Z['motion-graphic'] }}>
+      <AgenticMotionGraphicPreview
+        spec={spec}
+        frame={Math.max(0, Math.round(local * 30))}
+        durationInFrames={Math.max(1, Math.round(duration * 30))}
+        fps={30}
+      />
     </div>
   )
 }
@@ -428,6 +394,35 @@ function OverlayLayer({ item, t, items, registerMedia }) {
   }
 }
 
+// ── Split stage driver ──
+// Narrows the clip-video wrapper during split-map windows without ever
+// re-rendering the pool: subscribes to the clock and writes style.width
+// imperatively, matching MapLayer's slide-in curve frame for frame.
+function SplitStageDriver({ items, clock, stageRef }) {
+  useEffect(() => {
+    const apply = (t) => {
+      const stage = stageRef.current
+      if (!stage) return
+      let p = 0
+      for (const item of items) {
+        if (item.kind !== 'map') continue
+        if ((item.payload?.presentation || 'split') !== 'split') continue
+        if (!item.payload?.src) continue
+        if (t < item.startTime || t >= item.endTime) continue
+        p = Math.max(p, mapSplitProgressAt(t - item.startTime, item.endTime - item.startTime))
+      }
+      const width = `${100 - 50 * p}%`
+      if (stage.style.width !== width) stage.style.width = width
+    }
+    apply(clock.get())
+    let latest = clock.get()
+    const unsubscribe = clock.subscribe(time => { latest = time })
+    const interval = setInterval(() => apply(latest), 33)
+    return () => { unsubscribe(); clearInterval(interval) }
+  }, [items, clock, stageRef])
+  return null
+}
+
 // ── Overlay stage ──
 // The only part of the player that re-renders continuously — and only while
 // its content actually changes. It subscribes to the preview clock and
@@ -454,9 +449,15 @@ function OverlayStage({ items, clock, registerMedia }) {
       .sort((a, b) => OVERLAY_Z[a.kind] - OVERLAY_Z[b.kind]),
     [items, t])
 
-  // Dip-to-black transition beat around dip clip starts.
+  // Dip-to-black transition beat around the exact authored boundary.
   let dipOpacity = 0
   for (const i of items) {
+    if (i.kind === 'transition' && transitionDefinition(i.payload?.type).renderType === 'dip') {
+      const half = Math.max(0.1, (i.endTime - i.startTime) / 2)
+      const d = Math.abs(t - i.startTime)
+      if (d < half) dipOpacity = Math.max(dipOpacity, 1 - d / half)
+      continue
+    }
     if (i.kind !== 'clip' || i.payload?.transitionIn !== 'dip') continue
     const d = Math.abs(t - i.startTime)
     if (d < 0.17) dipOpacity = Math.max(dipOpacity, 1 - d / 0.17)
@@ -571,6 +572,7 @@ function SequencePlayer({
   backgroundMusicVolume = 1,
   filmTreatment = { grain: 0.32, atmosphere: 0.42, vignette: 0.70 },
 }) {
+  const clipStageRef = useRef(null)
   const slotARef = useRef(null)
   const slotBRef = useRef(null)
   const slotCRef = useRef(null)
@@ -690,10 +692,15 @@ function SequencePlayer({
       onClick={() => onPlayingChange(!playing)}
     >
       {/* Picture pool: three stacked decoders; the engine flips visibility at
-          cuts so the on-screen element never reloads its src mid-play. */}
-      <video ref={slotARef} className={poolVideoClass} style={{ zIndex: 1, opacity: 0 }} playsInline preload="auto" />
-      <video ref={slotBRef} className={poolVideoClass} style={{ zIndex: 0, opacity: 0 }} playsInline preload="auto" />
-      <video ref={slotCRef} className={poolVideoClass} style={{ zIndex: 0, opacity: 0 }} playsInline preload="auto" />
+          cuts so the on-screen element never reloads its src mid-play. The
+          wrapper narrows during split-map windows (object-fit cover keeps the
+          footage centered in its panel), mirroring the renderer. */}
+      <div ref={clipStageRef} className="absolute inset-y-0 left-0 overflow-hidden" style={{ width: '100%' }}>
+        <video ref={slotARef} className={poolVideoClass} style={{ zIndex: 1, opacity: 0 }} playsInline preload="auto" />
+        <video ref={slotBRef} className={poolVideoClass} style={{ zIndex: 0, opacity: 0 }} playsInline preload="auto" />
+        <video ref={slotCRef} className={poolVideoClass} style={{ zIndex: 0, opacity: 0 }} playsInline preload="auto" />
+      </div>
+      <SplitStageDriver items={items} clock={clock} stageRef={clipStageRef} />
 
       {/* Cinema overlays (time-driven approximations of the render) */}
       <OverlayStage items={items} clock={clock} registerMedia={registerMedia} />

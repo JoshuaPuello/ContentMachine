@@ -189,7 +189,7 @@ const isBlockedNetworkAddress = (address) => {
     || inIpv6Range(normalized, '2001:db8::', 32)
 }
 
-const assertPublicImageHost = async (hostname) => {
+export const assertPublicImageHost = async (hostname) => {
   const normalized = String(hostname || '')
     .toLowerCase()
     .replace(/^\[|\]$/g, '')
@@ -205,7 +205,7 @@ const assertPublicImageHost = async (hostname) => {
   }
 }
 
-const readBoundedResponse = async (response, maxBytes) => {
+export const readBoundedResponse = async (response, maxBytes) => {
   const declaredLength = Number(response.headers.get('content-length'))
   if (Number.isFinite(declaredLength) && declaredLength > maxBytes) {
     throw new Error('Selected image exceeds the 50 MiB limit')
@@ -231,7 +231,7 @@ const readBoundedResponse = async (response, maxBytes) => {
   return Buffer.concat(chunks, received)
 }
 
-const loadImageBytes = async (reference, sessionId) => {
+export const loadImageBytes = async (reference, sessionId) => {
   const data = decodeDataUri(reference)
   if (data) return data
   const local = localSessionPath(reference, sessionId)
@@ -266,10 +266,22 @@ export const buildWindowsPrompt = (prompt) => {
   // 5,000-character budget and can reject an otherwise valid prompt. Preserve
   // every constraint, but include an identical block only once.
   const negativeBlock = negative ? `Avoid: ${negative}` : ''
-  const combined = negativeBlock && !full.includes(negativeBlock)
+  let combined = negativeBlock && !full.includes(negativeBlock)
     ? `${full}\n\n${negativeBlock}`
     : full
-  if (combined.length > 5000) throw new Error(`Windows/Veo prompt is ${combined.length} characters; maximum is 5000`)
+  const generationRevision = Math.max(0, Number(prompt?.generation_revision) || 0)
+  if (generationRevision > 0) {
+    // The revision must alter the immutable broker fingerprint, but it must not
+    // consume the quality prompt's remaining provider budget. All creative and
+    // continuity constraints are already present above.
+    combined += `\n\nTAKE REVISION: ${generationRevision}.`
+  }
+  if (combined.length > 5000) {
+    const error = new Error(`Windows/Veo prompt is ${combined.length} characters; maximum is 5000`)
+    error.code = 'WINDOWS_PROMPT_TOO_LONG'
+    error.retryable = false
+    throw error
+  }
   return combined
 }
 
@@ -301,14 +313,28 @@ export const snapshotWindowsInput = async (project, sessionId, unitId) => {
 const extensionFor = (contentType) => contentType === 'image/png' ? 'png' : contentType === 'image/webp' ? 'webp' : 'jpg'
 
 const uploadSnapshot = async (sessionId, unitId, snapshot) => {
-  const session = await mediaBroker.createInputSession({
+  const request = {
     projectId: sessionId,
     itemId: unitId,
     fileName: `source.${extensionFor(snapshot.contentType)}`,
     contentType: snapshot.contentType,
     sizeBytes: snapshot.sizeBytes,
     sha256: snapshot.sha256,
-  })
+  }
+  let session
+  try {
+    session = await mediaBroker.createInputSession(request)
+  } catch (error) {
+    // Older reset-to-images code incorrectly sent deleteAssets=true to the
+    // broker. Recover only this still-live canonical session, then retry the
+    // exact immutable input once. Authentication and producer ownership are
+    // enforced by the broker's reactivation route.
+    if (error.code !== 'TASK_CANCELED' || !/producer project was deleted/i.test(error.message)) {
+      throw error
+    }
+    await mediaBroker.reactivateProject(sessionId)
+    session = await mediaBroker.createInputSession(request)
+  }
   if (!session.alreadyExists) await mediaBroker.uploadInput(session, snapshot.bytes)
   return session.objectKey
 }
@@ -449,6 +475,69 @@ export const queueWindowsUnits = async (sessionId, requestedUnitIds) => {
       return { unitId, error: { code: error.code || 'QUEUE_FAILED', message: error.message, retryable: error.retryable !== false } }
     }
   })
+}
+
+export const regenerateWindowsUnit = async (sessionId, unitId, options = {}) => {
+  if (!validSessionId(sessionId)) throw new Error('A valid sessionId is required')
+  if (!/^\d+_\d+$/.test(String(unitId || ''))) throw new Error('A valid unitId is required')
+  let taskToCancel = null
+  let generationRevision = 0
+  await withSessionMutationLock(sessionId, async () => {
+    const project = await readSessionSnapshot(sessionId)
+    const promptRecord = findPrompt(project, unitId)
+    if (!promptRecord) throw new Error(`Unknown video unit ${unitId}`)
+    const replacementPrompt = String(options.prompt || '').trim()
+    if (replacementPrompt) promptRecord.full_prompt_string = replacementPrompt
+    promptRecord.generation_revision = Math.max(
+      0,
+      Number(promptRecord.generation_revision) || 0,
+    ) + 1
+    generationRevision = promptRecord.generation_revision
+
+    const state = await readWindowsState(sessionId)
+    const previous = state.jobs[unitId]
+    if (previous?.taskId && ACTIVE_STATUSES.has(previous.status)) {
+      taskToCancel = previous.taskId
+    }
+    if (previous?.url) {
+      project.video_history ||= {}
+      const history = project.video_history[unitId] || []
+      if (!history.some(entry => entry?.url === previous.url)) {
+        history.push({
+          url: previous.url,
+          prompt: previous.promptSnapshot || buildWindowsPrompt(promptRecord),
+          provider: WINDOWS_PROVIDER,
+          completedAt: previous.completedAt || previous.updatedAt || null,
+        })
+      }
+      project.video_history[unitId] = history
+    }
+
+    delete state.jobs[unitId]
+    project.video_jobs ||= {}
+    project.video_jobs[unitId] = {
+      unitId,
+      provider: WINDOWS_PROVIDER,
+      adapter: WINDOWS_ADAPTER,
+      status: 'queued',
+      url: null,
+      error: null,
+      generationRevision: promptRecord.generation_revision,
+      updatedAt: new Date().toISOString(),
+    }
+    await writeWindowsState(sessionId, state)
+    await writeSessionSnapshot(sessionId, project)
+  })
+
+  if (taskToCancel) {
+    await mediaBroker.cancelTask(
+      taskToCancel,
+      sessionId,
+      'Superseded by explicit Content Machine regeneration',
+    ).catch(() => {})
+  }
+  const [result] = await queueWindowsUnits(sessionId, [String(unitId)])
+  return { ...result, generationRevision }
 }
 
 const currentSnapshotMatches = async (project, sessionId, unitId, job) => {
@@ -688,8 +777,30 @@ const invalidateStaleCompletedJobs = async (sessionId) => {
       job.status = 'superseded'
       job.error = { code: 'STALE_INPUT', message: 'The selected image, prompt, or Windows settings changed after this video completed', retryable: false }
       job.updatedAt = new Date().toISOString()
+      for (const field of [
+        'url',
+        'objectKey',
+        'etag',
+        'sizeBytes',
+        'sha256',
+        'durationSeconds',
+        'width',
+        'height',
+        'fps',
+        'videoCodec',
+        'hasAudio',
+        'completedAt',
+      ]) {
+        delete job[field]
+      }
       project.video_jobs ||= {}
       project.video_jobs[unitId] = resolvedJob(job)
+      // Editorial selection is valid only for the exact image/prompt/settings
+      // fingerprint that produced it. Never let a stale selected MP4 reach the
+      // timeline or final render after its source image changes.
+      if (project.selected_videos?.[unitId]) {
+        delete project.selected_videos[unitId]
+      }
       changed = true
     }
     if (changed) {

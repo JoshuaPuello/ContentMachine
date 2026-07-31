@@ -109,6 +109,42 @@ export function normalizeFilmTreatment(value) {
   };
 }
 
+export function applyStudioTransitions(clips, items, fps = FPS, onLog = () => {}) {
+  const typeOf = (value) => ({
+    'cross-dissolve': 'crossfade', crossfade: 'crossfade',
+    'dip-to-black': 'dip', dip: 'dip',
+    'soft-blur': 'blur-dissolve', 'blur-dissolve': 'blur-dissolve',
+    'film-dissolve': 'film-dissolve',
+  })[String(value || '').toLowerCase()] || null;
+  const toFrames = seconds => Math.round(seconds * fps);
+  for (const item of items.filter(candidate => candidate.kind === 'transition')) {
+    const type = typeOf(item.payload?.type);
+    if (!type) continue;
+    const toClip = clips.find(clip => clip.studioItemId === item.payload?.toClipId)
+      || clips.find(clip => Math.abs(clip.startFrame - toFrames(item.startTime)) <= 1);
+    if (!toClip) {
+      onLog(`transition ${item.id} skipped: incoming clip no longer exists`);
+      continue;
+    }
+    const fromClip = clips.find(clip => clip.studioItemId === item.payload?.fromClipId)
+      || [...clips]
+        .filter(clip => clip.startFrame < toClip.startFrame)
+        .sort((a, b) => b.startFrame - a.startFrame)[0];
+    const transitionFrames = Math.max(6, toFrames(item.endTime - item.startTime));
+    toClip.transitionIn = type;
+    toClip.transitionDurationInFrames = transitionFrames;
+    if (fromClip && type !== 'dip') {
+      fromClip.durationInFrames = Math.max(
+        fromClip.durationInFrames,
+        toClip.startFrame - fromClip.startFrame + transitionFrames
+      );
+    }
+    onLog(`transition ${item.id}: ${type} · ${transitionFrames} frames`);
+  }
+  for (const clip of clips) delete clip.studioItemId;
+  return clips;
+}
+
 // Remove transient Remotion staging owned by a deleted ContentMachine project.
 // Job ids include the session id, so cleanup remains possible after a backend
 // restart even though the in-memory jobs map has been lost.
@@ -223,6 +259,7 @@ async function buildMasterTimeline(
   const overlays = [];
   let mediaIdx = 0;
 
+
   for (const item of studio.items) {
     const start = toFrames(item.startTime);
     const dur = Math.max(1, toFrames(item.endTime - item.startTime));
@@ -231,6 +268,7 @@ async function buildMasterTimeline(
         const name = `clip_${String(mediaIdx++).padStart(3, '0')}.${extOf(item.payload.src, 'mp4')}`;
         await stageAsset(resolveMediaRef(item.payload.src, sessionId), workDir, name, job);
         clips.push({
+          studioItemId: item.id,
           src: rel(name),
           startFrame: start,
           durationInFrames: dur,
@@ -294,9 +332,15 @@ async function buildMasterTimeline(
           src: rel(name),
           startFrame: start,
           durationInFrames: dur,
-          ...(item.payload.presentation ? { presentation: item.payload.presentation } : {}),
+          // Same default as the editor preview: split unless the editor
+          // explicitly chose another mode — full-frame is never implicit.
+          presentation: item.payload.presentation || 'split',
           ...(Number.isFinite(item.payload.insetFrames)
             ? { insetFrames: Math.round(item.payload.insetFrames) }
+            : {}),
+          // Editor's source-window trim: which stretch of the map video plays.
+          ...(Number(item.payload.sourceStart) > 0
+            ? { sourceStartFrames: Math.round(Number(item.payload.sourceStart) * FPS) }
             : {}),
         });
         break;
@@ -370,6 +414,11 @@ async function buildMasterTimeline(
           durationInFrames: dur,
         });
         break;
+      case 'transition':
+        // First-class editorial transition. It is applied to its exact clip
+        // pair after all media have been staged, so item ordering cannot
+        // change the result.
+        break;
       default:
         job.log.push(`skipping unknown item kind ${item.kind}`);
     }
@@ -402,6 +451,8 @@ async function buildMasterTimeline(
       );
     }
   }
+
+  applyStudioTransitions(clips, studio.items, FPS, line => job.log.push(line));
 
   for (const bed of music) {
     const bedEnd = bed.startFrame + (bed.durationInFrames || 0);

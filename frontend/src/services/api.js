@@ -9,6 +9,24 @@ const api = axios.create({
 })
 
 const sessionCache = new Map()
+const wait = (milliseconds) => new Promise(resolve => setTimeout(resolve, milliseconds))
+
+const awaitWindowsImageTask = async (sessionId, itemId) => {
+  const deadline = Date.now() + 45 * 60 * 1000
+  while (Date.now() < deadline) {
+    const { job } = await api.get(
+      `/images/windows/status/${encodeURIComponent(sessionId)}/${encodeURIComponent(itemId)}`,
+    ).then(response => response.data)
+    if (job.status === 'complete') return job
+    if (job.status === 'failed') {
+      const error = new Error(job.error?.message || 'Windows image generation failed')
+      error.code = job.error?.code
+      throw error
+    }
+    await wait(4000)
+  }
+  throw new Error('Windows image generation is still running; reopen the project to resume its durable task')
+}
 
 const fetchSession = (sessionId, { force = false, optional = false } = {}) => {
   if (force) sessionCache.delete(sessionId)
@@ -129,9 +147,52 @@ const exportedApi = {
   generateThumbnailPrompts: (story, selectedTitle, thumbnailConcept, provider = 'fal', model, systemPrompt) =>
     api.post('/claude/thumbnail-prompts', { story, selectedTitle, thumbnailConcept, provider, model, systemPrompt: systemPrompt || undefined }).then(r => r.data),
   
-  generateImages: (prompts, provider, model, aspectRatio, characterImages, characterDescription, characterReference) => {
+  generateImages: async (
+    prompts,
+    provider,
+    model,
+    aspectRatio,
+    characterImages,
+    characterDescription,
+    characterReference,
+    windowsContext,
+  ) => {
     const charImgs = characterImages?.filter(Boolean) ?? []
     console.log('API generateImages request:', { promptCount: prompts?.length, provider, model, aspectRatio, charImgCount: charImgs.length, characterDescription: characterDescription || '(none)' })
+    if (provider === 'windows-image') {
+      if (!windowsContext?.sessionId || windowsContext.itemIds?.length !== prompts.length) {
+        throw new Error('Windows image generation requires stable project and item IDs')
+      }
+      const queued = await api.post('/images/windows/generate', {
+        sessionId: windowsContext.sessionId,
+        items: prompts.map((prompt, index) => ({
+          itemId: windowsContext.itemIds[index],
+          prompt,
+        })),
+        aspectRatio,
+        characterImages: charImgs,
+        characterDescription,
+        outputCount: windowsContext.outputCount || 1,
+        retry: !!windowsContext.retry,
+      }).then(response => response.data)
+      return Promise.all(queued.map(async (entry, index) => {
+        if (entry.error) return { prompt: prompts[index], url: null, error: entry.error }
+        try {
+          const job = entry.job?.status === 'complete'
+            ? entry.job
+            : await awaitWindowsImageTask(windowsContext.sessionId, entry.itemId)
+          return {
+            prompt: prompts[index],
+            url: job.outputs?.[0]?.url || null,
+            alternatives: job.outputs || [],
+            taskId: job.taskId,
+            error: job.outputs?.length ? null : 'Windows returned no image outputs',
+          }
+        } catch (error) {
+          return { prompt: prompts[index], url: null, error: error.message }
+        }
+      }))
+    }
     return api.post('/images/generate', {
       prompts,
       provider,
@@ -153,7 +214,27 @@ const exportedApi = {
     })
   },
   
-  regenerateImage: (prompt, provider, model, aspectRatio, characterImages, characterDescription) => {
+  regenerateImage: (
+    prompt,
+    provider,
+    model,
+    aspectRatio,
+    characterImages,
+    characterDescription,
+    windowsContext,
+  ) => {
+    if (provider === 'windows-image') {
+      return exportedApi.generateImages(
+        [prompt],
+        provider,
+        model,
+        aspectRatio,
+        characterImages,
+        characterDescription,
+        null,
+        windowsContext,
+      ).then(results => results[0])
+    }
     const charImgs = characterImages?.filter(Boolean) ?? []
     console.log('API regenerateImage request:', { provider, model, aspectRatio, charImgCount: charImgs.length, characterDescription: characterDescription || '(none)' })
     return api.post('/images/regenerate', {
@@ -168,6 +249,23 @@ const exportedApi = {
       return r.data
     })
   },
+
+  generateWindowsSceneSheet: (sessionId, groupId, outputCount, writeToken, retry = false) =>
+    api.post(`/scene-sheets/${encodeURIComponent(sessionId)}/${encodeURIComponent(groupId)}/windows/generate`, {
+      outputCount,
+      writeToken,
+      retry,
+    }).then(r => r.data),
+
+  getWindowsSceneSheetStatus: (sessionId, groupId) =>
+    api.get(`/scene-sheets/${encodeURIComponent(sessionId)}/${encodeURIComponent(groupId)}/windows/status`)
+      .then(r => r.data),
+
+  selectWindowsSceneSheetOption: (sessionId, groupId, ordinal, writeToken) =>
+    api.post(`/scene-sheets/${encodeURIComponent(sessionId)}/${encodeURIComponent(groupId)}/windows/select`, {
+      ordinal,
+      writeToken,
+    }).then(r => r.data),
   
   generateVideos: (scenes, provider = 'fal', resolution = '1080p', aspectRatio = '16:9', videoModel, sessionId) =>
     api.post('/videos/generate', { scenes, provider, resolution, aspectRatio, videoModel, sessionId }).then(r => r.data),
@@ -191,7 +289,8 @@ const exportedApi = {
     negativePrompt,
     motionPromptVersion,
     sourceFrameLocked,
-    sessionId
+    sessionId,
+    timing = {}
   ) =>
     api.post('/videos/regenerate', {
       scene_number: sceneNumber,
@@ -200,6 +299,11 @@ const exportedApi = {
       motion_prompt_version: motionPromptVersion,
       source_frame_locked: sourceFrameLocked,
       duration_seconds: durationSeconds,
+      target_duration: timing.target_duration,
+      action_duration_seconds: timing.action_duration_seconds,
+      editorial_duration_seconds: timing.editorial_duration_seconds,
+      clip_duration: timing.clip_duration,
+      playback_rate: timing.playback_rate,
       image_url: imageUrl,
       provider,
       resolution,
@@ -232,6 +336,11 @@ const exportedApi = {
 
   retryMissingWindowsVideos: (sessionId, unitIds, sessionToken) =>
     api.post(WINDOWS_VIDEO_API_ROUTES.retryMissing, { sessionId, unitIds }, {
+      headers: { 'X-Content-Machine-Session-Token': sessionToken },
+    }).then(r => r.data),
+
+  regenerateWindowsVideo: (sessionId, unitId, prompt, sessionToken) =>
+    api.post(WINDOWS_VIDEO_API_ROUTES.regenerate, { sessionId, unitId, prompt }, {
       headers: { 'X-Content-Machine-Session-Token': sessionToken },
     }).then(r => r.data),
 
@@ -330,6 +439,41 @@ exportedApi.renameSession = (sessionId, name) =>
     return r.data
   })
 
+exportedApi.resetSessionToImages = (sessionId, writeToken) =>
+  api.post(`/session/${encodeURIComponent(sessionId)}/reset-to-images`, {
+    writeToken,
+  }, { timeout: 300000 }).then(r => {
+    sessionCache.delete(sessionId)
+    return r.data
+  })
+
+// Scene-sheet workflow: the backend owns the uploaded sheet, crops, expansion
+// assets, and canonical workflow state. The browser only orchestrates review.
+exportedApi.planSceneSheets = (sessionId, writeToken) =>
+  api.post('/scene-sheets/plan', { sessionId, writeToken }, { timeout: 1000000 })
+    .then(r => r.data)
+
+exportedApi.getSceneSheets = (sessionId) =>
+  api.get(`/scene-sheets/${encodeURIComponent(sessionId)}`).then(r => r.data)
+
+exportedApi.uploadSceneSheet = (sessionId, groupId, file, writeToken) => {
+  const form = new FormData()
+  form.append('file', file)
+  if (writeToken) form.append('writeToken', writeToken)
+  return api.post(
+    `/scene-sheets/${encodeURIComponent(sessionId)}/${encodeURIComponent(groupId)}/upload`,
+    form,
+    { timeout: 300000 }
+  ).then(r => r.data)
+}
+
+exportedApi.expandSceneSheet = (sessionId, groupId, panelOrdinals, writeToken) =>
+  api.post(
+    `/scene-sheets/${encodeURIComponent(sessionId)}/${encodeURIComponent(groupId)}/expand`,
+    { writeToken, panelOrdinals },
+    { timeout: 1000000 }
+  ).then(r => r.data)
+
 // ─── Director (cinema placement plan + map segments) ─────────────────────────
 
 exportedApi.directorPlan = (payload) =>
@@ -343,6 +487,9 @@ exportedApi.directorMapStart = (payload) =>
 
 exportedApi.directorMapStatus = (jobId) =>
   api.get(`/director/map/status/${jobId}`).then(r => r.data)
+
+exportedApi.directorMapDecision = (jobId, action) =>
+  api.post(`/director/map/decision/${jobId}`, { action }).then(r => r.data)
 
 exportedApi.directorMapHistory = (sessionId, mapId) =>
   api.get(`/director/map/history/${encodeURIComponent(sessionId)}/${encodeURIComponent(mapId)}`).then(r => r.data)

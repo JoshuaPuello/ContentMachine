@@ -88,6 +88,56 @@ export function buildShotGrid(durationSeconds) {
   }));
 }
 
+const finitePositive = (value) => {
+  const number = Number(value);
+  return Number.isFinite(number) && number > 0 ? number : null;
+};
+
+const roundTenth = (value) => Math.round(value * 10) / 10;
+
+/**
+ * Separates the provider's generated duration from the portion intended for the
+ * final edit. Fixed-duration providers can still author a fast 3–6 second beat:
+ * the story action finishes inside the editorial window and the unused tail is
+ * a stable continuation that can be trimmed without cutting through motion.
+ */
+export function resolveEditorialTiming(scene = {}) {
+  const providerDuration = Math.max(2, roundTenth(finitePositive(scene.duration_seconds) || 6));
+  const requestedActionDuration = [
+    scene.action_duration_seconds,
+    scene.usable_duration_seconds,
+    scene.editorial_duration_seconds,
+    scene.target_duration,
+  ].map(finitePositive).find(value => value !== null);
+  const actionDuration = roundTenth(Math.min(providerDuration, requestedActionDuration || providerDuration));
+  const hasCleanTail = actionDuration < providerDuration;
+  return {
+    provider_duration_seconds: providerDuration,
+    action_duration_seconds: actionDuration,
+    clean_hold_duration_seconds: roundTenth(providerDuration - actionDuration),
+    trim_after_seconds: hasCleanTail ? actionDuration : null,
+  };
+}
+
+export function buildEditorialShotGrid(scene = {}) {
+  const timing = resolveEditorialTiming(scene);
+  const baseGrid = buildShotGrid(timing.provider_duration_seconds);
+  const boundaries = new Set(baseGrid.flatMap(({ start, end }) => [start, end]));
+  if (timing.clean_hold_duration_seconds > 0) boundaries.add(timing.action_duration_seconds);
+  const sorted = [...boundaries].sort((a, b) => a - b);
+  return sorted.slice(0, -1).map((start, index) => {
+    const end = sorted[index + 1];
+    const phase = start >= timing.action_duration_seconds ? 'clean_hold' : 'action';
+    return {
+      shot: index + 1,
+      start,
+      end,
+      phase,
+      label: `SHOT ${index + 1} — ${secondsLabel(start)}–${secondsLabel(end)}${phase === 'clean_hold' ? ' [CLEAN HOLD]' : ' [ACTION WINDOW]'}`,
+    };
+  });
+}
+
 const compact = (value, max = 900) => {
   const normalized = String(value || '').replace(/\s+/g, ' ').trim();
   if (normalized.length <= max) return normalized;
@@ -111,7 +161,8 @@ ${loadSeedanceMotionSkill()}
 - PORCELAIN IS VISUAL ONLY: every mannequin represents a living human and must move with natural human biomechanics. Use believable center of gravity, weight transfer, balance, planted feet, joint arcs, reach, grip, inertia, anticipation, follow-through, and recovery. Respect age, build, injury, terrain, clothing, and carried weight. Never choreograph toy-like, robotic, puppet-like, statue-like, stiff display-mannequin, sliding, floating, weightless, or mechanically repeated motion.
 - Preserve the source-frame figure count, silhouettes, porcelain tones, sculpted/painted hair, complete clothing, footwear, accessories, props, composition, lighting, and environment.
 - Choose exactly ONE restrained primary camera move. Never combine moves into a showcase.
-- Write exactly one continuous take on the supplied two-second shot grid. No internal cuts, angle swaps, montages, teleports, transformations, or new entities.
+- Write exactly one continuous take on the supplied timed beat grid. No internal cuts, angle swaps, montages, teleports, transformations, or new entities.
+- Treat provider duration and editorial action duration as different contracts. Complete the essential visible action inside the ACTION WINDOW, front-loaded enough to survive a trim. After that boundary, introduce no new story action: maintain a composed CLEAN HOLD with only natural settling and continuous existing atmosphere.
 - The scene narration and description define what matters. Choreograph concrete actions and object interactions that directly illustrate them.
 - ContentMachine supplies narration separately: no dialogue, lip-sync instructions, subtitles, captions, labels, UI, or generated text.
 - Return every requested scene_number + segment_index exactly once. Return JSON only.
@@ -120,10 +171,18 @@ ${creative ? `## PROJECT CREATIVE DIRECTION\nApply this only when it does not co
 }
 
 export function buildMotionPromptUserContent(sceneData, { useSegments = true, repairIssues = [] } = {}) {
-  const prepared = sceneData.map((scene) => ({
-    ...scene,
-    required_shot_grid: buildShotGrid(scene.duration_seconds).map((shot) => shot.label),
-  }));
+  const prepared = sceneData.map((scene) => {
+    const editorialTiming = resolveEditorialTiming(scene);
+    return {
+      ...scene,
+      editorial_timing: editorialTiming,
+      required_shot_grid: buildEditorialShotGrid(scene).map((shot) => ({
+        shot: shot.shot,
+        time: `${secondsLabel(shot.start)}–${secondsLabel(shot.end)}`,
+        phase: shot.phase,
+      })),
+    };
+  });
   const repairBlock = repairIssues.length > 0
     ? `\n\nYOUR PREVIOUS RESPONSE WAS REJECTED. Correct every issue:\n- ${repairIssues.join('\n- ')}`
     : '';
@@ -137,6 +196,9 @@ ${segmentInstruction}
 
 HUMAN-MOTION REQUIREMENT:
 Porcelain describes appearance only. Choreograph every represented person exactly like a real human body. Each subject_action must include physically credible weight, balance, foot contact, joint coordination, reach, grip, effort, and timing appropriate to the action. Never describe movement as mannequin-like, robotic, puppet-like, doll-like, statue-like, sliding, floating, weightless, or mechanically stiff.
+
+EDITORIAL PACING REQUIREMENT:
+duration_seconds is the provider output length, not a command to stretch one action across the whole clip. editorial_timing.action_duration_seconds is the usable story window. Start meaningful motion immediately, deliver the visible payoff before that boundary, and use every later clean_hold beat only for natural deceleration into the same stable pose. A clean_hold beat must add no gesture, reaction, prop interaction, camera reveal, or new story information. It exists so an editor can trim the provider tail cleanly.
 
 SCENES:
 ${JSON.stringify(prepared, null, 2)}${repairBlock}
@@ -155,6 +217,7 @@ Return ONLY this JSON array:
         {
           "shot": 1,
           "time": "00:00–00:02",
+          "phase": "action",
           "subject_action": "Concrete physical action beginning exactly from the selected frame, with natural human biomechanics, weight transfer, balance, joint coordination, and object resistance",
           "camera_progression": "How the single primary move advances during this beat",
           "environment_motion": "One subtle physically plausible secondary motion, or none"
@@ -169,7 +232,7 @@ Return ONLY this JSON array:
   }
 ]
 
-The storyboard array MUST contain exactly the supplied required_shot_grid entries, in order, with matching shot numbers and time strings. Do not emit full_prompt_string; the server composes protected locks around your motion specification.`;
+The storyboard array MUST contain exactly the supplied required_shot_grid entries, in order, with matching shot numbers, time strings, and phase values. In clean_hold entries, describe only a stable continuation after the action is already complete. Do not emit full_prompt_string; the server composes protected locks around your motion specification.`;
 }
 
 export function coerceVideoPromptArray(parsed) {
@@ -278,7 +341,7 @@ export function validateMotionPromptBatch(items, sceneData) {
     if (!compact(motion.ending_state, 500)) {
       issues.push(`Unit ${key} has no ending_state.`);
     }
-    const expectedGrid = buildShotGrid(scene.duration_seconds);
+    const expectedGrid = buildEditorialShotGrid(scene);
     const storyboard = Array.isArray(motion.storyboard) ? motion.storyboard : [];
     if (storyboard.length !== expectedGrid.length) {
       issues.push(`Unit ${key} needs exactly ${expectedGrid.length} storyboard beats; received ${storyboard.length}.`);
@@ -293,8 +356,25 @@ export function validateMotionPromptBatch(items, sceneData) {
       if (normalizeTime(beat.time) !== expectedTime) {
         issues.push(`Unit ${key} shot ${expected.shot} must use ${secondsLabel(expected.start)}–${secondsLabel(expected.end)}.`);
       }
+      if (beat.phase !== expected.phase) {
+        issues.push(`Unit ${key} shot ${expected.shot} must use phase ${expected.phase}.`);
+      }
       if (!compact(beat.subject_action, 700)) {
         issues.push(`Unit ${key} shot ${expected.shot} has no subject_action.`);
+      }
+      if (expected.phase === 'clean_hold') {
+        const holdText = [
+          beat.subject_action,
+          beat.camera_progression,
+          beat.environment_motion,
+        ].filter(Boolean).join(' ');
+        if (!/\b(?:hold(?:s|ing)?|held|stable|still|settle(?:s|d|ing)?|remain(?:s|ed|ing)?|rest(?:s|ed|ing)?|stop(?:s|ped|ping)?|complete(?:s|d)?|no new)\b/i.test(holdText)) {
+          issues.push(`Unit ${key} shot ${expected.shot} clean_hold must describe a stable trimmable tail.`);
+        }
+        const newAction = holdText.match(/\b(?:begins?|starts?|initiates?|raises?|lifts?|reaches?|grabs?|turns?|walks?|runs?|opens?|closes?|reveals?|reacts?|gestures?|strikes?|throws?|enters?|exits?)\b/i);
+        if (newAction) {
+          issues.push(`Unit ${key} shot ${expected.shot} clean_hold introduces new action: ${newAction[0]}.`);
+        }
       }
     });
   }
@@ -309,18 +389,25 @@ export function validateMotionPromptBatch(items, sceneData) {
 // better than leaving a project permanently stranded on an empty Videos page.
 export function createFallbackMotionPromptBatch(sceneData, reason = '') {
   return (sceneData || []).map((scene) => {
-    const storyboard = buildShotGrid(scene.duration_seconds).map(({ shot, start, end }, index, grid) => {
+    const editorialTiming = resolveEditorialTiming(scene);
+    const storyboard = buildEditorialShotGrid(scene).map(({ shot, start, end, phase }, index, grid) => {
       const isFirst = index === 0;
       const isLast = index === grid.length - 1;
+      const isHold = phase === 'clean_hold';
       return {
         shot,
         time: `${secondsLabel(start)}–${secondsLabel(end)}`,
-        subject_action: isFirst
+        phase,
+        subject_action: isHold
+          ? 'The completed pose remains in a composed stable hold; grounded balance and grip stay unchanged while only minute natural settling continues, with no new action.'
+          : isFirst
           ? 'Every visible subject begins in the exact source-frame pose; natural human weight, balance, and joint coordination initiate only the smallest physically plausible motion already implied by frame zero.'
           : isLast
             ? 'The restrained action settles through natural human deceleration, weight transfer, and balance recovery while every visible subject and prop finishes in a composed stable hold.'
             : 'The same visible subjects continue one minimal action with natural human biomechanics, grounded weight, coordinated joints, and believable object resistance without changing identity, count, wardrobe, or props.',
-        camera_progression: isLast
+        camera_progression: isHold
+          ? 'The same camera position remains stable for a clean editorial trim.'
+          : isLast
           ? 'The same near-locked documentary drift eases to a complete stop.'
           : 'The same near-locked documentary drift advances almost imperceptibly.',
         environment_motion: 'Only atmosphere or practical light already visible in frame may shift subtly and continuously.',
@@ -332,13 +419,14 @@ export function createFallbackMotionPromptBatch(sceneData, reason = '') {
       scene_number: scene.scene_number,
       segment_index: scene.segment_index ?? 0,
       duration_seconds: scene.duration_seconds,
+      editorial_timing: editorialTiming,
       authoring_source: 'protected-local-fallback',
       authoring_warning: compact(reason, 500) || undefined,
       video_prompt: {
         scene_intent: 'Preserve the selected frame while the documented beat advances through restrained motion performed with natural human biomechanics; porcelain remains a visual surface treatment only.',
         primary_camera_move: 'near-locked documentary drift at 10% intensity',
         storyboard,
-        ending_state: 'Every source-frame subject, garment, prop, and environmental feature remains intact as motion settles into a clean stable hold.',
+        ending_state: `Every source-frame subject, garment, prop, and environmental feature remains intact as the essential action completes by ${secondsLabel(editorialTiming.action_duration_seconds)} and motion settles into a clean stable hold.`,
       },
       continuity_notes: {
         source_frame_authority: 'The selected image remains immutable frame zero and controls all visible identities, objects, styling, and composition.',
@@ -388,6 +476,7 @@ const limitPrompt = (head, tail, maxChars = MOTION_PROMPT_MAX_CHARS) => {
 
 function composeProtectedPrompt(scene, item, handoff = {}) {
   const motion = item.video_prompt || {};
+  const editorialTiming = resolveEditorialTiming(scene);
   const details = scene.mannequin_details || {};
   const count = Number.isFinite(Number(details.count)) ? Math.max(0, Math.round(Number(details.count))) : null;
   const props = Array.isArray(scene.environment?.key_props)
@@ -435,9 +524,14 @@ function composeProtectedPrompt(scene, item, handoff = {}) {
     'CAMERA:',
     `Exactly one restrained primary move at 10–15% intensity: ${safeMotionText(motion.primary_camera_move, scene.camera_intent || 'near-locked documentary drift', 140)}. Do not layer a second move.`,
     '',
-    `STORYBOARD / SHOT LIST — 00:00–${secondsLabel(Math.max(2, Math.round(Number(scene.duration_seconds) || 6)))}:`,
+    'EDITORIAL TIMING:',
+    editorialTiming.clean_hold_duration_seconds > 0
+      ? `The provider generates ${editorialTiming.provider_duration_seconds} seconds, but the intended usable story action is ${editorialTiming.action_duration_seconds} seconds. Start the meaningful action immediately and complete its payoff by ${secondsLabel(editorialTiming.action_duration_seconds)}. From that exact boundary through ${secondsLabel(editorialTiming.provider_duration_seconds)}, add no new story action; preserve the completed pose and composition as a clean stable tail that may be trimmed.`
+      : `Use the full ${editorialTiming.provider_duration_seconds}-second provider output. Begin meaningful motion immediately, complete the action without padding, and finish on a composed stable frame.`,
+    '',
+    `STORYBOARD / SHOT LIST — 00:00–${secondsLabel(editorialTiming.provider_duration_seconds)}:`,
     ...(motion.storyboard || []).flatMap((beat, index) => {
-      const expected = buildShotGrid(scene.duration_seconds)[index];
+      const expected = buildEditorialShotGrid(scene)[index];
       return [
         expected?.label || `SHOT ${index + 1}`,
         [
@@ -453,6 +547,10 @@ function composeProtectedPrompt(scene, item, handoff = {}) {
   ].filter((line) => line !== '').join('\n');
 
   const tail = [
+    ...(editorialTiming.clean_hold_duration_seconds > 0 ? [
+      'EDITORIAL TRIM CONTRACT:',
+      `The essential action is complete by ${secondsLabel(editorialTiming.action_duration_seconds)}. After that boundary, allow no new story action and maintain the completed composition as a [CLEAN HOLD] through ${secondsLabel(editorialTiming.provider_duration_seconds)}.`,
+    ] : []),
     ...(previousSelectedFrame || previousEndingState ? [
       'CONTINUITY HANDOFF:',
       previousSelectedFrame ? `Previous selected-frame reference: ${previousSelectedFrame}` : '',
@@ -482,6 +580,7 @@ export function composeMotionPromptBatch(items, sceneData) {
       scene_number: scene.scene_number,
       segment_index: scene.segment_index ?? 0,
       duration_seconds: scene.duration_seconds,
+      editorial_timing: resolveEditorialTiming(scene),
       motion_prompt_version: 'seedance-2-0-v1',
       source_frame_locked: true,
       negative_prompt: BASE_NEGATIVE_CONSTRAINTS.join(', '),

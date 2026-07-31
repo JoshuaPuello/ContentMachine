@@ -17,10 +17,27 @@ function ImageModal({
   onNext,
   positionLabel,
 }) {
-  // Build full version list: history entries + current (latest)
+  // Build full version list: history + provider alternatives + current. Keep
+  // the current selection last so the existing "latest" behavior is stable.
   const allVersions = useMemo(() => {
-    const current = image?.url ? [{ url: image.url, prompt: image.prompt }] : []
-    return [...history, ...current]
+    const candidates = [
+      ...history,
+      ...(image?.alternatives || []).map(option => ({
+        url: option.url,
+        prompt: option.prompt || image?.prompt,
+        ordinal: option.ordinal,
+      })),
+      ...(image?.url ? [{ url: image.url, prompt: image.prompt }] : []),
+    ]
+    const seen = new Set()
+    const unique = []
+    for (let index = candidates.length - 1; index >= 0; index -= 1) {
+      const candidate = candidates[index]
+      if (!candidate?.url || seen.has(candidate.url)) continue
+      seen.add(candidate.url)
+      unique.unshift(candidate)
+    }
+    return unique
   }, [history, image])
 
   // Start viewing the latest version

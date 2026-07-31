@@ -55,6 +55,7 @@ function EditorTimeline() {
     buildTimeline,
     runDirector,
     addTimelineItem,
+    addTransitionBeforeClip,
     deleteTimelineItem,
     moveTimelineItem,
     resizeTimelineItem,
@@ -243,9 +244,15 @@ function EditorTimeline() {
   }
 
   const openInspector = useCallback((id) => {
+    const item = usePipelineStore.getState().timeline.items.find(candidate => candidate.id === id)
+    if (item?.kind === 'transition') {
+      // Land inside the live blend so changing library options produces an
+      // immediate, truthful preview instead of opening on a finished frame.
+      seek(item.startTime + Math.min(0.18, (item.endTime - item.startTime) * 0.35))
+    }
     setSelectedId(id)
     setInspectorOpen(true)
-  }, [])
+  }, [seek])
 
   const deleteFromTracks = useCallback((id) => {
     deleteTimelineItem(id)
@@ -583,6 +590,7 @@ function EditorTimeline() {
             onDelete={deleteFromTracks}
             onToggleMute={toggleItemMute}
             onToggleTrackMute={setTimelineTrackMuted}
+            onAddTransition={addTransitionBeforeClip}
           />
         </div>
 

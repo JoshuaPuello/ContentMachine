@@ -7,10 +7,13 @@
 import {
   S3Client,
   PutObjectCommand,
+  GetObjectCommand,
+  HeadObjectCommand,
   DeleteObjectCommand,
   ListObjectsV2Command,
   DeleteObjectsCommand,
 } from '@aws-sdk/client-s3';
+import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { randomUUID } from 'crypto';
 import { createReadStream } from 'fs';
 
@@ -88,6 +91,72 @@ export const projectR2AssetUrl = (sessionId, relativePath, mimeType = 'image/jpe
   return `${publicUrl}/${projectR2AssetKey(sessionId, relativePath, mimeType)}`;
 };
 
+export const createProjectR2DownloadUrl = async (
+  sessionId,
+  relativePath,
+  mimeType = 'image/png',
+  expiresInSeconds = 4 * 60 * 60,
+) => {
+  const { client, bucketName } = getClient();
+  if (!client) throw new Error('R2 storage is not configured in backend/.env');
+  const key = projectR2AssetKey(sessionId, relativePath, mimeType);
+  const url = await getSignedUrl(client, new GetObjectCommand({
+    Bucket: bucketName,
+    Key: key,
+  }), { expiresIn: expiresInSeconds });
+  return { key, url, expiresAt: new Date(Date.now() + expiresInSeconds * 1000).toISOString() };
+};
+
+export const createProjectR2UploadUrl = async (
+  sessionId,
+  relativePath,
+  mimeType = 'image/png',
+  expiresInSeconds = 4 * 60 * 60,
+) => {
+  const { client, bucketName, publicUrl } = getClient();
+  if (!client) throw new Error('R2 storage is not configured in backend/.env');
+  const key = projectR2AssetKey(sessionId, relativePath, mimeType);
+  // The image worker discovers the actual PNG/JPEG/WebP result only after
+  // generation. Do not sign a Content-Type header the native upload cannot
+  // know at task submission time.
+  const url = await getSignedUrl(client, new PutObjectCommand({
+    Bucket: bucketName,
+    Key: key,
+  }), { expiresIn: expiresInSeconds });
+  return {
+    key,
+    url,
+    publicUrl: `${publicUrl}/${key}`,
+    expiresAt: new Date(Date.now() + expiresInSeconds * 1000).toISOString(),
+  };
+};
+
+export const readProjectR2Object = async (
+  sessionId,
+  relativePath,
+  mimeType = 'image/png',
+) => {
+  const { client, bucketName } = getClient();
+  if (!client) throw new Error('R2 storage is not configured in backend/.env');
+  const key = projectR2AssetKey(sessionId, relativePath, mimeType);
+  const head = await sendR2Command(client, new HeadObjectCommand({
+    Bucket: bucketName,
+    Key: key,
+  }), 'R2 object validation');
+  const response = await sendR2Command(client, new GetObjectCommand({
+    Bucket: bucketName,
+    Key: key,
+  }), 'R2 object download');
+  const bytes = Buffer.from(await response.Body.transformToByteArray());
+  return {
+    key,
+    bytes,
+    sizeBytes: bytes.length,
+    contentType: response.ContentType || head.ContentType || mimeType,
+    etag: String(response.ETag || head.ETag || '').replace(/^"|"$/g, ''),
+  };
+};
+
 const sendR2Command = async (client, command, label) => {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), R2_REQUEST_TIMEOUT_MS);
@@ -142,6 +211,39 @@ export const deleteProjectAssetFromR2 = async (sessionId, relativePath, mimeType
     Key: projectR2AssetKey(sessionId, relativePath, mimeType),
   }), 'R2 asset cleanup');
   return true;
+};
+
+// Delete one exact, project-owned asset subtree without touching the rest of
+// the project. This is intentionally limited to downstream video assets: an
+// "Images" workflow reset must never remove source frames, character
+// references, narration, or thumbnails belonging to another project.
+export const deleteProjectVideoAssetsFromR2 = async (sessionId) => {
+  const { client, bucketName } = getClient();
+  if (!client) return { configured: false, deleted: 0 };
+
+  const prefix = `${projectR2Prefix(sessionId)}assets/videos/`;
+  let deleted = 0;
+  while (true) {
+    const listed = await sendR2Command(client, new ListObjectsV2Command({
+      Bucket: bucketName,
+      Prefix: prefix,
+    }), 'R2 video asset listing');
+    const keys = (listed.Contents || []).map(object => object.Key).filter(Boolean);
+    if (keys.length === 0) break;
+    const result = await sendR2Command(client, new DeleteObjectsCommand({
+      Bucket: bucketName,
+      Delete: {
+        Objects: keys.map(Key => ({ Key })),
+        Quiet: true,
+      },
+    }), 'R2 video asset cleanup');
+    if (result.Errors?.length) {
+      throw new Error(`R2 rejected deletion of ${result.Errors.length} project video asset(s)`);
+    }
+    deleted += keys.length;
+  }
+
+  return { configured: true, deleted, prefix };
 };
 
 // Return the existing project object when it has already been synchronized;

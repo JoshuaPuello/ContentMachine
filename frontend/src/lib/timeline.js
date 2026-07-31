@@ -10,9 +10,10 @@
  *   id, kind, startTime, endTime, label, locked?, payload }
  * kinds: 'clip' | 'narration' | 'music' | 'map' | 'chapter-reveal' |
  *        'chapter-active' | 'motion-graphic' | 'title' | 'lower-third' |
- *        'date-chip' | 'sound-effect'
+ *        'date-chip' | 'transition' | 'sound-effect'
  */
 import { parseUnitKey } from './segmentation.js';
+import { transitionDefinition } from './transitionLibrary.js';
 
 let idCounter = 0;
 export const newItemId = (prefix = 'tl') =>
@@ -20,6 +21,7 @@ export const newItemId = (prefix = 'tl') =>
 
 /** Track lane assignment for the editor UI. */
 export const TRACKS = [
+  { id: 'transitions', label: 'Transitions', kinds: ['transition'] },
   { id: 'picture', label: 'Picture', kinds: ['clip'] },
   { id: 'cinema', label: 'Cinema', kinds: ['map', 'chapter-reveal', 'chapter-active', 'title'] },
   { id: 'graphics', label: 'Graphics', kinds: ['motion-graphic', 'lower-third', 'date-chip'] },
@@ -214,7 +216,9 @@ export function deriveBaseTimeline({ sceneOrder, sceneAudioBySceneNumber, sceneS
             sceneNumber,
             segmentIndex: seg.segmentIndex,
             playbackRate: vid.playback_rate ?? seg.playbackRate ?? 1,
-            transitionIn: seg.segmentIndex === 0 ? 'crossfade' : 'cut',
+            // A transition is a visible timeline object authored by the
+            // Director. Base footage therefore starts with honest hard cuts.
+            transitionIn: 'cut',
           },
         });
       }
@@ -546,26 +550,62 @@ export function applyDirectorPlan({
     }
   }
 
-  // 3. Maps: play OVER the film at the end of their anchor scene (no shift)
+  // 3. Maps: play OVER the film (no shift). Placement law:
+  //    - the map belongs to the first clip playing in its anchor scene and
+  //      enters ~2s after that clip starts (a beat of clean footage first)
+  //    - it spans at most two clips
+  //    - it runs at most ~7s, but never exits within 2s of the hosting
+  //      clip's own end — a map-out immediately followed by a cut reads as
+  //      a glitch, so it holds to the clip boundary instead.
+  const MAP_ENTRY_DELAY = 2;
+  const MAP_MAX_SECONDS = 7;
+  const MAP_MIN_CLIP_TAIL = 2;
+  const clipsForMaps = items
+    .filter(item => item.kind === 'clip')
+    .sort((a, b) => a.startTime - b.startTime || a.endTime - b.endTime);
   for (const m of plan?.maps ?? []) {
     const win = sceneWindows[m.after_scene];
     if (!win) continue;
-    const dur = m.duration_seconds;
-    const start = Math.max(win.start, win.end - dur);
+    const requested = Math.min(MAP_MAX_SECONDS, m.duration_seconds || MAP_MAX_SECONDS);
+    const ownerIndex = clipsForMaps.findIndex(clip => clip.endTime > win.start + 1e-6);
+    const owner = ownerIndex >= 0 ? clipsForMaps[ownerIndex] : null;
+    const second = ownerIndex >= 0 ? clipsForMaps[ownerIndex + 1] : null;
+    let start;
+    let end;
+    if (owner) {
+      const ownerLength = owner.endTime - owner.startTime;
+      start = Math.max(win.start, owner.startTime + Math.min(MAP_ENTRY_DELAY, ownerLength / 2));
+      const lastReachable = second ? second.endTime : owner.endTime;
+      end = Math.min(start + requested, lastReachable);
+      const host = second && end > second.startTime + 1e-6 ? second : owner;
+      if (end < host.endTime - 1e-6 && host.endTime - end < MAP_MIN_CLIP_TAIL) {
+        end = Math.min(host.endTime, lastReachable);
+      }
+    } else {
+      start = Math.max(win.start, win.end - requested);
+      end = start + requested;
+    }
+    if (end - start < 3) {
+      // Degenerate clip layout (tiny shots): fall back to the scene tail.
+      start = Math.max(win.start, win.end - requested);
+      end = start + requested;
+    }
+    const hint = m.request?.presentation_hint;
     items.push({
       id: m.id || newItemId('map'),
       kind: 'map',
       startTime: start,
-      endTime: start + dur,
+      endTime: end,
       label: `Map · ${m.request?.subject?.slice(0, 30) ?? 'segment'}`,
       payload: {
         src: m.src || null,
         posterUrl: m.posterUrl || null,
         request: m.request,
         status: m.src ? 'ready' : 'pending',
-        mapModels: m.mapModels || { ideation: 'opus', executor: 'opus', reviewer: 'opus' },
+        mapModels: m.mapModels || { ideation: 'opus', executor: 'opus' },
         mapOptions: m.options || [],
         selectedOptionId: m.selectedOptionId || null,
+        presentation: ['split', 'corner', 'full', 'inset'].includes(hint) ? hint : (m.presentation || null),
       },
     });
   }
@@ -655,6 +695,44 @@ export function applyDirectorPlan({
         };
       }
     }
+  }
+
+  // 6. First-class transitions point at the exact outgoing/incoming clips.
+  // They do not shift narration or scene timing; preview and render derive the
+  // same blend from this single timeline object.
+  const clips = items
+    .filter(item => item.kind === 'clip' && item.payload?.src)
+    .sort((a, b) => a.startTime - b.startTime || a.endTime - b.endTime)
+  for (const transition of plan?.transitions ?? []) {
+    const beforeScene = Number(transition.before_scene)
+    const beforeSegment = Number.isFinite(Number(transition.before_segment_index))
+      ? Number(transition.before_segment_index)
+      : 0
+    const toIndex = clips.findIndex(clip => (
+      Number(clip.payload?.sceneNumber) === beforeScene
+      && Number(clip.payload?.segmentIndex || 0) === beforeSegment
+    ))
+    if (toIndex <= 0) continue
+    const fromClip = clips[toIndex - 1]
+    const toClip = clips[toIndex]
+    const definition = transitionDefinition(transition.type)
+    const requested = Number(transition.duration_seconds) || definition.defaultDuration
+    const duration = Math.max(0.25, Math.min(1.2, requested, (toClip.endTime - toClip.startTime) * 0.45))
+    items.push({
+      id: transition.id || newItemId('tr'),
+      kind: 'transition',
+      startTime: toClip.startTime,
+      endTime: toClip.startTime + duration,
+      label: definition.label,
+      payload: {
+        type: definition.id,
+        fromClipId: fromClip.id,
+        toClipId: toClip.id,
+        reason: transition.reason || '',
+        authoredBy: 'director',
+        soundDesign: transition.sound_design,
+      },
+    })
   }
 
   const totalDuration = items.reduce((max, item) => Math.max(max, item.endTime), 0);

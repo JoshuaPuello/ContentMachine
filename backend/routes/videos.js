@@ -43,6 +43,29 @@ export const validateVideoSubmission = (scene) => {
   if (prompt && !/immutable frame zero/i.test(prompt)) {
     issues.push('video_prompt is missing immutable frame-zero authority');
   }
+  const providerDuration = Number(scene?.duration_seconds);
+  const editorialDuration = [
+    scene?.action_duration_seconds,
+    scene?.usable_duration_seconds,
+    scene?.editorial_duration_seconds,
+    scene?.target_duration,
+  ].map(Number).find(value => Number.isFinite(value) && value > 0);
+  if (
+    Number.isFinite(providerDuration)
+    && providerDuration > 0
+    && Number.isFinite(editorialDuration)
+    && editorialDuration < providerDuration
+  ) {
+    if (!prompt.includes('EDITORIAL TIMING:')) {
+      issues.push('video_prompt is missing protected EDITORIAL TIMING for its shorter usable action window');
+    }
+    if (!/\[CLEAN HOLD\]/i.test(prompt)) {
+      issues.push('video_prompt is missing a CLEAN HOLD after its editorial trim boundary');
+    }
+    if (!/no new story action/i.test(prompt)) {
+      issues.push('video_prompt clean tail must forbid new story action after its editorial trim boundary');
+    }
+  }
   const storyboard = prompt.match(/STORYBOARD \/ SHOT LIST[^\n]*:\s*\n([\s\S]*?)(?=\nENDING STATE:|$)/i)?.[1] || '';
   const firstShot = storyboard.match(/SHOT\s+1\s+[—-][^\n]*\n([\s\S]*?)(?=\nSHOT\s+\d+\s+[—-]|$)/i)?.[1]?.trim() || '';
   if (!firstShot) issues.push('video_prompt must contain a nonempty SHOT 1 storyboard beat');
@@ -57,6 +80,34 @@ export const validateVideoSubmission = (scene) => {
   if (unsafeCreative) issues.push(`video_prompt contains unsafe identity/entity drift: ${unsafeCreative[0]}`);
   return issues;
 };
+
+export const buildRegenerationSubmittedScene = ({
+  scene_number,
+  video_prompt,
+  image_url,
+  negative_prompt,
+  motion_prompt_version,
+  source_frame_locked,
+  duration_seconds,
+  target_duration,
+  action_duration_seconds,
+  editorial_duration_seconds,
+  clip_duration,
+  playback_rate,
+}) => ({
+  scene_number,
+  video_prompt,
+  image_url,
+  negative_prompt,
+  motion_prompt_version,
+  source_frame_locked,
+  duration_seconds,
+  target_duration,
+  action_duration_seconds,
+  editorial_duration_seconds,
+  clip_duration,
+  playback_rate,
+});
 
 const validSessionId = (value) => /^[a-zA-Z0-9_-]+$/.test(String(value || ''));
 
@@ -878,6 +929,11 @@ router.post('/regenerate', async (req, res) => {
       scene_number,
       video_prompt,
       duration_seconds,
+      target_duration,
+      action_duration_seconds,
+      editorial_duration_seconds,
+      clip_duration,
+      playback_rate,
       image_url,
       negative_prompt,
       motion_prompt_version,
@@ -889,14 +945,20 @@ router.post('/regenerate', async (req, res) => {
       sessionId,
     } = req.body;
     const restoredImageUrl = await recoverSelectedImageReference(image_url, sessionId, scene_number);
-    const submittedScene = {
+    const submittedScene = buildRegenerationSubmittedScene({
       scene_number,
       video_prompt,
       image_url: restoredImageUrl,
       negative_prompt,
       motion_prompt_version,
       source_frame_locked,
-    };
+      duration_seconds,
+      target_duration,
+      action_duration_seconds,
+      editorial_duration_seconds,
+      clip_duration,
+      playback_rate,
+    });
     const validationIssues = validateVideoSubmission(submittedScene);
     if (validationIssues.length > 0) {
       return res.status(400).json({

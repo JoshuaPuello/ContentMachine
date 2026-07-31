@@ -20,9 +20,16 @@ const backendDir = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const targetEnvPath = join(backendDir, '.env');
 const secretsDir = join(backendDir, '.secrets', 'vertex');
 const sourceArg = process.argv[2];
+const accountsFlagIndex = process.argv.indexOf('--accounts');
+const requestedAccounts = accountsFlagIndex >= 0
+  ? String(process.argv[accountsFlagIndex + 1] || '')
+    .split(',')
+    .map((id) => id.trim())
+    .filter(Boolean)
+  : null;
 
 if (!sourceArg) {
-  console.error('Usage: npm run import:vertex -- /absolute/path/to/source.env');
+  console.error('Usage: npm run import:vertex -- /absolute/path/to/source.env [--accounts alt3,alt4]');
   process.exit(1);
 }
 
@@ -33,13 +40,20 @@ if (!existsSync(sourceEnvPath)) {
 }
 
 const source = parseDotEnv(readFileSync(sourceEnvPath));
-const accountIds = (source.VERTEX_IMAGE_ACCOUNTS || '')
+const sourceAccountIds = (source.VERTEX_IMAGE_ACCOUNTS || '')
   .split(',')
   .map((id) => id.trim())
   .filter(Boolean);
+const accountIds = requestedAccounts ?? sourceAccountIds;
 
 if (accountIds.length === 0) {
   console.error('VERTEX_IMAGE_ACCOUNTS must list at least one account.');
+  process.exit(1);
+}
+const sourceAccountSet = new Set(sourceAccountIds.map((id) => id.toLowerCase()));
+const unavailableAccounts = accountIds.filter((id) => !sourceAccountSet.has(id.toLowerCase()));
+if (unavailableAccounts.length > 0) {
+  console.error(`Requested Vertex accounts are not listed by the source: ${unavailableAccounts.join(', ')}`);
   process.exit(1);
 }
 
@@ -53,6 +67,22 @@ const imported = {
   VERTEX_IMAGE_ACCOUNTS: accountIds.join(','),
 };
 const managedKeys = new Set(['VERTEX_ENV_FILE', ...Object.keys(imported)]);
+const currentTarget = existsSync(targetEnvPath)
+  ? parseDotEnv(readFileSync(targetEnvPath))
+  : {};
+const currentAccountIds = (currentTarget.VERTEX_IMAGE_ACCOUNTS || '')
+  .split(',')
+  .map((id) => id.trim())
+  .filter(Boolean);
+for (const managedAccountId of new Set([...sourceAccountIds, ...currentAccountIds])) {
+  const token = managedAccountId.toUpperCase().replace(/[^A-Z0-9]/g, '_');
+  const prefix = `VERTEX_${token}`;
+  managedKeys.add(`${prefix}_PROJECT`);
+  managedKeys.add(`${prefix}_CREDENTIALS`);
+  managedKeys.add(`${prefix}_CREDENTIALS_JSON`);
+  managedKeys.add(`${prefix}_LOCATION`);
+  managedKeys.add(`${prefix}_IMAGE_RPM`);
+}
 
 for (const accountId of accountIds) {
   const token = accountId.toUpperCase().replace(/[^A-Z0-9]/g, '_');
@@ -108,7 +138,10 @@ const currentLines = existsSync(targetEnvPath)
   : [];
 const preservedLines = currentLines.filter((line) => {
   const match = line.match(/^([A-Z][A-Z0-9_]*)=/);
-  return !match || !managedKeys.has(match[1]);
+  if (!match) return true;
+  const key = match[1];
+  const isAccountField = /^VERTEX_(?!IMAGE_RPM$|IMAGE_ACCOUNTS$|LOCATION$)[A-Z0-9_]+_(?:PROJECT|CREDENTIALS|CREDENTIALS_JSON|LOCATION|IMAGE_RPM)$/.test(key);
+  return !managedKeys.has(key) && !isAccountField;
 });
 while (preservedLines.at(-1)?.trim() === '') preservedLines.pop();
 

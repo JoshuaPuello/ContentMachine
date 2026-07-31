@@ -60,6 +60,22 @@ test('film treatment is normalized as a renderer-safe project contract', async (
   });
 });
 
+test('first-class transitions bind exact clips and preserve the outgoing tail', async () => {
+  const { applyStudioTransitions } = await import(`./render.js?transition-test=${Date.now()}`);
+  const clips = [
+    { studioItemId: 'clip-a', startFrame: 0, durationInFrames: 120, transitionIn: 'cut' },
+    { studioItemId: 'clip-b', startFrame: 120, durationInFrames: 120, transitionIn: 'cut' },
+  ];
+  applyStudioTransitions(clips, [{
+    id: 'tr-1', kind: 'transition', startTime: 4, endTime: 4.6,
+    payload: { type: 'soft-blur', fromClipId: 'clip-a', toClipId: 'clip-b' },
+  }], 30);
+  assert.equal(clips[1].transitionIn, 'blur-dissolve');
+  assert.equal(clips[1].transitionDurationInFrames, 18);
+  assert.equal(clips[0].durationInFrames, 138);
+  assert.equal('studioItemId' in clips[0], false);
+});
+
 test('project cleanup removes only render workspaces owned by that session', async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'contentmachine-render-cleanup-'));
   const workRoot = path.join(root, 'public', 'docmaster-work');
