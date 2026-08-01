@@ -138,6 +138,9 @@ The visual style is fully customisable: expand **Advanced — Customize System P
 | **fal.ai** *(WIP)* | Flux Pro, Flux 2 Pro, Flux Schnell, Nano Banana Pro, Qwen Image 2512, Z-Image Base, Ideogram V3, SD 3.5 Large |
 | **Replicate** | Flux 2 Pro, Flux 1.1 Pro, Nano Banana Pro *(Gemini)*, Imagen 4 |
 | **Gemini (direct)** | Gemini 3 Pro Image Preview *(2K native output)* |
+| **Vertex AI** | Gemini 2.5 Flash Image and configured Gemini image models |
+| **Windows Extra High** | Separate five-slot Windows Chrome worker with 1–3 alternatives |
+| **Windows Nano Banana** | Nano Banana 2 through the Storyforge/Veo worker queue; prompt-only or one reference, 1K/2K/4K, up to 80 durable tasks |
 
 ### Video Generation
 

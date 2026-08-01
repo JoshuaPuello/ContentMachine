@@ -19,6 +19,14 @@ import {
   queueWindowsImageTask,
   retryWindowsImageTask,
 } from '../lib/windowsImage.js';
+import {
+  beginWindowsNanoImageRun,
+  cancelWindowsNanoImageProject,
+  getWindowsNanoImageJob,
+  queueWindowsNanoImageTask,
+  retryWindowsNanoImageTask,
+  WINDOWS_NANO_IMAGE_MAX_TASKS,
+} from '../lib/windowsNanoImage.js';
 const router = express.Router();
 const IMAGE_GENERATION_TIMEOUT_MS = Math.max(
   30_000,
@@ -303,6 +311,155 @@ The SECOND attached image is a packed character reference board. Its left-to-rig
       : '',
   };
 };
+
+const windowsNanoReference = async (characterImages, characterDescription) => {
+  if (!characterImages.length) return { reference: null, promptSuffix: '' };
+  const characterInputs = characterImages.map((dataUri, index) => {
+    const parsed = parseDataUri(dataUri);
+    return {
+      referenceId: `character-${index + 1}`,
+      name: characterDescription || `Character ${index + 1}`,
+      contentType: parsed.mimeType,
+      bytes: parsed.buffer,
+    };
+  });
+  const board = await buildOrderedReferenceBoard(characterInputs);
+  return {
+    reference: board ? { bytes: board.bytes, contentType: board.contentType } : null,
+    promptSuffix: board
+      ? `\n\nSINGLE ORDERED CHARACTER REFERENCE BOARD
+The attached image is a packed character reference board. Its left-to-right slots preserve the ordered character inputs. Match those visual identities whenever the scene prompt calls for them. Never reproduce the board layout, labels, black strip, or reference numbers in the final image.`
+      : '',
+  };
+};
+
+router.post('/windows-nano/generate', async (req, res) => {
+  try {
+    const {
+      sessionId,
+      items,
+      aspectRatio = '16:9',
+      resolution = '1K',
+      characterImages = [],
+      characterDescription = '',
+      retry = false,
+    } = req.body || {};
+    if (
+      !sessionId
+      || !Array.isArray(items)
+      || items.length < 1
+      || items.length > WINDOWS_NANO_IMAGE_MAX_TASKS
+    ) {
+      return res.status(400).json({
+        error: true,
+        message: `sessionId and 1-${WINDOWS_NANO_IMAGE_MAX_TASKS} Nano image items are required`,
+        code: 'INVALID_INPUT',
+      });
+    }
+    const safeCharacters = characterImages.filter(
+      item => typeof item === 'string' && /^data:image\/[a-zA-Z+]+;base64,/.test(item),
+    );
+    const runId = await beginWindowsNanoImageRun(sessionId, { reuseActive: true });
+    const referenceSet = await windowsNanoReference(
+      safeCharacters,
+      String(characterDescription || '').slice(0, MAX_CHAR_DESC_LENGTH),
+    );
+    const queued = await Promise.allSettled(items.map(async item => {
+      if (!item?.itemId || !item?.prompt) {
+        throw new Error('Every Nano image item needs itemId and prompt');
+      }
+      const taskInput = {
+        sessionId,
+        itemId: `nano-image-${item.itemId}`,
+        prompt: `${hardenDocumentaryImagePrompt(item.prompt)}${referenceSet.promptSuffix}`,
+        reference: referenceSet.reference,
+        aspectRatio,
+        resolution,
+        metadata: {
+          assetType: 'scene-image',
+          imageKey: String(item.itemId),
+        },
+        runId,
+      };
+      const prior = await getWindowsNanoImageJob(
+        sessionId,
+        taskInput.itemId,
+        { reconcile: true },
+      );
+      return retry || ['failed', 'canceled', 'superseded'].includes(prior?.status)
+        ? retryWindowsNanoImageTask(sessionId, taskInput.itemId, taskInput)
+        : queueWindowsNanoImageTask(taskInput);
+    }));
+    return res.status(202).json(queued.map((result, index) => (
+      result.status === 'fulfilled'
+        ? { itemId: items[index].itemId, job: result.value, error: null }
+        : {
+            itemId: items[index].itemId,
+            job: null,
+            error: result.reason?.message || 'Nano queue failed',
+          }
+    )));
+  } catch (error) {
+    console.error('Windows Nano image generation error:', error);
+    return res.status(500).json({
+      error: true,
+      message: error.message,
+      code: error.code || 'WINDOWS_NANO_IMAGE_ERROR',
+    });
+  }
+});
+
+router.post('/windows-nano/begin', async (req, res) => {
+  try {
+    return res.json({ runId: await beginWindowsNanoImageRun(req.body?.sessionId) });
+  } catch (error) {
+    return res.status(400).json({
+      error: true,
+      message: error.message,
+      code: error.code || 'WINDOWS_NANO_IMAGE_BEGIN_FAILED',
+    });
+  }
+});
+
+router.post('/windows-nano/cancel', async (req, res) => {
+  try {
+    const result = await cancelWindowsNanoImageProject(
+      req.body?.sessionId,
+      req.body?.reason || 'Canceled by user',
+    );
+    return res.json({ success: true, ...result });
+  } catch (error) {
+    return res.status(500).json({
+      error: true,
+      message: error.message,
+      code: error.code || 'WINDOWS_NANO_IMAGE_CANCEL_FAILED',
+    });
+  }
+});
+
+router.get('/windows-nano/status/:sessionId/:itemId', async (req, res) => {
+  try {
+    const job = await getWindowsNanoImageJob(
+      req.params.sessionId,
+      `nano-image-${req.params.itemId}`,
+      { reconcile: true },
+    );
+    if (!job) {
+      return res.status(404).json({
+        error: true,
+        message: 'Windows Nano image task not found',
+        code: 'TASK_NOT_FOUND',
+      });
+    }
+    return res.json({ job });
+  } catch (error) {
+    return res.status(500).json({
+      error: true,
+      message: error.message,
+      code: error.code || 'WINDOWS_NANO_IMAGE_STATUS_ERROR',
+    });
+  }
+});
 
 router.post('/windows/generate', async (req, res) => {
   try {

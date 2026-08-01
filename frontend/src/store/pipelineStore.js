@@ -63,6 +63,10 @@ import { reconcileTimelineVideoSelections } from '../lib/videoSelectionTimeline'
 import { runSceneSheetMutationWithTokenRecovery } from '../lib/sceneSheetSession'
 import { hydrateSceneSheetReferences } from '../lib/sceneSheets'
 
+const WINDOWS_NANO_IMAGE_PROVIDER = 'windows-nano-banana'
+const isWindowsImageProvider = (provider) =>
+  provider === 'windows-image' || provider === WINDOWS_NANO_IMAGE_PROVIDER
+
 const emptyWindowsVideoStatus = () => ({
   paused: false,
   brokerAvailable: false,
@@ -354,6 +358,7 @@ export const usePipelineStore = create(
       settings: {
         imageProvider: 'fal',
         imageModel: 'fal-ai/flux-pro',
+        windowsNanoResolution: '1K',
         claudeProvider: 'fal',
         claudeModel: 'claude-3-5-sonnet',
         videoProvider: WINDOWS_VIDEO_PROVIDER,
@@ -582,6 +587,7 @@ export const usePipelineStore = create(
           gemini: 'gemini-3-pro-image-preview',
           vertex: 'gemini-2.5-flash-image',
           'windows-image': 'extra-high',
+          [WINDOWS_NANO_IMAGE_PROVIDER]: 'Nano Banana 2',
         }
         set((state) => ({
           settings: {
@@ -717,6 +723,14 @@ export const usePipelineStore = create(
         void get().autoSaveSession()
       },
 
+      setWindowsNanoResolution: (resolution) => {
+        const value = ['1K', '2K', '4K'].includes(resolution) ? resolution : '1K'
+        set((state) => ({
+          settings: { ...state.settings, windowsNanoResolution: value },
+        }))
+        void get().autoSaveSession()
+      },
+
       prepareSceneSheets: async () => {
         const sessionId = getSessionId()
         const result = await executeSceneSheetMutation({
@@ -771,20 +785,27 @@ export const usePipelineStore = create(
 
       beginWindowsImageGeneration: async () => {
         const sessionId = getSessionId()
-        const result = await api.beginWindowsImageGeneration(sessionId)
+        const result = get().settings.imageProvider === WINDOWS_NANO_IMAGE_PROVIDER
+          ? await api.beginWindowsNanoImageGeneration(sessionId)
+          : await api.beginWindowsImageGeneration(sessionId)
         if (getSessionId() !== sessionId) return null
         return result.runId
       },
 
       cancelWindowsImageGeneration: async () => {
         const sessionId = getSessionId()
-        const result = await api.cancelWindowsImageGeneration(
-          sessionId,
-          'Canceled by user from Content Machine',
-        )
+        const result = get().settings.imageProvider === WINDOWS_NANO_IMAGE_PROVIDER
+          ? await api.cancelWindowsNanoImageGeneration(
+              sessionId,
+              'Canceled by user from Content Machine',
+            )
+          : await api.cancelWindowsImageGeneration(
+              sessionId,
+              'Canceled by user from Content Machine',
+            )
         if (getSessionId() !== sessionId) return null
         set(state => ({
-          generationState: state.settings.imageProvider === 'windows-image'
+          generationState: isWindowsImageProvider(state.settings.imageProvider)
             ? 'stopped'
             : state.generationState,
           sceneSheetWorkflow: state.sceneSheetWorkflow
@@ -800,7 +821,7 @@ export const usePipelineStore = create(
             : state.sceneSheetWorkflow,
         }))
         get().logActivity(
-          `Canceled ${result.broker?.canceled || 0} Windows image task${result.broker?.canceled === 1 ? '' : 's'}`,
+          `Canceled ${result.broker?.canceled || result.canceled || 0} Windows image task${(result.broker?.canceled || result.canceled) === 1 ? '' : 's'}`,
           'info',
         )
         return result
@@ -1334,6 +1355,7 @@ export const usePipelineStore = create(
                   sessionId: getSessionId(),
                   itemIds: [`character-${character.id}`],
                   outputCount: settings.windowsImageOutputs || 1,
+                  resolution: settings.windowsNanoResolution || '1K',
                 },
               )
               if (!isProjectScopeCurrent(get, scope)) return []
@@ -1402,8 +1424,12 @@ export const usePipelineStore = create(
             character,
             {
               sessionId: getSessionId(),
-              itemIds: [`character-${character.id}-regenerate`],
+              itemIds: Array.from(
+                { length: state.settings.imageProvider === 'windows-image' ? 1 : count },
+                (_, index) => `character-${character.id}-regenerate-${index + 1}`,
+              ),
               outputCount: count,
+              resolution: state.settings.windowsNanoResolution || '1K',
               retry: true,
             },
           )
@@ -1808,6 +1834,7 @@ export const usePipelineStore = create(
                   sessionId: getSessionId(),
                   itemIds: unitPrompts.map(keyOf),
                   outputCount: settings.windowsImageOutputs || 1,
+                  resolution: settings.windowsNanoResolution || '1K',
                 }
               )
               if (!isProjectScopeCurrent(get, scope)) return null
@@ -1874,15 +1901,14 @@ export const usePipelineStore = create(
               })
             }
 
-            if (settings.imageProvider !== 'windows-image') {
+            if (!isWindowsImageProvider(settings.imageProvider)) {
               await new Promise(r => setTimeout(r, 800))
             }
           }
 
-          if (settings.imageProvider === 'windows-image') {
-            // Queue five independent jobs before waiting for results. The
-            // Windows worker owns its persistent Chrome execution slot; serial
-            // browser-side awaits would starve four of them.
+          if (isWindowsImageProvider(settings.imageProvider)) {
+            // Extra High exposes five independent Chrome slots. Nano journals
+            // up to 80 tasks while Veo schedules four provider threads.
             let nextUnitIndex = 0
             const worker = async () => {
               while (nextUnitIndex < unitKeys.length && !get().checkShouldStop()) {
@@ -1892,7 +1918,12 @@ export const usePipelineStore = create(
               }
             }
             await Promise.all(
-              Array.from({ length: Math.min(5, unitKeys.length) }, worker),
+              Array.from({
+                length: Math.min(
+                  settings.imageProvider === WINDOWS_NANO_IMAGE_PROVIDER ? 80 : 5,
+                  unitKeys.length,
+                ),
+              }, worker),
             )
           } else {
             for (const uk of unitKeys) {
@@ -2075,6 +2106,7 @@ export const usePipelineStore = create(
                   sessionId: getSessionId(),
                   itemIds: [key],
                   outputCount: settings.windowsImageOutputs || 1,
+                  resolution: settings.windowsNanoResolution || '1K',
                   retry: true,
                 },
               )
@@ -2170,6 +2202,7 @@ export const usePipelineStore = create(
               sessionId: getSessionId(),
               itemIds: [key],
               outputCount: settings.windowsImageOutputs || 1,
+              resolution: settings.windowsNanoResolution || '1K',
               retry: true,
             },
           )
@@ -2257,8 +2290,12 @@ export const usePipelineStore = create(
             null,
             {
               sessionId: getSessionId(),
-              itemIds: [`${key}-edit`],
+              itemIds: Array.from(
+                { length: editProvider === 'windows-image' ? 1 : count },
+                (_, index) => `${key}-edit-${index + 1}`,
+              ),
               outputCount: count,
+              resolution: get().settings.windowsNanoResolution || '1K',
               retry: true,
             },
           )
@@ -2389,6 +2426,7 @@ export const usePipelineStore = create(
                 sessionId: getSessionId(),
                 itemIds: unitPrompts.map(keyOf),
                 outputCount: settings.windowsImageOutputs || 1,
+                resolution: settings.windowsNanoResolution || '1K',
               },
             )
             if (!isProjectScopeCurrent(get, scope)) return null
@@ -4622,6 +4660,7 @@ export const usePipelineStore = create(
                   sessionId: getSessionId(),
                   itemIds: [`director-chapter-${ch.start_scene}-${i}`],
                   outputCount: 1,
+                  resolution: settings.windowsNanoResolution || '1K',
                 },
               )
               if (!isProjectScopeCurrent(get, scope)) return
@@ -5768,6 +5807,9 @@ export const usePipelineStore = create(
             ...(project.settings ? {
               ...(project.settings.image_provider   ? { imageProvider:   project.settings.image_provider   } : {}),
               ...(project.settings.image_model      ? { imageModel:      project.settings.image_model      } : {}),
+              ...(project.settings.windows_nano_resolution
+                ? { windowsNanoResolution: project.settings.windows_nano_resolution }
+                : {}),
               ...(project.settings.claude_provider  ? { claudeProvider:  project.settings.claude_provider  } : {}),
               ...(project.settings.claude_model     ? { claudeModel:     project.settings.claude_model     } : {}),
               ...(project.settings.video_provider   ? { videoProvider:   project.settings.video_provider   } : {}),
@@ -5885,6 +5927,7 @@ export const usePipelineStore = create(
           settings: {
             image_provider:   state.settings.imageProvider,
             image_model:      state.settings.imageModel,
+            windows_nano_resolution: state.settings.windowsNanoResolution || '1K',
             claude_provider:  state.settings.claudeProvider,
             claude_model:     state.settings.claudeModel,
             video_provider:   state.settings.videoProvider,

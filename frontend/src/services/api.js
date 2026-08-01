@@ -11,11 +11,14 @@ const api = axios.create({
 const sessionCache = new Map()
 const wait = (milliseconds) => new Promise(resolve => setTimeout(resolve, milliseconds))
 
-const awaitWindowsImageTask = async (sessionId, itemId) => {
+const awaitWindowsImageTask = async (sessionId, itemId, provider) => {
   const deadline = Date.now() + 45 * 60 * 1000
+  const route = provider === 'windows-nano-banana'
+    ? 'windows-nano'
+    : 'windows'
   while (Date.now() < deadline) {
     const { job } = await api.get(
-      `/images/windows/status/${encodeURIComponent(sessionId)}/${encodeURIComponent(itemId)}`,
+      `/images/${route}/status/${encodeURIComponent(sessionId)}/${encodeURIComponent(itemId)}`,
     ).then(response => response.data)
     if (job.status === 'complete') return job
     if (job.status === 'failed') {
@@ -159,28 +162,37 @@ const exportedApi = {
   ) => {
     const charImgs = characterImages?.filter(Boolean) ?? []
     console.log('API generateImages request:', { promptCount: prompts?.length, provider, model, aspectRatio, charImgCount: charImgs.length, characterDescription: characterDescription || '(none)' })
-    if (provider === 'windows-image') {
+    if (provider === 'windows-image' || provider === 'windows-nano-banana') {
       if (!windowsContext?.sessionId || windowsContext.itemIds?.length !== prompts.length) {
         throw new Error('Windows image generation requires stable project and item IDs')
       }
-      const queued = await api.post('/images/windows/generate', {
+      const nano = provider === 'windows-nano-banana'
+      const queued = await api.post(
+        nano ? '/images/windows-nano/generate' : '/images/windows/generate',
+        {
         sessionId: windowsContext.sessionId,
         items: prompts.map((prompt, index) => ({
           itemId: windowsContext.itemIds[index],
           prompt,
         })),
         aspectRatio,
+        ...(nano ? { resolution: windowsContext.resolution || '1K' } : {}),
         characterImages: charImgs,
         characterDescription,
-        outputCount: windowsContext.outputCount || 1,
+        outputCount: nano ? 1 : (windowsContext.outputCount || 1),
         retry: !!windowsContext.retry,
-      }).then(response => response.data)
+        },
+      ).then(response => response.data)
       return Promise.all(queued.map(async (entry, index) => {
         if (entry.error) return { prompt: prompts[index], url: null, error: entry.error }
         try {
           const job = entry.job?.status === 'complete'
             ? entry.job
-            : await awaitWindowsImageTask(windowsContext.sessionId, entry.itemId)
+            : await awaitWindowsImageTask(
+                windowsContext.sessionId,
+                entry.itemId,
+                provider,
+              )
           return {
             prompt: prompts[index],
             url: job.outputs?.[0]?.url || null,
@@ -223,7 +235,7 @@ const exportedApi = {
     characterDescription,
     windowsContext,
   ) => {
-    if (provider === 'windows-image') {
+    if (provider === 'windows-image' || provider === 'windows-nano-banana') {
       return exportedApi.generateImages(
         [prompt],
         provider,
@@ -261,8 +273,14 @@ const exportedApi = {
   beginWindowsImageGeneration: (sessionId) =>
     api.post('/images/windows/begin', { sessionId }).then(r => r.data),
 
+  beginWindowsNanoImageGeneration: (sessionId) =>
+    api.post('/images/windows-nano/begin', { sessionId }).then(r => r.data),
+
   cancelWindowsImageGeneration: (sessionId, reason = 'Canceled by user') =>
     api.post('/images/windows/cancel', { sessionId, reason }).then(r => r.data),
+
+  cancelWindowsNanoImageGeneration: (sessionId, reason = 'Canceled by user') =>
+    api.post('/images/windows-nano/cancel', { sessionId, reason }).then(r => r.data),
 
   getWindowsSceneSheetStatus: (sessionId, groupId) =>
     api.get(`/scene-sheets/${encodeURIComponent(sessionId)}/${encodeURIComponent(groupId)}/windows/status`)

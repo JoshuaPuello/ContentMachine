@@ -775,7 +775,10 @@ function SceneImages() {
               <button
                 onClick={async () => {
                   stopGeneration()
-                  if (settings.imageProvider === 'windows-image') {
+                  if (
+                    settings.imageProvider === 'windows-image'
+                    || settings.imageProvider === 'windows-nano-banana'
+                  ) {
                     try {
                       await cancelWindowsImageGeneration()
                       toast.success('All Windows image tasks canceled')

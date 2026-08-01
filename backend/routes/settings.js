@@ -49,6 +49,7 @@ router.get('/', async (req, res) => {
     r2: isR2Configured(),
     windowsWorker: isMediaBrokerConfigured(),
     windowsImage: isMediaBrokerConfigured() && isR2Configured(),
+    windowsNano: isMediaBrokerConfigured(),
     // Environment-based capabilities (configured in backend/.env, not via UI keys)
     vertex,
     vertexAccounts: vertexAccountCount(),

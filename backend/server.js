@@ -106,6 +106,10 @@ import {
   discoverWindowsImageProjects,
   startWindowsImageReconciler,
 } from './lib/windowsImage.js';
+import {
+  discoverWindowsNanoImageProjects,
+  startWindowsNanoImageReconciler,
+} from './lib/windowsNanoImage.js';
 import { OUTPUT_ROOT } from './lib/sessionStore.js';
 
 app.use('/api/settings', settingsRoutes);
@@ -137,5 +141,10 @@ app.listen(PORT, () => {
     .then(() => startWindowsImageReconciler())
     .catch((error) => {
       console.warn(`[windows-image] reconciler could not start: ${error.message}`);
+    });
+  discoverWindowsNanoImageProjects(OUTPUT_ROOT)
+    .then(() => startWindowsNanoImageReconciler())
+    .catch((error) => {
+      console.warn(`[windows-nano-image] reconciler could not start: ${error.message}`);
     });
 });

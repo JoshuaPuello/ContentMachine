@@ -644,6 +644,7 @@ function SettingsDrawer({ onClose }) {
     vertexError: null,
     windowsWorker: null,
     windowsImage: false,
+    windowsNano: false,
   })
   const [validating, setValidating] = useState({})
   const [saving, setSaving] = useState(false)
@@ -654,7 +655,7 @@ function SettingsDrawer({ onClose }) {
     setClaudeProvider, setClaudeModel,
     setVideoProvider, setVideoModel,
     setVideoClipDuration, setVideoSpeedFactor, setImageVariations, setSceneSheetEnabled,
-    setWindowsImageOutputs,
+    setWindowsImageOutputs, setWindowsNanoResolution,
     setSoundEffectsVolume, setBackgroundMusicEnabled, setBackgroundMusicVolume,
     setFilmGrainEnabled, setFilmGrainAmount,
     setAtmosphericGradeEnabled, setAtmosphericGradeAmount,
@@ -693,6 +694,7 @@ function SettingsDrawer({ onClose }) {
           ?? status.windowsWorker
           ?? null,
         windowsImage: !!status.windowsImage,
+        windowsNano: !!status.windowsNano,
       })
       setKeysConfigured({
         fal: !!status.fal,
@@ -788,6 +790,8 @@ function SettingsDrawer({ onClose }) {
           ?? status.windows_worker?.configured
           ?? status.windowsWorker
           ?? null,
+        windowsImage: !!status.windowsImage,
+        windowsNano: !!status.windowsNano,
       })
       setKeysConfigured({ fal: !!status.fal, replicate: !!status.replicate, gemini: !!status.gemini, elevenlabs: !!status.elevenlabs, geminigen: !!status.geminigen, vertex: !!status.vertex, claudeCli: !!status.claudeCli, whisper: !!status.whisper })
       // Refresh displayed keys from storage
@@ -821,6 +825,8 @@ function SettingsDrawer({ onClose }) {
     ? VERTEX_IMAGE_MODELS
     : settings.imageProvider === 'windows-image'
     ? [{ value: 'extra-high', label: 'Extra High (Windows Chrome)' }]
+    : settings.imageProvider === 'windows-nano-banana'
+    ? [{ value: 'Nano Banana 2', label: 'Nano Banana 2 (Windows Veo)' }]
     : GEMINI_IMAGE_MODELS
 
   return (
@@ -833,7 +839,7 @@ function SettingsDrawer({ onClose }) {
       <motion.div
         initial={{ x: '100%' }} animate={{ x: 0 }} exit={{ x: '100%' }}
         transition={{ type: 'tween', duration: 0.22 }}
-        className="fixed right-0 top-0 bottom-0 w-[440px] bg-surface border-l border-border z-50 flex flex-col shadow-2xl"
+        className="fixed right-0 top-0 bottom-0 w-full max-w-[440px] bg-surface border-l border-border z-50 flex flex-col shadow-2xl"
       >
         {/* Header */}
         <div className="flex items-center justify-between px-5 py-4 border-b border-border">
@@ -1151,13 +1157,14 @@ function SettingsDrawer({ onClose }) {
           <section>
             <h3 className="text-xs font-semibold text-text-disabled uppercase tracking-wider mb-3">Image Generation</h3>
             <div className="space-y-2">
-              <div className="grid grid-cols-5 gap-1.5 bg-surface-raised rounded-lg p-1">
+              <div className="grid grid-cols-3 gap-1.5 bg-surface-raised rounded-lg p-1">
                 {[
                   { id: 'fal', label: 'fal.ai', enabled: isValid('fal') },
                   { id: 'replicate', label: 'Replicate', enabled: isValid('replicate') },
                   { id: 'gemini', label: 'Gemini', enabled: isValid('gemini') },
                   { id: 'vertex', label: 'Vertex', enabled: envStatus.vertex },
                   { id: 'windows-image', label: 'Windows', enabled: envStatus.windowsImage },
+                  { id: 'windows-nano-banana', label: 'Nano Win', enabled: envStatus.windowsNano },
                 ].map(p => (
                   <button key={p.id}
                     onClick={() => setProvider(p.id)}
@@ -1195,6 +1202,24 @@ function SettingsDrawer({ onClose }) {
                       className="text-xs w-20"
                     >
                       {[1, 2, 3].map(count => <option key={count} value={count}>{count}</option>)}
+                    </select>
+                  </div>
+                </div>
+              )}
+              {settings.imageProvider === 'windows-nano-banana' && (
+                <div className="rounded-lg border border-accent/20 bg-accent/[0.06] p-3">
+                  <div className="flex items-center justify-between gap-3">
+                    <div>
+                      <p className="text-[10px] font-medium text-text-primary">Windows Veo image queue</p>
+                      <p className="text-[9px] text-text-disabled mt-0.5">Queues up to 80 independent images. Prompts can run with one continuity reference or without one.</p>
+                    </div>
+                    <select
+                      value={settings.windowsNanoResolution || '1K'}
+                      onChange={event => setWindowsNanoResolution(event.target.value)}
+                      className="text-xs w-20"
+                      aria-label="Nano Banana resolution"
+                    >
+                      {['1K', '2K', '4K'].map(value => <option key={value} value={value}>{value}</option>)}
                     </select>
                   </div>
                 </div>
