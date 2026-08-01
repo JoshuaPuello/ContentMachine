@@ -197,6 +197,7 @@ function SceneImages() {
   const [expandingAllSceneSheets, setExpandingAllSceneSheets] = useState(false)
   const allImagesCompleteToastedRef = useRef(false)
   const autoStartRef = useRef(false)
+  const canonicalSceneSheetRefreshRef = useRef(null)
 
   const {
     selectedStory,
@@ -318,6 +319,29 @@ function SceneImages() {
   useEffect(() => {
     if (!selectedStory) navigate('/')
   }, [selectedStory, navigate])
+
+  // session.json can contain validation text written by an older backend
+  // version. Always refresh planned sheets once per plan on Images-page load
+  // so completed Windows outputs are decorated by the current canonical
+  // validator instead of remaining stuck in stale browser/session state.
+  useEffect(() => {
+    if (!settings.sceneSheetEnabled || !sceneSheetWorkflow?.groups?.length) return
+    const planMarker = sceneSheetWorkflow.planId
+      || sceneSheetWorkflow.plan_id
+      || sceneSheetWorkflow.groups.map(group => group.id).join('|')
+    if (!planMarker || canonicalSceneSheetRefreshRef.current === planMarker) return
+    canonicalSceneSheetRefreshRef.current = planMarker
+    refreshSceneSheets().catch(error => {
+      canonicalSceneSheetRefreshRef.current = null
+      console.warn('[scene-sheets] canonical refresh failed:', error.message)
+    })
+  }, [
+    refreshSceneSheets,
+    sceneSheetWorkflow?.planId,
+    sceneSheetWorkflow?.plan_id,
+    sceneSheetWorkflow?.groups?.length,
+    settings.sceneSheetEnabled,
+  ])
 
   // Audio-first flow: arriving here with a scene plan but no image prompts yet
   // means the audio step just finished — start the image pipeline automatically

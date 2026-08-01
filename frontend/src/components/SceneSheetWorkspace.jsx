@@ -99,6 +99,7 @@ function SceneSheetGroup({
   onRefreshWindows,
   onSelectWindowsOption,
   planningLocked = false,
+  compact = false,
 }) {
   const inputRef = useRef(null)
   const [busy, setBusy] = useState(null)
@@ -216,6 +217,132 @@ function SceneSheetGroup({
     } finally {
       setBusy(null)
     }
+  }
+
+  if (compact) {
+    const outputs = windowsJob?.outputs || []
+    const preferredOutput = outputs.find(output => output.ordinal === windowsJob?.selectedOrdinal)
+      || outputs.find(output => output.layoutValidation?.valid !== false)
+      || outputs[0]
+    const preferredOutputValid = preferredOutput?.layoutValidation?.valid !== false
+    const previewUrl = group.sheetUrl || preferredOutput?.url || templateUrl
+    const progress = windowsJob?.progress?.percent
+      ?? (windowsJob?.status === 'complete' ? 100 : windowsJob ? 4 : 0)
+    return (
+      <article
+        className="rounded-2xl border border-border bg-surface/80 overflow-hidden shadow-lg shadow-black/10"
+        tabIndex={0}
+        onPaste={handlePaste}
+      >
+        <div className="aspect-video bg-black/35 relative overflow-hidden">
+          <img src={previewUrl} alt={group.title} className="w-full h-full object-cover" />
+          <div className="absolute inset-x-0 top-0 p-3 flex items-start justify-between gap-2 bg-gradient-to-b from-black/75 to-transparent">
+            <span className="rounded-full border border-white/15 bg-black/55 px-2 py-1 text-[9px] uppercase tracking-wider text-white/80">
+              {group.layout.columns}×{group.layout.rows} · {group.panels.length} shots
+            </span>
+            <span className={`rounded-full px-2 py-1 text-[9px] uppercase tracking-wider ${
+              group.status === 'expanded'
+                ? 'bg-success/85 text-white'
+                : group.status === 'failed'
+                  ? 'bg-error/85 text-white'
+                  : 'border border-white/15 bg-black/55 text-white/80'
+            }`}>
+              {statusLabel(group.status)}
+            </span>
+          </div>
+          {windowsActive && (
+            <div className="absolute inset-x-3 bottom-3 rounded-full h-1.5 bg-black/60 overflow-hidden">
+              <div
+                className="h-full bg-accent transition-[width] duration-500"
+                style={{ width: `${progress}%` }}
+              />
+            </div>
+          )}
+        </div>
+        <div className="p-4">
+          <div className="flex items-start justify-between gap-3">
+            <div className="min-w-0">
+              <h3 className="text-sm font-semibold text-text-primary truncate">{group.title}</h3>
+              <p className="text-[10px] text-text-disabled mt-1">
+                {expandedCount}/{group.panels.length} expanded
+                {windowsJob ? ` · ${String(windowsJob.progress?.phase || windowsJob.status).replaceAll('-', ' ')}` : ''}
+              </p>
+            </div>
+            {preferredOutput && (
+              <span className={`text-[9px] shrink-0 ${preferredOutputValid ? 'text-success' : 'text-error'}`}>
+                {preferredOutput.width}×{preferredOutput.height}
+              </span>
+            )}
+          </div>
+          {windowsJob?.error && <p className="text-[10px] text-error mt-2 line-clamp-2">{windowsJob.error.message}</p>}
+          {preferredOutput?.layoutValidation?.message && (
+            <p className={`text-[10px] mt-2 line-clamp-2 ${preferredOutputValid ? 'text-success' : 'text-error'}`}>
+              {preferredOutput.layoutValidation.message}
+            </p>
+          )}
+          <input
+            ref={inputRef}
+            type="file"
+            accept="image/png,image/jpeg,image/webp"
+            className="hidden"
+            onChange={event => handleUpload(event.target.files?.[0])}
+          />
+          <div className="grid grid-cols-2 gap-2 mt-4">
+            {!group.sheetUrl && windowsJob?.status === 'complete' && preferredOutput && (
+              <button
+                disabled={!!busy || !preferredOutputValid || planningLocked}
+                onClick={() => selectWindowsOption(preferredOutput.ordinal)}
+                className="btn-primary py-2 text-[10px] disabled:opacity-40"
+              >
+                {busy === `windows-select-${preferredOutput.ordinal}` ? 'Applying…' : 'Use generated sheet'}
+              </button>
+            )}
+            {group.sheetUrl && remainingOrdinals.length > 0 && (
+              <button
+                disabled={!!busy || planningLocked}
+                onClick={() => handleExpand(remainingOrdinals)}
+                className="btn-primary py-2 text-[10px] disabled:opacity-40"
+              >
+                {busy === 'expand' ? 'Expanding…' : `Expand ${remainingOrdinals.length} panels`}
+              </button>
+            )}
+            {(!windowsJob || ['failed', 'canceled'].includes(windowsJob.status)) && (
+              <button
+                disabled={!!busy || planningLocked}
+                onClick={() => generateWithWindows(['failed', 'canceled'].includes(windowsJob?.status))}
+                className="btn-primary py-2 text-[10px] disabled:opacity-40"
+              >
+                {busy === 'windows' ? 'Queueing…' : windowsJob ? 'Retry Windows' : 'Generate Windows'}
+              </button>
+            )}
+            <button
+              disabled={!!busy || planningLocked}
+              onClick={() => inputRef.current?.click()}
+              className="btn-secondary py-2 text-[10px] disabled:opacity-40"
+            >
+              {group.sheetUrl ? 'Replace upload' : 'Upload'}
+            </button>
+            <button
+              disabled={!!busy || planningLocked}
+              onClick={handleClipboardButton}
+              className="btn-secondary py-2 text-[10px] disabled:opacity-40"
+            >
+              Paste
+            </button>
+            {group.sheetUrl && (
+              <a
+                href={group.sheetUrl}
+                target="_blank"
+                rel="noreferrer"
+                className="btn-ghost text-center py-2 text-[10px]"
+              >
+                View source
+              </a>
+            )}
+          </div>
+        </div>
+      </article>
+    )
   }
 
   return (
@@ -487,9 +614,19 @@ export default function SceneSheetWorkspace({
   onSelectAllExpanded,
   defaultWindowsOutputCount = 1,
 }) {
+  const viewPreferenceKey = 'content-machine:scene-sheet-view-mode'
   const [planning, setPlanning] = useState(false)
   const [bulkWindowsGeneration, setBulkWindowsGeneration] = useState(false)
   const [cancelingWindows, setCancelingWindows] = useState(false)
+  const [viewMode, setViewMode] = useState(() => {
+    try {
+      return window.localStorage.getItem(viewPreferenceKey) === 'detailed'
+        ? 'detailed'
+        : 'compact'
+    } catch {
+      return 'compact'
+    }
+  })
   const serverPlanning = workflow?.status === 'planning'
   const planningMeta = workflow?.planning
   const totals = useMemo(() => {
@@ -592,6 +729,16 @@ export default function SceneSheetWorkspace({
     return status && !['complete', 'failed', 'canceled'].includes(status)
   })
 
+  const chooseViewMode = (mode) => {
+    setViewMode(mode)
+    try {
+      window.localStorage.setItem(viewPreferenceKey, mode)
+    } catch {
+      // A private or quota-limited browser may reject local preferences. The
+      // in-memory view still changes for the current visit.
+    }
+  }
+
   return (
     <div className="space-y-5">
       <div className="rounded-2xl border border-accent/25 bg-gradient-to-br from-accent/[0.10] via-surface to-surface p-5">
@@ -602,6 +749,24 @@ export default function SceneSheetWorkspace({
             <p className="text-sm text-text-secondary leading-relaxed mt-2">Compatible shots—even non-adjacent ones—share one visual world. Copy the authored prompt and ordered references, generate the sheet with your preferred provider, upload it here, then expand and approve every panel independently.</p>
           </div>
           <div className="flex items-center gap-2">
+            <div className="flex items-center rounded-lg border border-border bg-black/15 p-1">
+              {[
+                ['compact', 'Compact grid'],
+                ['detailed', 'Detailed'],
+              ].map(([mode, label]) => (
+                <button
+                  key={mode}
+                  onClick={() => chooseViewMode(mode)}
+                  className={`rounded-md px-3 py-1.5 text-[10px] transition-colors ${
+                    viewMode === mode
+                      ? 'bg-accent text-white'
+                      : 'text-text-secondary hover:text-text-primary'
+                  }`}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
             {workflow?.groups?.some(group =>
               !group.windowsGeneration || ['failed', 'canceled'].includes(group.windowsGeneration.status)
             ) && (
@@ -703,21 +868,26 @@ export default function SceneSheetWorkspace({
           {[['Sheets', totals.sheets], ['Sheet shots', totals.panels], ['Expanded', totals.expanded], ['Standard shots', totals.isolated]].map(([label, value]) => <div key={label} className="rounded-xl border border-border bg-black/15 px-3 py-2"><p className="text-lg text-text-primary">{value}</p><p className="text-[9px] uppercase tracking-wider text-text-disabled">{label}</p></div>)}
         </div>}
       </div>
-      {(workflow?.groups || []).map(group => (
-        <SceneSheetGroup
-          key={group.id}
-          group={group}
-          selectedImages={selectedImages}
-          onUpload={onUpload}
-          onGenerateWindows={onGenerateWindows}
-          defaultWindowsOutputCount={defaultWindowsOutputCount}
-          onRefreshWindows={onRefreshWindows}
-          onSelectWindowsOption={onSelectWindowsOption}
-          onExpand={onExpand}
-          onSelect={onSelect}
-          planningLocked={serverPlanning}
-        />
-      ))}
+      <div className={viewMode === 'compact'
+        ? 'grid gap-4 sm:grid-cols-2 xl:grid-cols-3'
+        : 'space-y-5'}>
+        {(workflow?.groups || []).map(group => (
+          <SceneSheetGroup
+            key={group.id}
+            group={group}
+            selectedImages={selectedImages}
+            onUpload={onUpload}
+            onGenerateWindows={onGenerateWindows}
+            defaultWindowsOutputCount={defaultWindowsOutputCount}
+            onRefreshWindows={onRefreshWindows}
+            onSelectWindowsOption={onSelectWindowsOption}
+            onExpand={onExpand}
+            onSelect={onSelect}
+            planningLocked={serverPlanning}
+            compact={viewMode === 'compact'}
+          />
+        ))}
+      </div>
       {workflow && !workflow.groups?.length && !serverPlanning && <div className="rounded-xl border border-border p-5 text-sm text-text-secondary">No shots share a sufficiently strong continuity world. All shots will use the standard individual image flow.</div>}
     </div>
   )
