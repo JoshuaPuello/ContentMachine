@@ -166,19 +166,24 @@ test('crop geometry covers non-divisible dimensions without gaps', () => {
   assert.equal(sixth.top + sixth.height, 768);
 });
 
-test('dimension validation accepts native grids and common AI provider canvases', () => {
+test('dimension validation accepts any usable grid canvas and delegates shape repair to expansion', () => {
   const layout = layoutForPanelCount(6);
   const native = validateSheetDimensions({ width: 2048, height: 768 }, layout);
   assert.equal(native.layoutMode, 'native-16:9-panels');
   assert.equal(native.needsOutpaint, false);
   const generated = validateSheetDimensions({ width: 1672, height: 941 }, layout);
-  assert.equal(generated.layoutMode, 'provider-canvas');
+  assert.equal(generated.layoutMode, 'flexible-source-canvas');
   assert.equal(generated.needsOutpaint, true);
   assert.ok(generated.actualPanelAspectRatio > 1.18 && generated.actualPanelAspectRatio < 1.19);
-  assert.throws(
-    () => validateSheetDimensions({ width: 1200, height: 1000 }, layout),
-    /not compatible/,
+  const tall = validateSheetDimensions({ width: 1200, height: 1000 }, layout);
+  assert.equal(tall.layoutMode, 'flexible-source-canvas');
+  assert.equal(tall.needsOutpaint, true);
+  const wideTwoPanel = validateSheetDimensions(
+    { width: 2172, height: 724 },
+    layoutForPanelCount(2),
   );
+  assert.equal(wideTwoPanel.layoutMode, 'flexible-source-canvas');
+  assert.equal(wideTwoPanel.needsOutpaint, true);
 });
 
 test('planned groups reject duplicate ownership and preserve isolated units', () => {

@@ -39,6 +39,7 @@ import {
   validatePlannedGroups,
   validateSheetDimensions,
 } from '../lib/sceneSheets.js';
+import { detectSceneSheetPanels } from '../lib/sceneSheetExtraction.js';
 
 const router = express.Router();
 const MAX_SHEET_BYTES = 50 * 1024 * 1024;
@@ -504,6 +505,9 @@ const workflowForResponse = (req, snapshot, sessionId) => {
   }));
   const characterById = new Map((snapshot.characters || []).map(character => [character.id, character]));
   for (const group of workflow.groups || []) {
+    if (group.windowsGeneration?.outputs?.length) {
+      group.windowsGeneration = decorateWindowsJobForGroup(group.windowsGeneration, group);
+    }
     group.sheetUrl = publicSessionAsset(req, sessionId, group.sheetUrl);
     for (const panel of group.panels || []) {
       panel.cropUrl = publicSessionAsset(req, sessionId, panel.cropUrl);
@@ -562,8 +566,10 @@ const applySceneSheetBuffer = async ({
   const actualMimeType = contentTypeForFormat(metadata.format);
   const sourceRelativePath = `${relativeRoot}/source.${extForMime(actualMimeType)}`;
   const sourcePath = path.join(sessionDirectory(sessionId), sourceRelativePath);
+  const extraction = await detectSceneSheetPanels(buffer, group.layout);
   const cropBuffers = await Promise.all(group.panels.map(async panel => {
-    const geometry = panelCropGeometry(metadata.width, metadata.height, group.layout, panel.ordinal);
+    const geometry = extraction.geometries[panel.ordinal - 1]
+      || panelCropGeometry(metadata.width, metadata.height, group.layout, panel.ordinal);
     const cropBuffer = await sharp(buffer, { failOn: 'warning' })
       .extract(geometry)
       .png({ compressionLevel: 9 })
@@ -597,6 +603,16 @@ const applySceneSheetBuffer = async ({
     layoutMode: sheetValidation.layoutMode,
     actualPanelAspectRatio: sheetValidation.actualPanelAspectRatio,
     needsOutpaint: sheetValidation.needsOutpaint,
+    extraction: {
+      strategy: extraction.strategy,
+      detectedDividers: extraction.detectedDividers,
+      dividerCount: extraction.dividerCount,
+      confidence: Number(extraction.confidence.toFixed(3)),
+      xBoundaries: extraction.xBoundaries,
+      yBoundaries: extraction.yBoundaries,
+      xInsets: extraction.xInsets,
+      yInsets: extraction.yInsets,
+    },
     uploadedAt: new Date().toISOString(),
     ...(generatedSource ? { generatedSource } : {}),
   };
@@ -816,7 +832,7 @@ const sceneSheetWindowsInputs = async (snapshot, sessionId, group) => {
   };
 };
 
-const decorateWindowsJobForGroup = (job, group) => {
+export const decorateWindowsJobForGroup = (job, group) => {
   const outputs = (job.outputs || []).map(output => {
     try {
       validateSheetDimensions(
@@ -826,7 +842,10 @@ const decorateWindowsJobForGroup = (job, group) => {
       );
       return {
         ...output,
-        layoutValidation: { valid: true, message: 'Canvas fits this panel layout' },
+        layoutValidation: {
+          valid: true,
+          message: 'Usable source canvas · panels will be detected and expanded to 16:9',
+        },
       };
     } catch (error) {
       return {

@@ -93,19 +93,6 @@ export const validateSheetDimensions = (
     throw new Error('Each scene-sheet panel must contain at least 256×256 source pixels');
   }
   const canonicalGrid = Math.abs(actual - expected) / expected <= tolerance;
-  // Most image generators force the complete output onto one conventional
-  // canvas even when asked for six native 16:9 panels. Accept those common
-  // canvases without stretching: each cell is cropped as authored, then the
-  // expansion pass outpaints it into the final native 16:9 frame.
-  const commonCanvasRatios = [16 / 9, 3 / 2, 4 / 3];
-  const providerCanvas = commonCanvasRatios.some(
-    ratio => Math.abs(actual - ratio) / ratio <= 0.06,
-  );
-  if (!canonicalGrid && !providerCanvas) {
-    throw new Error(
-      `The sheet canvas is not compatible with its ${layout.columns}×${layout.rows} panel layout`,
-    );
-  }
   const actualPanelAspectRatio = panelWidth / panelHeight;
   return {
     width,
@@ -113,7 +100,7 @@ export const validateSheetDimensions = (
     expectedAspectRatio: expected,
     actualAspectRatio: actual,
     actualPanelAspectRatio,
-    layoutMode: canonicalGrid ? 'native-16:9-panels' : 'provider-canvas',
+    layoutMode: canonicalGrid ? 'native-16:9-panels' : 'flexible-source-canvas',
     needsOutpaint: !canonicalGrid,
   };
 };
@@ -368,7 +355,9 @@ export const buildPanelExpansionPrompt = (panel, group) =>
 
 Create one clean, native 16:9, high-resolution cinematic frame. Preserve the first reference panel's exact composition, camera angle, lens character, subject identity, pose, wardrobe, environment geometry, lighting, palette, evidence placement, and visual narrative. The second reference is the complete approved sheet and is authoritative for environment and cross-panel continuity. Additional references identify the exact linked character(s).
 
-MANDATORY CLEAN-FRAME DELIVERY: remove the panel number completely, including every digit, numeral fragment, shadow, glow, outline, or impression left by it. Remove every grid divider, border, guide mark, label, caption, watermark, and crop-edge residue. In particular, the lower-left corner where the panel number appeared must contain only naturally reconstructed scene pixels. The final frame must contain ZERO readable text and ZERO panel numbering. This requirement is critical and overrides any tendency to preserve markings from either reference image.
+MANDATORY FULL-BLEED CLEAN-FRAME DELIVERY: use the meaningful cinematic content inside the first reference as the source composition, even if that content does not perfectly fill its extracted grid region. Expand and reconstruct it into a complete edge-to-edge 16:9 scene. Do not place the source inside a frame. Do not preserve or invent letterboxing, pillarboxing, matte bars, blank bands, black/white margins, unused grid-cell pixels, transparent edges, soft empty strips, dead space, or a smaller image floating on a canvas. Every pixel along all four output edges must be natural scene content continuous with the authored environment.
+
+Remove the panel number completely, including every digit, numeral fragment, shadow, glow, outline, or impression left by it. Remove every grid divider, border, guide mark, label, caption, watermark, and crop-edge residue. In particular, the lower-left corner where the panel number appeared must contain only naturally reconstructed scene pixels. The final frame must contain ZERO readable text and ZERO panel numbering. This requirement is critical and overrides any tendency to preserve markings from either reference image.
 
 Reconstruct only the tiny pixels covered by those removable markings and extend crop edges naturally. Do not redesign, recast, restage, beautify, add, remove, duplicate, or relocate important subjects or story objects.
 
@@ -378,4 +367,4 @@ ${panel.prompt}
 CONTINUITY WORLD:
 ${group.scenarioContinuity}
 
-The result must remain a photorealistic documentary recreation with seamless glossy porcelain mannequins using life-size realistic human anatomy. No human skin or facial features, no toy proportions, no doll joints, no digits, no letters, no text, no captions, no panel identifiers, no watermark, and no border. Before returning the image, inspect all four corners and confirm the old sheet number is entirely absent.`;
+The result must remain a photorealistic documentary recreation with seamless glossy porcelain mannequins using life-size realistic human anatomy. No human skin or facial features, no toy proportions, no doll joints, no digits, no letters, no text, no captions, no panel identifiers, no watermark, no border, no matte, and no empty canvas. Before returning the image, inspect all four corners and all four edges: confirm the old sheet number is entirely absent and natural scene imagery reaches every edge.`;

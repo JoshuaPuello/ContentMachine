@@ -1,10 +1,29 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  decorateWindowsJobForGroup,
   invalidatedSheetSelections,
   resolveSceneSheetExpansionModel,
   sceneSheetGroupStatus,
 } from './sceneSheets.js';
+
+test('completed flexible-canvas Windows sheets are reusable without regeneration', () => {
+  const decorated = decorateWindowsJobForGroup({
+    taskId: 'task-existing',
+    status: 'complete',
+    selectedOrdinal: null,
+    outputs: [{
+      ordinal: 1,
+      width: 2172,
+      height: 724,
+      bytes: 1_667_808,
+    }],
+  }, {
+    layout: { columns: 2, rows: 1 },
+  });
+  assert.equal(decorated.outputs[0].layoutValidation.valid, true);
+  assert.match(decorated.outputs[0].layoutValidation.message, /detected and expanded/i);
+});
 
 test('scene-sheet expansion uses the project Vertex model when supported', () => {
   assert.equal(
